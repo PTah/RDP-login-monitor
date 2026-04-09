@@ -78,3 +78,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\Soft\Login_Monitor.p
 - если процесса нет — запускает монитор;
 - если heartbeat старше `$HeartbeatStaleMinutes` (по умолчанию 90 минут) — перезапускает монитор.
 
+<<<<<<< HEAD
+=======
+
+>>>>>>> 68f8bcb (Add editor/gitattributes defaults for PowerShell encoding)
