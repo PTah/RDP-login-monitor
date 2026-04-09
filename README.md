@@ -78,8 +78,3 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\Soft\Login_Monitor.p
 - если процесса нет — запускает монитор;
 - если heartbeat старше `$HeartbeatStaleMinutes` (по умолчанию 90 минут) — перезапускает монитор.
 
-## 6) Безопасность
-
-- Не храните реальный токен Telegram в публичном репозитории.
-- Лучше передавать токен/chat id через защищенные параметры, переменные окружения или секреты CI/CD.
-
