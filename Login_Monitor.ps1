@@ -86,6 +86,13 @@ $ExcludedComputerPatterns = @(
     "Authz*"
 )
 
+# Узкое исключение "шумовых" сетевых логонов (LogonType=3) от конкретных источников.
+# Пример: Proxmox Mail Gateway / LDAP sync, которые периодически создают 4624 с LogonProcessName=Advapi.
+$IgnoreAdvapiNetworkLogonSourceIps = @(
+    "192.168.160.57"
+)
+$IgnoreAdvapiNetworkLogonProcessContains = "Advapi"
+
 # ============================================
 # ИНИЦИАЛИЗАЦИЯ
 # ============================================
@@ -346,9 +353,20 @@ function Should-IgnoreEvent {
     if ($EventID -eq 4648) { return $true }
     if ([string]::IsNullOrWhiteSpace($Username)) { return $true }
 
-    if ($Username -like "*\DWM-*" -or $Username -like "DWM-*") { return $true }
-    if ($Username -like "*\UMFD-*" -or $Username -like "UMFD-*") { return $true }
+    # DWM/UMFD (иногда приходит как DOMAIN\DWM-8)
+    if ($Username -match '(?i)(\\)?DWM-\d+') { return $true }
+    if ($Username -match '(?i)(\\)?UMFD-\d+') { return $true }
     if ($Username -like "*$") { return $true }
+
+    # Узкий фильтр: сетевой логон (3) + Advapi + конкретный IP источника
+    if ($EventID -eq 4624 -and $LogonType -eq 3) {
+        foreach ($ip in $IgnoreAdvapiNetworkLogonSourceIps) {
+            if ([string]::IsNullOrWhiteSpace($ip)) { continue }
+            if ($SourceIP -eq $ip -and $ProcessName -like ("*{0}*" -f $IgnoreAdvapiNetworkLogonProcessContains)) {
+                return $true
+            }
+        }
+    }
 
     foreach ($excludedUser in $ExcludedUsers) {
         if ($Username -like "*$excludedUser*") { return $true }
