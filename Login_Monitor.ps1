@@ -192,13 +192,27 @@ function Enable-SecurityAudit {
         }
     }
 
+    function Test-RussianAuditPolUi {
+        # Эвристика: если auditpol локализован, не дергаем английские subcategory имена (они дают код 87 и шумят в логах).
+        try {
+            if ((Get-Culture).TwoLetterISOLanguageName -eq 'ru') { return $true }
+        } catch { }
+
+        if ($PSUICulture -like 'ru*') { return $true }
+
+        $r = Invoke-AuditPol -Arguments '/list /subcategory:*'
+        if ($r.ExitCode -ne 0) { return $false }
+        return ($r.Text -match 'Вход/выход')
+    }
+
     function Test-LogonAuditEnabled {
         # На русской Windows подкатегория называется "Вход в систему", а не "Logon".
         # В выводе auditpol обычно встречаются слова "успех" и "отказ" (или Success/Failure).
-        $candidates = @(
-            '/get /subcategory:"Вход в систему"',
-            '/get /subcategory:"Logon"'
-        )
+        $isRu = Test-RussianAuditPolUi
+        $candidates = @('/get /subcategory:"Вход в систему"')
+        if (-not $isRu) {
+            $candidates += '/get /subcategory:"Logon"'
+        }
 
         foreach ($args in $candidates) {
             $r = Invoke-AuditPol -Arguments $args
@@ -223,16 +237,18 @@ function Enable-SecurityAudit {
     Write-Log "Аудит входа не настроен полностью. Пытаюсь включить..."
 
     # Порядок попыток: от самого "каноничного" к более совместимому.
-    $attempts = @(
-        # RU Windows (как в вашем выводе auditpol /list /subcategory:*)
-        '/set /subcategory:"Вход в систему" /success:enable /failure:enable',
-        '/set /category:"Вход/выход" /success:enable /failure:enable',
+    $isRu = Test-RussianAuditPolUi
+    $attempts = New-Object System.Collections.Generic.List[string]
+    # RU Windows (как в вашем выводе auditpol /list /subcategory:*)
+    $attempts.Add('/set /subcategory:"Вход в систему" /success:enable /failure:enable')
+    $attempts.Add('/set /category:"Вход/выход" /success:enable /failure:enable')
+    if (-not $isRu) {
         # EN Windows
-        '/set /subcategory:"Logon" /success:enable /failure:enable',
-        '/set /category:"Logon/Logoff" /success:enable /failure:enable',
-        # GUID категории (как было у вас изначально)
-        '/set /category:"{69979849-797A-11D9-BED3-505054503030}" /success:enable /failure:enable'
-    )
+        $attempts.Add('/set /subcategory:"Logon" /success:enable /failure:enable')
+        $attempts.Add('/set /category:"Logon/Logoff" /success:enable /failure:enable')
+    }
+    # GUID категории (как было у вас изначально)
+    $attempts.Add('/set /category:"{69979849-797A-11D9-BED3-505054503030}" /success:enable /failure:enable')
 
     foreach ($a in $attempts) {
         $r = Invoke-AuditPol -Arguments $a
