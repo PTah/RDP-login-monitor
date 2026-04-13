@@ -18,15 +18,36 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+$script:Utf8BomEncoding = New-Object System.Text.UTF8Encoding $true
+$script:WatchdogLogBomChecked = $false
+
+function Ensure-FileStartsWithUtf8Bom {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { return }
+    $bom = [byte[]](0xEF, 0xBB, 0xBF)
+    $combined = New-Object byte[] ($bom.Length + $bytes.Length)
+    [Buffer]::BlockCopy($bom, 0, $combined, 0, $bom.Length)
+    if ($bytes.Length -gt 0) {
+        [Buffer]::BlockCopy($bytes, 0, $combined, $bom.Length, $bytes.Length)
+    }
+    [System.IO.File]::WriteAllBytes($Path, $combined)
+}
+
 function Write-WatchdogLog {
     param([string]$Message)
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $line = "$ts - $Message"
+    $line = "$ts - $Message" + [Environment]::NewLine
     $dir = Split-Path -Parent $WatchdogLog
     if ($dir -and -not (Test-Path $dir)) {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
-    Add-Content -Path $WatchdogLog -Value $line -Encoding UTF8
+    if (-not $script:WatchdogLogBomChecked) {
+        Ensure-FileStartsWithUtf8Bom -Path $WatchdogLog
+        $script:WatchdogLogBomChecked = $true
+    }
+    [System.IO.File]::AppendAllText($WatchdogLog, $line, $script:Utf8BomEncoding)
 }
 
 function Get-MainScriptProcesses {
