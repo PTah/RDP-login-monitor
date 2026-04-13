@@ -366,12 +366,17 @@ function Enable-SecurityAudit {
 }
 
 function Test-RDSDeploymentPresent {
+    # Узел только с RD Gateway (RDS-Gateway и т.п.) не считаем «полноценным RDS по сессиям» —
+    # для шлюза отдельное сообщение в Telegram (журнал Gateway, 302/303 к целевым ПК).
+    $gatewayOnlyFeatureNames = @('RDS-Gateway', 'RDS-WEB-ACCESS')
+
     try {
         if (Get-Command Get-WindowsFeature -ErrorAction SilentlyContinue) {
             $rdsFeatures = @(Get-WindowsFeature -ErrorAction SilentlyContinue | Where-Object {
                 $_.Name -like 'RDS*' -and $_.InstallState -eq 'Installed'
             })
-            if ($rdsFeatures.Count -gt 0) {
+            $sessionOrHostLike = @($rdsFeatures | Where-Object { $gatewayOnlyFeatureNames -notcontains $_.Name })
+            if ($sessionOrHostLike.Count -gt 0) {
                 return $true
             }
         }
@@ -396,13 +401,13 @@ function Send-Heartbeat {
         $message += "🖥️ Сервер: $env:COMPUTERNAME`r`n"
         $message += "🕐 Время запуска: $timestamp"
         if (Test-RDSDeploymentPresent) {
-            $message += "`r`n🔐 <b>RDS:</b> обнаружена роль/компоненты Remote Desktop Services — в мониторинг входят также входы пользователей через RDS/RDP (события Security 4624/4625, типы входа по настройке скрипта)."
+            $message += "`r`n🔐 <b>RDS (хост сессий):</b> обнаружены компоненты RDS помимо чистого шлюза — в мониторинг входят входы по RDP/RDS на этом узле (Security 4624/4625, типы входа по настройке скрипта)."
         }
         if ($EnableRDGatewayMonitoring) {
             try {
                 $gwLog = Get-WinEvent -ListLog $RDGatewayLogName -ErrorAction SilentlyContinue
                 if ($gwLog) {
-                    $message += "`r`n🌐 <b>RD Gateway:</b> журнал доступен — дополнительно фиксируются подключения через RD Gateway (302/303)."
+                    $message += "`r`n🌐 <b>RD Gateway:</b> журнал шлюза доступен — дополнительно фиксируются подключения пользователей к <b>внутренним целевым компьютерам</b> через RD Gateway (события 302/303 в журнале шлюза)."
                 }
             } catch { }
         }
