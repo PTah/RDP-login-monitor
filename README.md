@@ -77,6 +77,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\Soft\Login_Monitor.p
   - `D:\Soft\Logs\watchdog.log`
 - Heartbeat:
   - `D:\Soft\Logs\last_heartbeat.txt` обновляется примерно раз в час (по `$HeartbeatInterval`).
+- Telegram при старте: если обнаружена роль RDS (или типичный сервис RDS Session Host), в тексте явно указано, что мониторятся и входы через RDS/RDP; при доступном журнале RD Gateway — отдельная строка про события Gateway.
 
 ## 5) Автоматический перезапуск при падении
 
