@@ -656,8 +656,12 @@ function Format-LoginEvent {
         [string]$ProcessName,
         [datetime]$TimeCreated,
         [int]$LogonType,
-        [string]$LogonTypeName
+        [string]$LogonTypeName,
+        [string]$SecurityLogComputerName
     )
+
+    $logHost = $SecurityLogComputerName
+    if ([string]::IsNullOrWhiteSpace($logHost)) { $logHost = $env:COMPUTERNAME }
 
     $message = "<b>"
     if ($EventID -eq 4624) { $message += "✅ УСПЕШНЫЙ ВХОД" }
@@ -666,7 +670,8 @@ function Format-LoginEvent {
     $message += "</b>`r`n"
 
     $message += "👤 Пользователь: $Username`r`n"
-    $message += "🖥️ Компьютер: $ComputerName`r`n"
+    $message += "🏢 Сервер (журнал Security): $logHost`r`n"
+    $message += "🖥️ Рабочая станция (клиент из события): $ComputerName`r`n"
     $message += "🌐 IP адрес: $SourceIP`r`n"
     $message += "⚙️ Процесс/Код: $ProcessName`r`n"
     $message += "🔑 Тип входа: $LogonTypeName ($LogonType)`r`n"
@@ -884,7 +889,8 @@ function Start-LoginMonitor {
                             -ProcessName $eventInfo.ProcessName `
                             -TimeCreated $eventInfo.TimeCreated `
                             -LogonType $eventInfo.LogonType `
-                            -LogonTypeName $logonTypeName
+                            -LogonTypeName $logonTypeName `
+                            -SecurityLogComputerName $event.MachineName
 
                         Write-Log "Notify: ID=$($event.Id) User=$($eventInfo.Username) LT=$($eventInfo.LogonType) IP=$($eventInfo.SourceIP)"
                         Send-TelegramMessage -Message $formattedMessage | Out-Null
