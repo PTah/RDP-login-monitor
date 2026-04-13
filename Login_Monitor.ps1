@@ -774,7 +774,8 @@ function Send-DailyReport {
             }
         }
         $count = $usernames.Count
-        $uniqueUsers = $usernames | Sort-Object -Unique
+        # PS 5.1: без @() один логин даёт скаляр String (нет .Count); пустой список даёт $null.
+        $uniqueUsers = @($usernames | Sort-Object -Unique)
         $message = "<b>📊 ЕЖЕДНЕВНЫЙ ОТЧЕТ</b>`r`n"
         $message += "🖥️ Сервер: $env:COMPUTERNAME`r`n"
         $message += "🕐 Время отчета: $(Get-Date -Format 'dd.MM.yyyy HH:mm:ss')`r`n"
