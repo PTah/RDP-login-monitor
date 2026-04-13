@@ -365,6 +365,27 @@ function Enable-SecurityAudit {
     Write-Log "ВНИМАНИЕ: не удалось автоматически настроить аудит входа/выхода через auditpol. Скрипт продолжит работу, но часть событий может отсутствовать. Проверьте политику аудита вручную (локальная/доменная GPO)."
 }
 
+function Test-RDSDeploymentPresent {
+    try {
+        if (Get-Command Get-WindowsFeature -ErrorAction SilentlyContinue) {
+            $rdsFeatures = @(Get-WindowsFeature -ErrorAction SilentlyContinue | Where-Object {
+                $_.Name -like 'RDS*' -and $_.InstallState -eq 'Installed'
+            })
+            if ($rdsFeatures.Count -gt 0) {
+                return $true
+            }
+        }
+    } catch { }
+
+    try {
+        if (Get-Service -Name 'UmRdpService' -ErrorAction SilentlyContinue) {
+            return $true
+        }
+    } catch { }
+
+    return $false
+}
+
 function Send-Heartbeat {
     param([switch]$IsStartup = $false)
 
@@ -374,6 +395,17 @@ function Send-Heartbeat {
         $message = "<b>✅ Мониторинг логинов ЗАПУЩЕН</b>`r`n"
         $message += "🖥️ Сервер: $env:COMPUTERNAME`r`n"
         $message += "🕐 Время запуска: $timestamp"
+        if (Test-RDSDeploymentPresent) {
+            $message += "`r`n🔐 <b>RDS:</b> обнаружена роль/компоненты Remote Desktop Services — в мониторинг входят также входы пользователей через RDS/RDP (события Security 4624/4625, типы входа по настройке скрипта)."
+        }
+        if ($EnableRDGatewayMonitoring) {
+            try {
+                $gwLog = Get-WinEvent -ListLog $RDGatewayLogName -ErrorAction SilentlyContinue
+                if ($gwLog) {
+                    $message += "`r`n🌐 <b>RD Gateway:</b> журнал доступен — дополнительно фиксируются подключения через RD Gateway (302/303)."
+                }
+            } catch { }
+        }
         Send-TelegramMessage -Message $message | Out-Null
         Write-Log "Отправлено уведомление о запуске скрипта"
     } else {
