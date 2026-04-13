@@ -101,12 +101,39 @@ $LogDir = Split-Path $LogFile -Parent
 if (!(Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
 if (!(Test-Path $LogBackupFolder)) { New-Item -ItemType Directory -Path $LogBackupFolder -Force | Out-Null }
 
+# UTF-8 с BOM: иначе часть просмотрщиков (FAR и др.) открывает лог как ANSI/OEM и показывает "кракозябры".
+$script:Utf8BomEncoding = New-Object System.Text.UTF8Encoding $true
+
+function Ensure-FileStartsWithUtf8Bom {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { return }
+    $bom = [byte[]](0xEF, 0xBB, 0xBF)
+    $combined = New-Object byte[] ($bom.Length + $bytes.Length)
+    [Buffer]::BlockCopy($bom, 0, $combined, 0, $bom.Length)
+    if ($bytes.Length -gt 0) {
+        [Buffer]::BlockCopy($bytes, 0, $combined, $bom.Length, $bytes.Length)
+    }
+    [System.IO.File]::WriteAllBytes($Path, $combined)
+}
+
+function Write-TextFileUtf8Bom {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Text
+    )
+    [System.IO.File]::WriteAllText($Path, $Text, $script:Utf8BomEncoding)
+}
+
+Ensure-FileStartsWithUtf8Bom -Path $LogFile
+
 function Write-Log {
     param([string]$Message)
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $logMessage = "$timestamp - $Message"
-    Add-Content -Path $LogFile -Value $logMessage -Force -Encoding UTF8
-    Write-Host $logMessage
+    $logMessage = "$timestamp - $Message" + [Environment]::NewLine
+    [System.IO.File]::AppendAllText($LogFile, $logMessage, $script:Utf8BomEncoding)
+    Write-Host ($logMessage.TrimEnd("`r`n"))
 }
 
 try {
@@ -350,7 +377,7 @@ function Send-Heartbeat {
         Send-TelegramMessage -Message $message | Out-Null
         Write-Log "Отправлено уведомление о запуске скрипта"
     } else {
-        $timestamp | Out-File -FilePath $HeartbeatFile -Force -Encoding UTF8
+        Write-TextFileUtf8Bom -Path $HeartbeatFile -Text $timestamp
     }
 }
 
@@ -376,6 +403,8 @@ function Rotate-LogFile {
 
             Copy-Item -Path $LogFile -Destination $backupFilePath -Force
             Clear-Content -Path $LogFile -Force
+            # После Clear-Content файл пустой без BOM — восстановим UTF-8 BOM для корректного просмотра в FAR/редакторах
+            Ensure-FileStartsWithUtf8Bom -Path $LogFile
             Write-Log "Лог-файл скопирован в бэкап: $backupFilePath"
 
             $oldBackups = Get-ChildItem -Path $LogBackupFolder -Filter "LoginLog_*.bak" |
@@ -414,7 +443,7 @@ function Check-AndRotateLog {
     elseif ($currentTime -ge $targetRotationTime) { $shouldRotate = $true }
 
     if ($shouldRotate -and (Rotate-LogFile)) {
-        $currentTime.ToString("yyyy-MM-dd HH:mm:ss") | Out-File -FilePath $lastRotationFile -Force -Encoding UTF8
+            Write-TextFileUtf8Bom -Path $lastRotationFile -Text ($currentTime.ToString("yyyy-MM-dd HH:mm:ss"))
     }
     return $targetRotationTime
 }
@@ -687,15 +716,38 @@ function Format-RDGatewayEvent {
 
 function Send-DailyReport {
     try {
-        $quserOutput = & quser 2>$null
-        $count = 0
-        if ($quserOutput -and $quserOutput.Count -gt 1) { $count = $quserOutput.Count - 1 }
+        $quserOutput = @(& quser 2>$null)
+        $usernames = [System.Collections.Generic.List[string]]::new()
+        if ($quserOutput -and $quserOutput.Count -gt 1) {
+            $sessionLines = @($quserOutput | Select-Object -Skip 1)
+            foreach ($raw in $sessionLines) {
+                $line = ($raw -replace '\s+', ' ').Trim()
+                if ([string]::IsNullOrWhiteSpace($line)) { continue }
+                $parts = $line -split ' ', 2
+                if ($parts.Count -lt 1) { continue }
+                $u = $parts[0].Trim()
+                if (-not [string]::IsNullOrWhiteSpace($u) -and $u -ne 'USERNAME') {
+                    $usernames.Add($u) | Out-Null
+                }
+            }
+        }
+        $count = $usernames.Count
+        $uniqueUsers = $usernames | Sort-Object -Unique
         $message = "<b>📊 ЕЖЕДНЕВНЫЙ ОТЧЕТ</b>`r`n"
         $message += "🖥️ Сервер: $env:COMPUTERNAME`r`n"
         $message += "🕐 Время отчета: $(Get-Date -Format 'dd.MM.yyyy HH:mm:ss')`r`n"
-        $message += "👥 Активных сессий (quser): $count"
+        $message += "👥 Активных сессий (quser): $count`r`n"
+        if ($uniqueUsers.Count -gt 0) {
+            $message += "`r`n<b>Уникальные логины ($($uniqueUsers.Count)):</b>`r`n"
+            foreach ($name in $uniqueUsers) {
+                $safe = [System.Net.WebUtility]::HtmlEncode($name)
+                $message += "  • $safe`r`n"
+            }
+        } else {
+            $message += "`r`n<i>Список пользователей недоступен (quser пуст или недостаточно прав).</i>"
+        }
         Send-TelegramMessage -Message $message | Out-Null
-        (Get-Date).ToString("yyyy-MM-dd HH:mm:ss") | Out-File -FilePath $LastReportFile -Force -Encoding UTF8
+        Write-TextFileUtf8Bom -Path $LastReportFile -Text ((Get-Date).ToString("yyyy-MM-dd HH:mm:ss"))
         Write-Log "Ежедневный отчет отправлен"
         return $true
     } catch {
