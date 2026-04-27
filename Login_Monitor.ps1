@@ -30,7 +30,7 @@ function Uc { param([int[]]$C) -join ($C | ForEach-Object { [char]$_ }) }
 # ============================================
 
 # Версия (обновляйте при значимых изменениях; пишется в лог и в консоль при интерактивном запуске)
-$ScriptVersion = "1.1.2"
+$ScriptVersion = "1.1.3"
 
 # Логи
 $LogFile = "D:\Soft\Logs\login_monitor.log"
@@ -231,16 +231,11 @@ function Enable-SecurityAudit {
         }
     }
 
+    # Do NOT use Get-Culture/PSUICulture: OS can be "ru" while auditpol stays English (Hyper-V, etc.).
+    # Only trust actual auditpol /list output.
     function Test-RussianUiPreferred {
-        try {
-            if ((Get-Culture).TwoLetterISOLanguageName -eq 'ru') { return $true }
-        } catch { }
-
-        if ($PSUICulture -like 'ru*') { return $true }
-
         $r = Invoke-AuditPol -Arguments '/list /subcategory:*'
         if ($r.ExitCode -ne 0) { return $false }
-        # RU category Logon/Logoff (Uc): must include 0x0445 before second 043E (was 0x57 from auditpol)
         $ax = Uc @(0x0412,0x0445,0x043E,0x0434,0x002F,0x0432,0x044B,0x0445,0x043E,0x0434)
         return ($r.Text -like ('*{0}*' -f $ax))
     }
@@ -359,13 +354,11 @@ function Enable-SecurityAudit {
             Write-Log "Audit policy (RU): enabled for Russian subcategory names (Logon/Logoff / Russian UI output)."
             return
         }
-
-        Write-Log "WARNING (RU): could not set Russian Advanced Audit subcategories through auditpol. The script will continue, but some events may be missing. Check domain/GPO (central Advanced Audit Policy may override)."
-        return
+        Write-Log "Russian category names not accepted or failed; trying English Logon/Logoff (auditpol language can differ from OS UI)."
     }
 
     if (Ensure-EnLogonLogoffSubcategories) {
-        Write-Log "Audit policy (EN): OK for Logon/Logoff (English UI output)."
+        Write-Log "Audit policy (EN): OK for Logon/Logoff (English auditpol output)."
         return
     }
 
