@@ -136,6 +136,12 @@ function Write-Log {
     Write-Host ($logMessage.TrimEnd("`r`n"))
 }
 
+function ConvertTo-TelegramHtml {
+    param([string]$Text)
+    if ($null -eq $Text) { return '' }
+    return [System.Net.WebUtility]::HtmlEncode([string]$Text)
+}
+
 try {
     [System.Net.ServicePointManager]::SecurityProtocol =
         [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
@@ -395,10 +401,11 @@ function Send-Heartbeat {
     param([switch]$IsStartup = $false)
 
     $timestamp = Get-Date -Format "dd.MM.yyyy HH:mm:ss"
+    $hHost = (ConvertTo-TelegramHtml $env:COMPUTERNAME)
 
     if ($IsStartup) {
         $message = "<b>✅ Мониторинг логинов ЗАПУЩЕН</b>`r`n"
-        $message += "🖥️ Сервер: $env:COMPUTERNAME`r`n"
+        $message += "🖥️ Сервер: $hHost`r`n"
         $message += "🕐 Время запуска: $timestamp"
         if (Test-RDSDeploymentPresent) {
             $message += "`r`n🔐 <b>RDS (хост сессий):</b> обнаружены компоненты RDS помимо чистого шлюза — в мониторинг входят входы по RDP/RDS на этом узле (Security 4624/4625, типы входа по настройке скрипта)."
@@ -422,10 +429,12 @@ function Send-StopNotification {
     param([string]$Reason)
 
     $timestamp = Get-Date -Format "dd.MM.yyyy HH:mm:ss"
+    $hHost = (ConvertTo-TelegramHtml $env:COMPUTERNAME)
+    $hReason = (ConvertTo-TelegramHtml $Reason)
     $message = "<b>⚠️ МОНИТОРИНГ ЛОГИНОВ ОСТАНОВЛЕН</b>`r`n"
-    $message += "🖥️ Сервер: $env:COMPUTERNAME`r`n"
+    $message += "🖥️ Сервер: $hHost`r`n"
     $message += "🕐 Время остановки: $timestamp`r`n"
-    $message += "📋 Причина: $Reason"
+    $message += "📋 Причина: $hReason"
 
     Send-TelegramMessage -Message $message | Out-Null
     Write-Log "Уведомление об остановке отправлено: $Reason"
@@ -459,6 +468,24 @@ function Rotate-LogFile {
     return $false
 }
 
+function Get-NextLocalSlotBoundary {
+    param(
+        [int]$Hour,
+        [int]$Minute
+    )
+    $now = Get-Date
+    $slotToday = Get-Date -Year $now.Year -Month $now.Month -Day $now.Day -Hour $Hour -Minute $Minute -Second 0
+    if ($now -lt $slotToday) { return $slotToday }
+    return $slotToday.AddDays(1)
+}
+
+function Get-MostRecentRotationSlot {
+    $now = Get-Date
+    $slotToday = Get-Date -Year $now.Year -Month $now.Month -Day $now.Day -Hour $LogRotationHour -Minute $LogRotationMinute -Second 0
+    if ($now -ge $slotToday) { return $slotToday }
+    return $slotToday.AddDays(-1)
+}
+
 function Check-AndRotateLog {
     $lastRotationFile = Join-Path $LogBackupFolder "last_rotation.txt"
     $lastRotation = $null
@@ -471,18 +498,15 @@ function Check-AndRotateLog {
     }
 
     $currentTime = Get-Date
-    $targetRotationTime = Get-Date -Year $currentTime.Year -Month $currentTime.Month -Day $currentTime.Day `
-        -Hour $LogRotationHour -Minute $LogRotationMinute -Second 0
-    if ($currentTime -ge $targetRotationTime) { $targetRotationTime = $targetRotationTime.AddDays(1) }
-
+    $mostRecentSlot = Get-MostRecentRotationSlot
     $shouldRotate = $false
-    if ($lastRotation -eq $null) { $shouldRotate = $true }
-    elseif ($currentTime -ge $targetRotationTime) { $shouldRotate = $true }
+    if ($null -eq $lastRotation) { $shouldRotate = $true }
+    elseif ($lastRotation -lt $mostRecentSlot) { $shouldRotate = $true }
 
     if ($shouldRotate -and (Rotate-LogFile)) {
-            Write-TextFileUtf8Bom -Path $lastRotationFile -Text ($currentTime.ToString("yyyy-MM-dd HH:mm:ss"))
+        Write-TextFileUtf8Bom -Path $lastRotationFile -Text ($currentTime.ToString("yyyy-MM-dd HH:mm:ss"))
     }
-    return $targetRotationTime
+    return (Get-NextLocalSlotBoundary -Hour $LogRotationHour -Minute $LogRotationMinute)
 }
 
 function Cleanup-OldLogs {
@@ -662,6 +686,13 @@ function Format-LoginEvent {
 
     $logHost = $SecurityLogComputerName
     if ([string]::IsNullOrWhiteSpace($logHost)) { $logHost = $env:COMPUTERNAME }
+    $hUser = (ConvertTo-TelegramHtml $Username)
+    $hLog = (ConvertTo-TelegramHtml $logHost)
+    $hWkst = (ConvertTo-TelegramHtml $ComputerName)
+    $hIp = (ConvertTo-TelegramHtml $SourceIP)
+    $hProc = (ConvertTo-TelegramHtml $ProcessName)
+    $hLtName = (ConvertTo-TelegramHtml $LogonTypeName)
+    $hTime = (ConvertTo-TelegramHtml ($TimeCreated.ToString('dd.MM.yyyy HH:mm:ss')))
 
     $message = "<b>"
     if ($EventID -eq 4624) { $message += "✅ УСПЕШНЫЙ ВХОД" }
@@ -669,13 +700,13 @@ function Format-LoginEvent {
     else { $message += "⚠️ СОБЫТИЕ" }
     $message += "</b>`r`n"
 
-    $message += "👤 Пользователь: $Username`r`n"
-    $message += "🏢 Сервер (журнал Security): $logHost`r`n"
-    $message += "🖥️ Рабочая станция (клиент из события): $ComputerName`r`n"
-    $message += "🌐 IP адрес: $SourceIP`r`n"
-    $message += "⚙️ Процесс/Код: $ProcessName`r`n"
-    $message += "🔑 Тип входа: $LogonTypeName ($LogonType)`r`n"
-    $message += "🕐 Время: $($TimeCreated.ToString('dd.MM.yyyy HH:mm:ss'))`r`n"
+    $message += "👤 Пользователь: $hUser`r`n"
+    $message += "🏢 Сервер (журнал Security): $hLog`r`n"
+    $message += "🖥️ Рабочая станция (клиент из события): $hWkst`r`n"
+    $message += "🌐 IP адрес: $hIp`r`n"
+    $message += "⚙️ Процесс/Код: $hProc`r`n"
+    $message += "🔑 Тип входа: $hLtName ($LogonType)`r`n"
+    $message += "🕐 Время: $hTime`r`n"
     $message += "🔢 Event ID: $EventID"
 
     return $message
@@ -738,20 +769,26 @@ function Format-RDGatewayEvent {
         [datetime]$TimeCreated
     )
 
+    $hUser = (ConvertTo-TelegramHtml $Username)
+    $hExt = (ConvertTo-TelegramHtml $ExternalIP)
+    $hInt = (ConvertTo-TelegramHtml $InternalIP)
+    $hProto = (ConvertTo-TelegramHtml $Protocol)
+    $hTime = (ConvertTo-TelegramHtml ($TimeCreated.ToString('dd.MM.yyyy HH:mm:ss')))
+
     $message = "<b>"
     if ($EventID -eq 302) { $message += "🖥️ УСПЕШНОЕ ПОДКЛЮЧЕНИЕ ЧЕРЕЗ RD GATEWAY" }
     elseif ($EventID -eq 303) { $message += "❌ НЕУДАЧНОЕ ПОДКЛЮЧЕНИЕ ЧЕРЕЗ RD GATEWAY" }
     else { $message += "⚠️ СОБЫТИЕ RD GATEWAY" }
     $message += "</b>`r`n"
 
-    $message += "👤 Пользователь: $Username`r`n"
-    $message += "🌐 IP пользователя (внешний): $ExternalIP`r`n"
-    $message += "🖥️ IP внутренний: $InternalIP`r`n"
-    $message += "🔌 Протокол: $Protocol`r`n"
+    $message += "👤 Пользователь: $hUser`r`n"
+    $message += "🌐 IP пользователя (внешний): $hExt`r`n"
+    $message += "🖥️ IP внутренний: $hInt`r`n"
+    $message += "🔌 Протокол: $hProto`r`n"
     if ($EventID -eq 303 -and $ErrorCode -ne "0" -and $ErrorCode -ne "N/A") {
-        $message += "⚠️ Код ошибки: $ErrorCode`r`n"
+        $message += "⚠️ Код ошибки: $(ConvertTo-TelegramHtml $ErrorCode)`r`n"
     }
-    $message += "🕐 Время: $($TimeCreated.ToString('dd.MM.yyyy HH:mm:ss'))`r`n"
+    $message += "🕐 Время: $hTime`r`n"
     $message += "🔢 Event ID: $EventID"
     return $message
 }
@@ -777,7 +814,7 @@ function Send-DailyReport {
         # PS 5.1: без @() один логин даёт скаляр String (нет .Count); пустой список даёт $null.
         $uniqueUsers = @($usernames | Sort-Object -Unique)
         $message = "<b>📊 ЕЖЕДНЕВНЫЙ ОТЧЕТ</b>`r`n"
-        $message += "🖥️ Сервер: $env:COMPUTERNAME`r`n"
+        $message += "🖥️ Сервер: $(ConvertTo-TelegramHtml $env:COMPUTERNAME)`r`n"
         $message += "🕐 Время отчета: $(Get-Date -Format 'dd.MM.yyyy HH:mm:ss')`r`n"
         $message += "👥 Активных сессий (quser): $count`r`n"
         if ($uniqueUsers.Count -gt 0) {
@@ -807,15 +844,19 @@ function Check-AndSendDailyReport {
     }
 
     $now = Get-Date
-    $target = Get-Date -Year $now.Year -Month $now.Month -Day $now.Day -Hour $DailyReportHour -Minute $DailyReportMinute -Second 0
-    if ($now -ge $target) { $target = $target.AddDays(1) }
-
+    $reportSlotToday = Get-Date -Year $now.Year -Month $now.Month -Day $now.Day -Hour $DailyReportHour -Minute $DailyReportMinute -Second 0
     $shouldSend = $false
-    if ($lastReport -eq $null) { $shouldSend = $true }
-    elseif ($now -ge $target) { $shouldSend = $true }
+    if ($now -ge $reportSlotToday) {
+        if ($null -eq $lastReport) {
+            $shouldSend = $true
+        } else {
+            $dLast = $lastReport.Date
+            if ($dLast -lt $now.Date) { $shouldSend = $true }
+        }
+    }
     if ($shouldSend) { Send-DailyReport | Out-Null }
 
-    return $target
+    return (Get-NextLocalSlotBoundary -Hour $DailyReportHour -Minute $DailyReportMinute)
 }
 
 function Start-LoginMonitor {
@@ -944,14 +985,18 @@ function Start-LoginMonitor {
     }
 }
 
+$script:StopNotificationSent = $false
 try {
     Test-TelegramConnection | Out-Null
     Start-LoginMonitor -MonitorInterval 5 -MonitorInteractiveOnly
 } catch {
     Write-Log "Критическая ошибка: $($_.Exception.Message)"
     Send-StopNotification -Reason "Критическая ошибка: $($_.Exception.Message)"
+    $script:StopNotificationSent = $true
     throw
 } finally {
-    Send-StopNotification -Reason "Скрипт завершил работу"
+    if (-not $script:StopNotificationSent) {
+        Send-StopNotification -Reason "Скрипт завершил работу"
+    }
 }
 
