@@ -21,12 +21,16 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+# Строка из BMP code point (0x....) — в исходнике остается только ASCII, скрипт не ломается
+# при скачивании через IWR, если при переносе в строке испортится UTF-8.
+function Uc { param([int[]]$C) -join ($C | ForEach-Object { [char]$_ }) }
+
 # ============================================
 # КОНФИГУРАЦИЯ
 # ============================================
 
 # Версия (обновляйте при значимых изменениях; пишется в лог и в консоль при интерактивном запуске)
-$ScriptVersion = "1.1.0"
+$ScriptVersion = "1.1.1"
 
 # Логи
 $LogFile = "D:\Soft\Logs\login_monitor.log"
@@ -213,10 +217,9 @@ if (-not (Test-Administrator)) {
 Write-Log "Скрипт запущен с правами администратора, версия $ScriptVersion"
 
 function Enable-SecurityAudit {
-    Write-Log "Проверка настроек аудита..."
+    Write-Log "Checking security audit (auditpol) settings..."
 
-    # Важно: auditpol пишет часть сообщений в stderr. Если перенаправлять stderr в $null,
-    # PowerShell может превратить это в завершающую ошибку (и скрипт упадёт из-за $ErrorActionPreference=Stop).
+    # auditpol writes to stderr; do not throw under $ErrorActionPreference = Stop.
     function Invoke-AuditPol {
         param([Parameter(Mandatory = $true)][string]$Arguments)
         $cmd = "auditpol $Arguments 2>&1"
@@ -237,17 +240,20 @@ function Enable-SecurityAudit {
 
         $r = Invoke-AuditPol -Arguments '/list /subcategory:*'
         if ($r.ExitCode -ne 0) { return $false }
-        return ($r.Text -match 'Вход/выход')
+        $ax = Uc @(0x0412,0x0445,0x043E,0x0434,0x002F,0x0432,0x044B,0x043E,0x0434)
+        return ($r.Text -like ('*{0}*' -f $ax))
     }
 
     function Test-SuccessAndFailureText {
         param([string]$Line)
         if ([string]::IsNullOrWhiteSpace($Line)) { return $false }
-        # RU: "Успех и сбой" (часто в выводе категории)
-        if ($Line -match '(?i)успех\s+и\s+сбой') { return $true }
-        # Иногда встречается без пробелов вокруг "и" из-за форматирования/переносов
-        if ($Line -match '(?i)успех\s*и\s*сбой') { return $true }
-        # EN fallback
+        $w1 = Uc @(0x0443,0x0441,0x043F,0x0435,0x0445)
+        $w2 = Uc @(0x0438)
+        $w3 = Uc @(0x0441,0x0431,0x043E,0x0439)
+        $p1 = '(?i)' + [regex]::Escape($w1) + '\s+' + [regex]::Escape($w2) + '\s+' + [regex]::Escape($w3)
+        $p2 = '(?i)' + [regex]::Escape($w1) + '\s*' + [regex]::Escape($w2) + '\s*' + [regex]::Escape($w3)
+        if ($Line -match $p1) { return $true }
+        if ($Line -match $p2) { return $true }
         if (($Line -match '(?i)Success') -and ($Line -match '(?i)Failure')) { return $true }
         return $false
     }
@@ -267,7 +273,6 @@ function Enable-SecurityAudit {
             $t = ($ln -replace '\s+', ' ').Trim()
             if ([string]::IsNullOrWhiteSpace($t)) { continue }
 
-            # Ищем по подстроке без жёсткой привязки к количеству пробелов
             if ($t -notlike ('*{0}*' -f $SubcategoryLabel)) { continue }
             return [pscustomobject]@{ Ok = $true; ExitCode = 0; Text = $r.Text; Line = $t }
         }
@@ -276,45 +281,44 @@ function Enable-SecurityAudit {
     }
 
     function Ensure-RuLogonLogoffSubcategories {
-        # Как вы описали: смотрим категорию "Вход/выход" и добиваем две ключевые подкатегории.
-        $category = "Вход/выход"
+        $category = Uc @(0x0412,0x0445,0x043E,0x0434,0x002F,0x0432,0x044B,0x043E,0x0434)
         $targets = @(
-            "Вход в систему",
-            "Выход из системы"
+            (Uc @(0x0412,0x0445,0x043E,0x0434,0x0020,0x0432,0x0020,0x0441,0x0438,0x0441,0x0442,0x0435,0x043C,0x0443)),
+            (Uc @(0x0412,0x044B,0x0445,0x043E,0x0434,0x0020,0x0438,0x0437,0x0020,0x0441,0x0438,0x0441,0x0442,0x0435,0x043C,0x044B))
         )
 
         foreach ($sub in $targets) {
             $cur = Get-CategorySettingLine -CategoryName $category -SubcategoryLabel $sub
             if (-not $cur.Ok) {
-                Write-Log ("Не удалось прочитать auditpol /get /category для '{0}' (код {1}). Вывод:`n{2}" -f $category, $cur.ExitCode, $cur.Text)
+                Write-Log ("Failed auditpol /get /category for category '{0}' (exit {1}). Output:`n{2}" -f $category, $cur.ExitCode, $cur.Text)
                 return $false
             }
 
             if ($null -eq $cur.Line) {
                 $frag = $cur.Text
                 if ($frag.Length -gt 4000) { $frag = $frag.Substring(0, 4000) + "`n... (truncated)" }
-                Write-Log ("В выводе категории '{0}' не найдена строка подкатегории '{1}'. Вывод (фрагмент):`n{2}" -f $category, $sub, $frag)
+                Write-Log ("Category '{0}': no line containing subcategory '{1}'. Output (excerpt):`n{2}" -f $category, $sub, $frag)
                 return $false
             }
 
             if (Test-SuccessAndFailureText -Line $cur.Line) {
-                Write-Log ("Аудит уже 'Успех и сбой' для: {0} :: {1}" -f $sub, $cur.Line)
+                Write-Log ("Subcategory {0} already has Success+Failure. Line: {1}" -f $sub, $cur.Line)
                 continue
             }
 
-            Write-Log ("Требуется включить Success+Failure для подкатегории: {0}. Текущая строка: {1}" -f $sub, $cur.Line)
+            Write-Log ("Enabling Success+Failure for subcategory: {0}. Current line: {1}" -f $sub, $cur.Line)
             $setArgs = ('/set /subcategory:"{0}" /success:enable /failure:enable' -f $sub)
             $set = Invoke-AuditPol -Arguments $setArgs
             if ($set.ExitCode -ne 0) {
-                Write-Log ("auditpol SET FAIL (код {0}): {1}`n{2}" -f $set.ExitCode, $setArgs, $set.Text)
+                Write-Log ("auditpol SET FAIL (code {0}): {1}`n{2}" -f $set.ExitCode, $setArgs, $set.Text)
                 return $false
             }
 
             $after = Get-CategorySettingLine -CategoryName $category -SubcategoryLabel $sub
             if ($null -ne $after.Line -and (Test-SuccessAndFailureText -Line $after.Line)) {
-                Write-Log ("OK: подкатегория '{0}' приведена к 'Успех и сбой'. Строка: {1}" -f $sub, $after.Line)
+                Write-Log ("OK: subcategory {0} set to Success+Failure. Line: {1}" -f $sub, $after.Line)
             } else {
-                Write-Log ("ПОСЛЕ SET строка для '{0}' всё ещё не похожа на 'Успех и сбой': {1}" -f $sub, $after.Line)
+                Write-Log ("After SET, line for {0} is still not Success+Failure. Line: {1}" -f $sub, $after.Line)
                 return $false
             }
         }
@@ -328,11 +332,11 @@ function Enable-SecurityAudit {
         foreach ($sub in $targets) {
             $cur = Get-CategorySettingLine -CategoryName $category -SubcategoryLabel $sub
             if (-not $cur.Ok) {
-                Write-Log ("Не удалось прочитать auditpol /get /category для '{0}' (код {1}). Вывод:`n{2}" -f $category, $cur.ExitCode, $cur.Text)
+                Write-Log ("Failed auditpol /get /category for category '{0}' (exit {1}). Output:`n{2}" -f $category, $cur.ExitCode, $cur.Text)
                 return $false
             }
             if ($null -eq $cur.Line) {
-                Write-Log ("В выводе категории '{0}' не найдена строка подкатегории '{1}'." -f $category, $sub)
+                Write-Log ("In category '{0}': no line for subcategory '{1}'." -f $category, $sub)
                 return $false
             }
             if (Test-SuccessAndFailureText -Line $cur.Line) { continue }
@@ -340,7 +344,7 @@ function Enable-SecurityAudit {
             $setArgs = ('/set /subcategory:"{0}" /success:enable /failure:enable' -f $sub)
             $set = Invoke-AuditPol -Arguments $setArgs
             if ($set.ExitCode -ne 0) {
-                Write-Log ("auditpol SET FAIL (код {0}): {1}`n{2}" -f $set.ExitCode, $setArgs, $set.Text)
+                Write-Log ("auditpol SET FAIL (code {0}): {1}`n{2}" -f $set.ExitCode, $setArgs, $set.Text)
                 return $false
             }
         }
@@ -351,27 +355,27 @@ function Enable-SecurityAudit {
 
     if ($preferRu) {
         if (Ensure-RuLogonLogoffSubcategories) {
-            Write-Log "Проверка аудита (RU): OK для 'Вход в систему' и 'Выход из системы'"
+            Write-Log "Audit policy (RU): enabled for Russian subcategory names (Logon/Logoff / Russian UI output)."
             return
         }
 
-        Write-Log "ВНИМАНИЕ (RU): не удалось автоматически привести аудит подкатегорий 'Вход/выход' к 'Успех и сбой' через auditpol. Скрипт продолжит работу, но часть событий может отсутствовать. Проверьте доменную/локальную GPO (часто мешает централизованный Advanced Audit Policy)."
+        Write-Log "WARNING (RU): could not set Russian Advanced Audit subcategories through auditpol. The script will continue, but some events may be missing. Check domain/GPO (central Advanced Audit Policy may override)."
         return
     }
 
     if (Ensure-EnLogonLogoffSubcategories) {
-        Write-Log "Проверка аудита (EN): OK для Logon/Logoff"
+        Write-Log "Audit policy (EN): OK for Logon/Logoff (English UI output)."
         return
     }
 
-    # Fallback: старый GUID категории Logon/Logoff (Microsoft). Это не "UID пользователя", а GUID категории политики аудита.
-    Write-Log "Пробую fallback через GUID категории Logon/Logoff..."
+    # Logon/Logoff category GUID (not a user id).
+    Write-Log "Trying Logon/Logoff category set via known GUID (fallback)..."
     $guidSet = Invoke-AuditPol -Arguments '/set /category:"{69979849-797A-11D9-BED3-505054503030}" /success:enable /failure:enable'
     if ($guidSet.ExitCode -ne 0) {
-        Write-Log ("auditpol GUID SET FAIL (код {0}):`n{1}" -f $guidSet.ExitCode, $guidSet.Text)
+        Write-Log ("auditpol GUID SET FAIL (code {0}):`n{1}" -f $guidSet.ExitCode, $guidSet.Text)
     }
 
-    Write-Log "ВНИМАНИЕ: не удалось автоматически настроить аудит входа/выхода через auditpol. Скрипт продолжит работу, но часть событий может отсутствовать. Проверьте политику аудита вручную (локальная/доменная GPO)."
+    Write-Log "WARNING: could not configure logon/logoff auditing via auditpol automatically. The script will continue; check audit policy in local/domain GPO."
 }
 
 function Test-RDSDeploymentPresent {
