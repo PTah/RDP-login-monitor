@@ -1,15 +1,12 @@
 <#
 .SYNOPSIS
-    Мониторинг логинов/попыток входа с уведомлениями в Telegram
+  Windows login / RDP / RD Gateway event monitor; Telegram notifications.
 .DESCRIPTION
-    Отслеживает события входа в систему (Security 4624/4625) и события RD Gateway (302/303),
-    отправляет уведомления в Telegram, делает ротацию логов, heartbeat в файл и ежедневный отчет.
+  Watches Security 4624/4625, optional Microsoft-Windows-TerminalServices-Gateway/Operational
+  302/303, log rotation, heartbeat file, and daily report.
 .NOTES
-    Требуется: PowerShell 5.0+, запуск от администратора.
-    Важное:
-    - На некоторых серверах RDP-логин приходит как LogonType=3, поэтому интерактивные типы: 2/3/10.
-    - Добавлены исключения шума: DWM-*, UMFD-*, HealthMailbox*, Font Driver Host*, NtLmSsp и др.
-    - Heartbeat без дрейфа: используется nextHeartbeatTime (а не "прошло N секунд").
+  PowerShell 5.0+; run elevated. String literals in this file are kept ASCII-only so the script
+  still parses if the .ps1 was re-encoded during download (e.g. broken UTF-8). Telegram messages are English.
 #>
 
 [CmdletBinding()]
@@ -21,31 +18,30 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# Строка из BMP code point (0x....) — в исходнике остается только ASCII, скрипт не ломается
-# при скачивании через IWR, если при переносе в строке испортится UTF-8.
+# RU auditpol labels as BMP code points (ASCII-only source)
 function Uc { param([int[]]$C) -join ($C | ForEach-Object { [char]$_ }) }
 
 # ============================================
-# КОНФИГУРАЦИЯ
+# CONFIG
 # ============================================
 
-# Версия (обновляйте при значимых изменениях; пишется в лог и в консоль при интерактивном запуске)
-$ScriptVersion = "1.1.1"
+# Version; logged to file and host on start
+$ScriptVersion = "1.2.0"
 
-# Логи
+# Logs
 $LogFile = "D:\Soft\Logs\login_monitor.log"
 $LogBackupFolder = "D:\Soft\Logs\Backup"
 $MaxBackupDays = 30
 
-# Ротация логов (ежедневно)
+# Log rotation (daily at local time)
 $LogRotationHour = 0
 $LogRotationMinute = 0
 
-# Heartbeat (только файл)
+# Heartbeat file only (no Telegram)
 $HeartbeatInterval = 3600
 $HeartbeatFile = "D:\Soft\Logs\last_heartbeat.txt"
 
-# Ежедневный отчет
+# Daily report (local time)
 $DailyReportHour = 9
 $DailyReportMinute = 0
 $LastReportFile = "D:\Soft\Logs\last_daily_report.txt"
@@ -93,22 +89,22 @@ $ExcludedComputerPatterns = @(
     "Authz*"
 )
 
-# Узкое исключение "шумовых" сетевых логонов (LogonType=3) от конкретных источников.
-# Пример: Proxmox Mail Gateway / LDAP sync, которые периодически создают 4624 с LogonProcessName=Advapi.
+# Optional: ignore noisy network logon (type 3) from a specific source IP + logon process substring
+# (e.g. some LDAP / mail gateway sync tools)
 $IgnoreAdvapiNetworkLogonSourceIps = @(
     "192.168.160.57"
 )
 $IgnoreAdvapiNetworkLogonProcessContains = "Advapi"
 
 # ============================================
-# ИНИЦИАЛИЗАЦИЯ
+# INIT
 # ============================================
 
 $LogDir = Split-Path $LogFile -Parent
 if (!(Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
 if (!(Test-Path $LogBackupFolder)) { New-Item -ItemType Directory -Path $LogBackupFolder -Force | Out-Null }
 
-# UTF-8 с BOM: иначе часть просмотрщиков (FAR и др.) открывает лог как ANSI/OEM и показывает "кракозябры".
+# UTF-8 with BOM for log files (safer in older viewers)
 $script:Utf8BomEncoding = New-Object System.Text.UTF8Encoding $true
 
 function Ensure-FileStartsWithUtf8Bom {
@@ -152,13 +148,13 @@ function ConvertTo-TelegramHtml {
 try {
     [System.Net.ServicePointManager]::SecurityProtocol =
         [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
-    Write-Log "TLS 1.2 включен"
+    Write-Log "TLS 1.2 enabled"
 } catch {
     try {
         [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
-        Write-Log "TLS 1.2 установлен"
+        Write-Log "TLS 1.2 set"
     } catch {
-        Write-Log "ВНИМАНИЕ: Не удалось включить TLS 1.2"
+        Write-Log "WARNING: could not set TLS 1.2"
     }
 }
 
@@ -166,7 +162,7 @@ function Send-TelegramMessage {
     param([string]$Message)
 
     if ([string]::IsNullOrWhiteSpace($TelegramBotToken) -or [string]::IsNullOrWhiteSpace($TelegramChatID)) {
-        Write-Log "Telegram: не задан токен/chat_id"
+        Write-Log "Telegram: missing token or chat_id"
         return $false
     }
 
@@ -182,23 +178,23 @@ function Send-TelegramMessage {
         $null = Invoke-RestMethod -Uri $uri -Method Post -Body $body -ErrorAction Stop -TimeoutSec 30
         return $true
     } catch {
-        Write-Log "Ошибка отправки в Telegram: $($_.Exception.Message)"
+        Write-Log "Telegram send error: $($_.Exception.Message)"
         return $false
     }
 }
 
 function Test-TelegramConnection {
-    Write-Log "Проверка подключения к Telegram API..."
+    Write-Log "Testing Telegram API (getMe)..."
     try {
         [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
         $testUrl = "https://api.telegram.org/bot$TelegramBotToken/getMe"
         $response = Invoke-RestMethod -Uri $testUrl -Method Get -TimeoutSec 10 -ErrorAction Stop
         if ($response.ok) {
-            Write-Log "Подключение к Telegram успешно. Бот: @$($response.result.username)"
+            Write-Log "Telegram OK, bot: @$($response.result.username)"
             return $true
         }
     } catch {
-        Write-Log "Ошибка подключения к Telegram: $($_.Exception.Message)"
+        Write-Log "Telegram API error: $($_.Exception.Message)"
         return $false
     }
     return $false
@@ -211,10 +207,10 @@ function Test-Administrator {
 }
 
 if (-not (Test-Administrator)) {
-    Write-Log "ОШИБКА: Скрипт должен быть запущен от имени администратора! (версия $ScriptVersion)"
+    Write-Log "ERROR: run elevated (Administrator). Version $ScriptVersion"
     exit 1
 }
-Write-Log "Скрипт запущен с правами администратора, версия $ScriptVersion"
+Write-Log "Running as Administrator, version $ScriptVersion"
 
 function Enable-SecurityAudit {
     Write-Log "Checking security audit (auditpol) settings..."
@@ -379,8 +375,7 @@ function Enable-SecurityAudit {
 }
 
 function Test-RDSDeploymentPresent {
-    # Узел только с RD Gateway (RDS-Gateway и т.п.) не считаем «полноценным RDS по сессиям» —
-    # для шлюза отдельное сообщение в Telegram (журнал Gateway, 302/303 к целевым ПК).
+    # Gateway-only nodes are not "full session host"; gateway traffic uses separate Telegram lines (302/303)
     $gatewayOnlyFeatureNames = @('RDS-Gateway', 'RDS-WEB-ACCESS')
 
     try {
@@ -411,22 +406,22 @@ function Send-Heartbeat {
     $hHost = (ConvertTo-TelegramHtml $env:COMPUTERNAME)
 
     if ($IsStartup) {
-        $message = "<b>✅ Мониторинг логинов ЗАПУЩЕН</b>`r`n"
-        $message += "🖥️ Сервер: $hHost`r`n"
-        $message += "🕐 Время запуска: $timestamp"
+        $message = "<b>Login monitor started</b>`r`n"
+        $message += "Host: $hHost`r`n"
+        $message += "Time: $timestamp"
         if (Test-RDSDeploymentPresent) {
-            $message += "`r`n🔐 <b>RDS (хост сессий):</b> обнаружены компоненты RDS помимо чистого шлюза — в мониторинг входят входы по RDP/RDS на этом узле (Security 4624/4625, типы входа по настройке скрипта)."
+            $message += "`r`n<b>RDS (session host role):</b> this server has non-Gateway RDS components; 4624/4625 and configured logon types are monitored (see script settings)"
         }
         if ($EnableRDGatewayMonitoring) {
             try {
                 $gwLog = Get-WinEvent -ListLog $RDGatewayLogName -ErrorAction SilentlyContinue
                 if ($gwLog) {
-                    $message += "`r`n🌐 <b>RD Gateway:</b> журнал шлюза доступен — дополнительно фиксируются подключения пользователей к <b>внутренним целевым компьютерам</b> через RD Gateway (события 302/303 в журнале шлюза)."
+                    $message += "`r`n<b>RD Gateway log:</b> also recording user connections to <b>internal target PCs</b> via the gateway (events 302/303)"
                 }
             } catch { }
         }
         Send-TelegramMessage -Message $message | Out-Null
-        Write-Log "Отправлено уведомление о запуске скрипта"
+        Write-Log "Startup notification sent to Telegram"
     } else {
         Write-TextFileUtf8Bom -Path $HeartbeatFile -Text $timestamp
     }
@@ -438,13 +433,13 @@ function Send-StopNotification {
     $timestamp = Get-Date -Format "dd.MM.yyyy HH:mm:ss"
     $hHost = (ConvertTo-TelegramHtml $env:COMPUTERNAME)
     $hReason = (ConvertTo-TelegramHtml $Reason)
-    $message = "<b>⚠️ МОНИТОРИНГ ЛОГИНОВ ОСТАНОВЛЕН</b>`r`n"
-    $message += "🖥️ Сервер: $hHost`r`n"
-    $message += "🕐 Время остановки: $timestamp`r`n"
-    $message += "📋 Причина: $hReason"
+    $message = "<b>Login monitor stopped</b>`r`n"
+    $message += "Host: $hHost`r`n"
+    $message += "Time: $timestamp`r`n"
+    $message += "Reason: $hReason"
 
     Send-TelegramMessage -Message $message | Out-Null
-    Write-Log "Уведомление об остановке отправлено: $Reason"
+    Write-Log "Stop notification sent: $Reason"
 }
 
 function Rotate-LogFile {
@@ -456,21 +451,21 @@ function Rotate-LogFile {
 
             Copy-Item -Path $LogFile -Destination $backupFilePath -Force
             Clear-Content -Path $LogFile -Force
-            # После Clear-Content файл пустой без BOM — восстановим UTF-8 BOM для корректного просмотра в FAR/редакторах
+            # Re-add UTF-8 BOM after Clear-Content
             Ensure-FileStartsWithUtf8Bom -Path $LogFile
-            Write-Log "Лог-файл скопирован в бэкап: $backupFilePath"
+            Write-Log "Log file copied to backup: $backupFilePath"
 
             $oldBackups = Get-ChildItem -Path $LogBackupFolder -Filter "LoginLog_*.bak" |
                 Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-$MaxBackupDays) }
 
             foreach ($oldBackup in $oldBackups) {
                 Remove-Item -Path $oldBackup.FullName -Force
-                Write-Log "Удален старый бэкап: $($oldBackup.Name)"
+                Write-Log "Deleted old backup: $($oldBackup.Name)"
             }
             return $true
         }
     } catch {
-        Write-Log "Ошибка при ротации лог-файла: $($_.Exception.Message)"
+        Write-Log "Log rotation error: $($_.Exception.Message)"
     }
     return $false
 }
@@ -523,11 +518,11 @@ function Cleanup-OldLogs {
                 Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-$MaxBackupDays) }
             foreach ($oldBackup in $oldBackups) {
                 Remove-Item -Path $oldBackup.FullName -Force
-                Write-Log "Удален старый бэкап: $($oldBackup.Name)"
+                Write-Log "Deleted old backup: $($oldBackup.Name)"
             }
         }
     } catch {
-        Write-Log "Ошибка при очистке старых логов: $($_.Exception.Message)"
+        Write-Log "Old log cleanup error: $($_.Exception.Message)"
     }
 }
 
@@ -566,15 +561,15 @@ function Convert-ToIntSafe {
 function Get-LogonTypeName {
     param([int]$LogonType)
     switch ($LogonType) {
-        2  { return "Интерактивный (консоль)" }
-        3  { return "Сеть/RDP (Network) (3)" }
-        10 { return "Удаленный интерактивный (RDP) (10)" }
-        4  { return "Пакетный (Batch)" }
-        5  { return "Сервис (Service)" }
-        7  { return "Разблокировка (Unlock)" }
-        8  { return "Сетевой с явными данными" }
-        9  { return "Новые учетные данные" }
-        default { return "Тип $LogonType (неизвестный)" }
+        2  { return "Interactive (console) (2)" }
+        3  { return "Network (3) / often RDP on some hosts" }
+        10 { return "Remote interactive RDP (10)" }
+        4  { return "Batch (4)" }
+        5  { return "Service (5)" }
+        7  { return "Unlock (7)" }
+        8  { return "Network cleartext (8)" }
+        9  { return "New credentials (9)" }
+        default { return "Type $LogonType (other)" }
     }
 }
 
@@ -596,12 +591,12 @@ function Should-IgnoreEvent {
     if ($EventID -eq 4648) { return $true }
     if ([string]::IsNullOrWhiteSpace($Username)) { return $true }
 
-    # DWM/UMFD (иногда приходит как DOMAIN\DWM-8)
+    # DWM/UMFD (e.g. DOMAIN\\DWM-8)
     if ($Username -match '(?i)(\\)?DWM-\d+') { return $true }
     if ($Username -match '(?i)(\\)?UMFD-\d+') { return $true }
     if ($Username -like "*$") { return $true }
 
-    # Узкий фильтр: сетевой логон (3) + Advapi + конкретный IP источника
+    # Network logon 3 + Advapi + allowlisted source IP
     if ($EventID -eq 4624 -and $LogonType -eq 3) {
         foreach ($ip in $IgnoreAdvapiNetworkLogonSourceIps) {
             if ([string]::IsNullOrWhiteSpace($ip)) { continue }
@@ -667,7 +662,7 @@ function Get-LoginEventInfo {
             )
         }
     } catch {
-        Write-Log "Ошибка при извлечении данных события: $($_.Exception.Message)"
+        Write-Log "Error parsing event data: $($_.Exception.Message)"
     }
 
     if ([string]::IsNullOrWhiteSpace($eventData.Username)) { $eventData.Username = "-" }
@@ -702,19 +697,19 @@ function Format-LoginEvent {
     $hTime = (ConvertTo-TelegramHtml ($TimeCreated.ToString('dd.MM.yyyy HH:mm:ss')))
 
     $message = "<b>"
-    if ($EventID -eq 4624) { $message += "✅ УСПЕШНЫЙ ВХОД" }
-    elseif ($EventID -eq 4625) { $message += "❌ НЕУДАЧНАЯ ПОПЫТКА" }
-    else { $message += "⚠️ СОБЫТИЕ" }
+    if ($EventID -eq 4624) { $message += "LOGON OK" }
+    elseif ($EventID -eq 4625) { $message += "LOGON FAILED" }
+    else { $message += "EVENT" }
     $message += "</b>`r`n"
 
-    $message += "👤 Пользователь: $hUser`r`n"
-    $message += "🏢 Сервер (журнал Security): $hLog`r`n"
-    $message += "🖥️ Рабочая станция (клиент из события): $hWkst`r`n"
-    $message += "🌐 IP адрес: $hIp`r`n"
-    $message += "⚙️ Процесс/Код: $hProc`r`n"
-    $message += "🔑 Тип входа: $hLtName ($LogonType)`r`n"
-    $message += "🕐 Время: $hTime`r`n"
-    $message += "🔢 Event ID: $EventID"
+    $message += "User: $hUser`r`n"
+    $message += "Security log (machine): $hLog`r`n"
+    $message += "Workstation: $hWkst`r`n"
+    $message += "IP: $hIp`r`n"
+    $message += "Process/code: $hProc`r`n"
+    $message += "Logon type: $hLtName ($LogonType)`r`n"
+    $message += "Time: $hTime`r`n"
+    $message += "Event ID: $EventID"
 
     return $message
 }
@@ -723,11 +718,11 @@ function Test-RDGatewayLog {
     try {
         $logExists = Get-WinEvent -ListLog $RDGatewayLogName -ErrorAction SilentlyContinue
         if ($logExists) {
-            Write-Log "Журнал RD Gateway доступен: $RDGatewayLogName"
+            Write-Log "RD Gateway log found: $RDGatewayLogName"
             return $true
         }
     } catch {
-        Write-Log "Ошибка при проверке журнала RD Gateway: $($_.Exception.Message)"
+        Write-Log "RD Gateway log check error: $($_.Exception.Message)"
     }
     return $false
 }
@@ -760,7 +755,7 @@ function Get-RDGatewayEventInfo {
             }
         }
     } catch {
-        Write-Log "Ошибка при извлечении RD Gateway события: $($_.Exception.Message)"
+        Write-Log "RD Gateway event parse error: $($_.Exception.Message)"
     }
     return $eventData
 }
@@ -783,20 +778,20 @@ function Format-RDGatewayEvent {
     $hTime = (ConvertTo-TelegramHtml ($TimeCreated.ToString('dd.MM.yyyy HH:mm:ss')))
 
     $message = "<b>"
-    if ($EventID -eq 302) { $message += "🖥️ УСПЕШНОЕ ПОДКЛЮЧЕНИЕ ЧЕРЕЗ RD GATEWAY" }
-    elseif ($EventID -eq 303) { $message += "❌ НЕУДАЧНОЕ ПОДКЛЮЧЕНИЕ ЧЕРЕЗ RD GATEWAY" }
-    else { $message += "⚠️ СОБЫТИЕ RD GATEWAY" }
+    if ($EventID -eq 302) { $message += "RD Gateway connection OK" }
+    elseif ($EventID -eq 303) { $message += "RD Gateway connection FAILED" }
+    else { $message += "RD Gateway event" }
     $message += "</b>`r`n"
 
-    $message += "👤 Пользователь: $hUser`r`n"
-    $message += "🌐 IP пользователя (внешний): $hExt`r`n"
-    $message += "🖥️ IP внутренний: $hInt`r`n"
-    $message += "🔌 Протокол: $hProto`r`n"
+    $message += "User: $hUser`r`n"
+    $message += "Client IP: $hExt`r`n"
+    $message += "Target IP: $hInt`r`n"
+    $message += "Protocol: $hProto`r`n"
     if ($EventID -eq 303 -and $ErrorCode -ne "0" -and $ErrorCode -ne "N/A") {
-        $message += "⚠️ Код ошибки: $(ConvertTo-TelegramHtml $ErrorCode)`r`n"
+        $message += "Error: $(ConvertTo-TelegramHtml $ErrorCode)`r`n"
     }
-    $message += "🕐 Время: $hTime`r`n"
-    $message += "🔢 Event ID: $EventID"
+    $message += "Time: $hTime`r`n"
+    $message += "Event ID: $EventID"
     return $message
 }
 
@@ -818,27 +813,27 @@ function Send-DailyReport {
             }
         }
         $count = $usernames.Count
-        # PS 5.1: без @() один логин даёт скаляр String (нет .Count); пустой список даёт $null.
+        # PS 5.1: a single name can be a scalar (no .Count); empty list is $null
         $uniqueUsers = @($usernames | Sort-Object -Unique)
-        $message = "<b>📊 ЕЖЕДНЕВНЫЙ ОТЧЕТ</b>`r`n"
-        $message += "🖥️ Сервер: $(ConvertTo-TelegramHtml $env:COMPUTERNAME)`r`n"
-        $message += "🕐 Время отчета: $(Get-Date -Format 'dd.MM.yyyy HH:mm:ss')`r`n"
-        $message += "👥 Активных сессий (quser): $count`r`n"
+        $message = "<b>Daily report (quser)</b>`r`n"
+        $message += "Server: $(ConvertTo-TelegramHtml $env:COMPUTERNAME)`r`n"
+        $message += "Time: $(Get-Date -Format 'dd.MM.yyyy HH:mm:ss')`r`n"
+        $message += "Active sessions: $count`r`n"
         if ($uniqueUsers.Count -gt 0) {
-            $message += "`r`n<b>Уникальные логины ($($uniqueUsers.Count)):</b>`r`n"
+            $message += "`r`n<b>Unique logon names ($($uniqueUsers.Count)):</b>`r`n"
             foreach ($name in $uniqueUsers) {
                 $safe = [System.Net.WebUtility]::HtmlEncode($name)
-                $message += "  • $safe`r`n"
+                $message += "  - $safe`r`n"
             }
         } else {
-            $message += "`r`n<i>Список пользователей недоступен (quser пуст или недостаточно прав).</i>"
+            $message += "`r`n<i>User list not available (quser empty or insufficient rights).</i>"
         }
         Send-TelegramMessage -Message $message | Out-Null
         Write-TextFileUtf8Bom -Path $LastReportFile -Text ((Get-Date).ToString("yyyy-MM-dd HH:mm:ss"))
-        Write-Log "Ежедневный отчет отправлен"
+        Write-Log "Daily report sent to Telegram"
         return $true
     } catch {
-        Write-Log "Ошибка ежедневного отчета: $($_.Exception.Message)"
+        Write-Log "Daily report error: $($_.Exception.Message)"
         return $false
     }
 }
@@ -874,8 +869,8 @@ function Start-LoginMonitor {
     )
 
     Write-Log "========================================"
-    Write-Log "Запуск мониторинга логинов"
-    Write-Log "Интерактивные типы: 2,3,10"
+    Write-Log "Starting login event monitor"
+    Write-Log "Monitoring logon types: 2,3,10 (when not in monitor-all mode)"
     Write-Log "========================================"
 
     Cleanup-OldLogs
@@ -986,7 +981,7 @@ function Start-LoginMonitor {
                 $nextReportCheck = Check-AndSendDailyReport
             }
         } catch {
-            Write-Log "Ошибка цикла мониторинга: $($_.Exception.Message)"
+            Write-Log "Monitor loop error: $($_.Exception.Message)"
         }
         Start-Sleep -Seconds $MonitorInterval
     }
@@ -997,13 +992,13 @@ try {
     Test-TelegramConnection | Out-Null
     Start-LoginMonitor -MonitorInterval 5 -MonitorInteractiveOnly
 } catch {
-    Write-Log "Критическая ошибка: $($_.Exception.Message)"
-    Send-StopNotification -Reason "Критическая ошибка: $($_.Exception.Message)"
+    Write-Log "Fatal error: $($_.Exception.Message)"
+    Send-StopNotification -Reason "Fatal error: $($_.Exception.Message)"
     $script:StopNotificationSent = $true
     throw
 } finally {
     if (-not $script:StopNotificationSent) {
-        Send-StopNotification -Reason "Скрипт завершил работу"
+        Send-StopNotification -Reason "Script exited"
     }
 }
 
