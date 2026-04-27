@@ -30,7 +30,7 @@ function Uc { param([int[]]$C) -join ($C | ForEach-Object { [char]$_ }) }
 # ============================================
 
 # Версия (обновляйте при значимых изменениях; пишется в лог и в консоль при интерактивном запуске)
-$ScriptVersion = "1.1.1"
+$ScriptVersion = "1.1.2"
 
 # Логи
 $LogFile = "D:\Soft\Logs\login_monitor.log"
@@ -240,7 +240,8 @@ function Enable-SecurityAudit {
 
         $r = Invoke-AuditPol -Arguments '/list /subcategory:*'
         if ($r.ExitCode -ne 0) { return $false }
-        $ax = Uc @(0x0412,0x0445,0x043E,0x0434,0x002F,0x0432,0x044B,0x043E,0x0434)
+        # RU category Logon/Logoff (Uc): must include 0x0445 before second 043E (was 0x57 from auditpol)
+        $ax = Uc @(0x0412,0x0445,0x043E,0x0434,0x002F,0x0432,0x044B,0x0445,0x043E,0x0434)
         return ($r.Text -like ('*{0}*' -f $ax))
     }
 
@@ -281,7 +282,7 @@ function Enable-SecurityAudit {
     }
 
     function Ensure-RuLogonLogoffSubcategories {
-        $category = Uc @(0x0412,0x0445,0x043E,0x0434,0x002F,0x0432,0x044B,0x043E,0x0434)
+        $category = Uc @(0x0412,0x0445,0x043E,0x0434,0x002F,0x0432,0x044B,0x0445,0x043E,0x0434)
         $targets = @(
             (Uc @(0x0412,0x0445,0x043E,0x0434,0x0020,0x0432,0x0020,0x0441,0x0438,0x0441,0x0442,0x0435,0x043C,0x0443)),
             (Uc @(0x0412,0x044B,0x0445,0x043E,0x0434,0x0020,0x0438,0x0437,0x0020,0x0441,0x0438,0x0441,0x0442,0x0435,0x043C,0x044B))
