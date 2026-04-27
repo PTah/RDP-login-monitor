@@ -25,6 +25,9 @@ $ErrorActionPreference = "Stop"
 # КОНФИГУРАЦИЯ
 # ============================================
 
+# Версия (обновляйте при значимых изменениях; пишется в лог и в консоль при интерактивном запуске)
+$ScriptVersion = "1.1.0"
+
 # Логи
 $LogFile = "D:\Soft\Logs\login_monitor.log"
 $LogBackupFolder = "D:\Soft\Logs\Backup"
@@ -204,10 +207,10 @@ function Test-Administrator {
 }
 
 if (-not (Test-Administrator)) {
-    Write-Log "ОШИБКА: Скрипт должен быть запущен от имени администратора!"
+    Write-Log "ОШИБКА: Скрипт должен быть запущен от имени администратора! (версия $ScriptVersion)"
     exit 1
 }
-Write-Log "Скрипт запущен с правами администратора"
+Write-Log "Скрипт запущен с правами администратора, версия $ScriptVersion"
 
 function Enable-SecurityAudit {
     Write-Log "Проверка настроек аудита..."
