@@ -10,6 +10,8 @@
     - На некоторых серверах RDP-логин приходит как LogonType=3, поэтому интерактивные типы: 2/3/10.
     - Добавлены исключения шума: DWM-*, UMFD-*, HealthMailbox*, Font Driver Host*, NtLmSsp и др.
     - Heartbeat без дрейфа: используется nextHeartbeatTime (а не "прошло N секунд").
+    - Win32_OperatingSystem.ProductType: 1 = рабочая станция (4624/4625 только LogonType 10 + при наличии журнала событие 1149 RCM);
+      2/3 = сервер/КД — прежняя логика (типы 2, 3, 10).
 #>
 
 [CmdletBinding()]
@@ -30,7 +32,7 @@ function Uc { param([int[]]$C) -join ($C | ForEach-Object { [char]$_ }) }
 # ============================================
 
 # Версия (обновляйте при значимых изменениях; пишется в лог и в консоль при интерактивном запуске)
-$ScriptVersion = "1.1.3"
+$ScriptVersion = "1.2.0"
 
 # Логи
 $LogFile = "D:\Soft\Logs\login_monitor.log"
@@ -54,6 +56,10 @@ $LastReportFile = "D:\Soft\Logs\last_daily_report.txt"
 $EnableRDGatewayMonitoring = $true
 $RDGatewayLogName = "Microsoft-Windows-TerminalServices-Gateway/Operational"
 $RDGatewayEvents = @(302, 303)
+
+# RDP Remote Connection Manager (workstations): User authentication succeeded — событие 1149
+$RcmLogName = "Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational"
+$RcmEventId = 1149
 
 $ExcludedProcesses = @(
     "HTTP", "HTTP/*", "W3WP.EXE", "MSExchange", "SYSTEM", "LOCAL SERVICE",
@@ -215,6 +221,9 @@ if (-not (Test-Administrator)) {
     exit 1
 }
 Write-Log "Скрипт запущен с правами администратора, версия $ScriptVersion"
+
+$script:IsWorkstation = $false
+$script:OsInstallKindLabel = ""
 
 function Enable-SecurityAudit {
     Write-Log "Checking security audit (auditpol) settings..."
@@ -398,6 +407,97 @@ function Test-RDSDeploymentPresent {
     return $false
 }
 
+function Get-OsInstallKind {
+    try {
+        $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+        $pt = [int]$os.ProductType
+        # 1 Workstation, 2 Domain Controller, 3 Server (member)
+        $label = switch ($pt) {
+            1 { 'Workstation' }
+            2 { 'Domain Controller' }
+            3 { 'Server' }
+            default { "ProductType=$pt" }
+        }
+        return [pscustomobject]@{
+            ProductType   = $pt
+            IsWorkstation = ($pt -eq 1)
+            Label         = $label
+        }
+    } catch {
+        Write-Log "Определение SKU ОС не удалось: $($_.Exception.Message); считаем Server"
+        return [pscustomobject]@{
+            ProductType   = 3
+            IsWorkstation = $false
+            Label         = 'Unknown (assume Server)'
+        }
+    }
+}
+
+function Test-RcmLogAvailable {
+    try {
+        $logExists = Get-WinEvent -ListLog $RcmLogName -ErrorAction SilentlyContinue
+        return [bool]$logExists
+    } catch {
+        return $false
+    }
+}
+
+function Get-Rcm1149EventInfo {
+    param($Event)
+    $eventData = @{
+        TimeCreated = $Event.TimeCreated
+        Username = "-"
+        ClientIP = "-"
+    }
+    try {
+        $map = Get-EventDataMap -Event $Event
+        $user = Get-FirstNonEmptyMapValue -DataMap $map -Keys @(
+            "TargetUser","User","Domain User","Param1","AccountName","ConnectionUser","SubjectUserName"
+        )
+        $ip = Get-FirstNonEmptyMapValue -DataMap $map -Keys @(
+            "ClientIP","Client Address","IpAddress","Ip","Param3","Address","CallingStationId"
+        )
+        if (-not [string]::IsNullOrWhiteSpace($user)) { $eventData.Username = [string]$user }
+        if (-not [string]::IsNullOrWhiteSpace($ip)) { $eventData.ClientIP = [string]$ip }
+
+        if ($eventData.Username -eq '-' -and $Event.Properties.Count -gt 0) {
+            $eventData.Username = [string]$Event.Properties[0].Value
+        }
+        if ($eventData.ClientIP -eq '-') {
+            if ($Event.Properties.Count -gt 2) {
+                $eventData.ClientIP = [string]$Event.Properties[2].Value
+            } elseif ($Event.Properties.Count -gt 1) {
+                $eventData.ClientIP = [string]$Event.Properties[1].Value
+            }
+        }
+    } catch {
+        Write-Log "Ошибка разбора события RCM 1149: $($_.Exception.Message)"
+    }
+    return $eventData
+}
+
+function Format-Rcm1149Event {
+    param(
+        [string]$Username,
+        [string]$ClientIP,
+        [datetime]$TimeCreated,
+        [string]$SecurityLogComputerName
+    )
+    $logHost = $SecurityLogComputerName
+    if ([string]::IsNullOrWhiteSpace($logHost)) { $logHost = $env:COMPUTERNAME }
+    $hUser = (ConvertTo-TelegramHtml $Username)
+    $hIp = (ConvertTo-TelegramHtml $ClientIP)
+    $hLog = (ConvertTo-TelegramHtml $logHost)
+    $hTime = (ConvertTo-TelegramHtml ($TimeCreated.ToString('dd.MM.yyyy HH:mm:ss')))
+    $message = "<b>🔑 RDP: успешная аутентификация (1149)</b>`r`n"
+    $message += "👤 Пользователь: $hUser`r`n"
+    $message += "🏢 Узел: $hLog`r`n"
+    $message += "🌐 Клиент (IP): $hIp`r`n"
+    $message += "🕐 Время: $hTime`r`n"
+    $message += "🔢 Event ID: 1149 (RemoteConnectionManager)"
+    return $message
+}
+
 function Send-Heartbeat {
     param([switch]$IsStartup = $false)
 
@@ -408,6 +508,14 @@ function Send-Heartbeat {
         $message = "<b>✅ Мониторинг логинов ЗАПУЩЕН</b>`r`n"
         $message += "🖥️ Сервер: $hHost`r`n"
         $message += "🕐 Время запуска: $timestamp"
+        if ($script:OsInstallKindLabel) {
+            $message += "`r`n💻 <b>Тип установки:</b> $(ConvertTo-TelegramHtml $script:OsInstallKindLabel)"
+        }
+        if ($script:IsWorkstation) {
+            $message += "`r`n📌 <b>Режим:</b> рабочая станция — Security 4624/4625 только LogonType 10 (RDP); при наличии журнала — также 1149 (Remote Connection Manager)."
+        } else {
+            $message += "`r`n📌 <b>Режим:</b> сервер — Security 4624/4625, типы входа 2, 3, 10."
+        }
         if (Test-RDSDeploymentPresent) {
             $message += "`r`n🔐 <b>RDS (хост сессий):</b> обнаружены компоненты RDS помимо чистого шлюза — в мониторинг входят входы по RDP/RDS на этом узле (Security 4624/4625, типы входа по настройке скрипта)."
         }
@@ -867,9 +975,18 @@ function Start-LoginMonitor {
         [switch]$MonitorInteractiveOnly = $true
     )
 
+    $osKind = Get-OsInstallKind
+    $script:IsWorkstation = $osKind.IsWorkstation
+    $script:OsInstallKindLabel = $osKind.Label
+    Write-Log "Тип ОС (Win32_ProductType=$($osKind.ProductType)): $($osKind.Label)"
+
     Write-Log "========================================"
     Write-Log "Запуск мониторинга логинов"
-    Write-Log "Интерактивные типы: 2,3,10"
+    if ($osKind.IsWorkstation) {
+        Write-Log "Режим рабочей станции: Security — только LogonType 10 (RDP); при наличии журнала — событие 1149 (Remote Connection Manager)."
+    } else {
+        Write-Log "Режим сервера: Security — LogonType 2, 3, 10"
+    }
     Write-Log "========================================"
 
     Cleanup-OldLogs
@@ -879,11 +996,17 @@ function Start-LoginMonitor {
     $rdGatewayAvailable = $false
     if ($EnableRDGatewayMonitoring) { $rdGatewayAvailable = Test-RDGatewayLog }
 
+    $rcmMonitoringEnabled = ($osKind.IsWorkstation -and (Test-RcmLogAvailable))
+    if ($osKind.IsWorkstation -and -not $rcmMonitoringEnabled) {
+        Write-Log "Рабочая станция: журнал Remote Connection Manager недоступен — уведомления только по Security 4624/4625 (LogonType 10). Проверьте, что включён удалённый рабочий стол."
+    }
+
     $nextHeartbeatTime = (Get-Date).AddSeconds($HeartbeatInterval)
     $nextRotationCheck = Check-AndRotateLog
     $nextReportCheck = Check-AndSendDailyReport
     $lastCheckTime = (Get-Date).AddSeconds(-10)
     $lastGatewayCheckTime = (Get-Date).AddSeconds(-10)
+    $lastRcmCheckTime = (Get-Date).AddSeconds(-10)
     $monitorEvents = @(4624, 4625, 4648)
 
     while ($true) {
@@ -906,7 +1029,11 @@ function Start-LoginMonitor {
                         if ($event.Id -eq 4648) {
                             $shouldIgnore = $true
                         } elseif ($event.Id -in 4624, 4625) {
-                            $interactiveTypes = @(2, 3, 10)
+                            if ($osKind.IsWorkstation) {
+                                $interactiveTypes = @(10)
+                            } else {
+                                $interactiveTypes = @(2, 3, 10)
+                            }
                             if ($interactiveTypes -notcontains $eventInfo.LogonType) {
                                 $shouldIgnore = $true
                             }
@@ -965,6 +1092,30 @@ function Start-LoginMonitor {
                         Send-TelegramMessage -Message $msg | Out-Null
                     }
                     $lastGatewayCheckTime = ($gatewayEvents | Measure-Object -Property TimeCreated -Maximum | Select-Object -ExpandProperty Maximum).AddSeconds(1)
+                }
+            }
+
+            if ($rcmMonitoringEnabled) {
+                $rcmEvents = Get-WinEvent -FilterHashtable @{
+                    LogName = $RcmLogName
+                    ID = $RcmEventId
+                    StartTime = $lastRcmCheckTime
+                } -ErrorAction SilentlyContinue
+
+                if ($rcmEvents) {
+                    foreach ($event in $rcmEvents) {
+                        if ($event.TimeCreated -le $lastRcmCheckTime) { continue }
+                        $rcmInfo = Get-Rcm1149EventInfo -Event $event
+                        if ($rcmInfo.Username -like "*$") { continue }
+                        if (Should-IgnoreEvent -Username $rcmInfo.Username -ProcessName "-" `
+                                -ComputerName "-" -EventID 1149 -LogonType 10 -SourceIP $rcmInfo.ClientIP) { continue }
+
+                        $msg = Format-Rcm1149Event -Username $rcmInfo.Username -ClientIP $rcmInfo.ClientIP `
+                            -TimeCreated $rcmInfo.TimeCreated -SecurityLogComputerName $event.MachineName
+                        Write-Log "Notify RCM 1149: User=$($rcmInfo.Username) IP=$($rcmInfo.ClientIP)"
+                        Send-TelegramMessage -Message $msg | Out-Null
+                    }
+                    $lastRcmCheckTime = ($rcmEvents | Measure-Object -Property TimeCreated -Maximum | Select-Object -ExpandProperty Maximum).AddSeconds(1)
                 }
             }
 
