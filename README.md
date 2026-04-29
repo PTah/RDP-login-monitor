@@ -1,10 +1,14 @@
 # RDP Login Monitor
 
-PowerShell-набор для мониторинга входов в Windows с отправкой уведомлений в Telegram:
+PowerShell-набор для мониторинга входов в Windows с отправкой уведомлений в Telegram.
 
-- `Login_Monitor.ps1` — основной монитор (Security `4624/4625`, RD Gateway `302/303`, ротация логов, heartbeat, ежедневный отчет).
-- `Watchdog_RDP_Monitor.ps1` — watchdog: проверяет, жив ли основной скрипт, и перезапускает его при падении/зависании heartbeat.
-- `Install-ScheduledTasks.ps1` — создание в Планировщике заданий с теми же именами и параметрами, что в разделе 3 (нужна повышенная PowerShell).
+## Актуальная схема (рекомендуется)
+
+- **`Login_Monitor.ps1`** — единый монитор: журнал Security (`4624`/`4625`), при необходимости RD Gateway (`302`/`303`), рабочие станции и серверы, ротация логов, heartbeat, отчёты. Устанавливается в **`C:\ProgramData\RDP-login-monitor\`**, задачи **`RDP-Login-Monitor`** и **`RDP-Login-Monitor-Watchdog`** создаются параметром **`-InstallTasks`** (встроено в скрипт).
+- **`Deploy-LoginMonitor.ps1`** + **`version.txt`** — доставка с файловой шары по версии (домен, GPO «автозагрузка» компьютера). Подробности, структура шары и правила версий: **[DEPLOY.md](DEPLOY.md)**.
+- **`Encrypt-DpapiForRdpMonitor.ps1`** — опционально, для DPAPI-строк токена/chat id на конкретном ПК.
+
+Разделы ниже про **`D:\Soft\`**, **`Watchdog_RDP_Monitor.ps1`** и **`Install-ScheduledTasks.ps1`** относятся к **старой схеме** и оставлены для совместимости; новые установки ориентируйте на **`ProgramData`** и **DEPLOY.md**.
 
 ## Что изменилось (важное)
 

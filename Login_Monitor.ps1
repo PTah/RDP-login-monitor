@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Мониторинг логинов/попыток входа с уведомлениями в Telegram
 .DESCRIPTION
@@ -6,18 +6,31 @@
     отправляет уведомления в Telegram, делает ротацию логов, heartbeat в файл и ежедневный отчет.
 .NOTES
     Требуется: PowerShell 5.0+, запуск от администратора.
+    Рабочая копия скрипта: C:\ProgramData\RDP-login-monitor\Login_Monitor.ps1
+    Логи и бэкапы: C:\ProgramData\RDP-login-monitor\Logs\ (бэкапы 31 день).
+    Задачи планировщика: RDP-Login-Monitor (запуск при старте ОС), RDP-Login-Monitor-Watchdog (контроль раз в 5 мин).
     Важное:
     - На некоторых серверах RDP-логин приходит как LogonType=3, поэтому интерактивные типы: 2/3/10.
     - Добавлены исключения шума: DWM-*, UMFD-*, HealthMailbox*, Font Driver Host*, NtLmSsp и др.
     - Heartbeat без дрейфа: используется nextHeartbeatTime (а не "прошло N секунд").
     - Win32_OperatingSystem.ProductType: 1 = рабочая станция (4624/4625 только LogonType 10 + при наличии журнала событие 1149 RCM);
       2/3 = сервер/КД — прежняя логика (типы 2, 3, 10).
+    Секреты Telegram (DPAPI LocalMachine): на ЭТОЙ машине, под админом, выполните:
+      Add-Type -AssemblyName System.Security
+      $p=[Text.Encoding]::UTF8.GetBytes('<токен>')
+      [Convert]::ToBase64String([Security.Cryptography.ProtectedData]::Protect($p,$null,'LocalMachine'))
+    Полученную строку вставьте в $TelegramBotTokenProtectedB64 (и аналогично для chat id).
 #>
 
 [CmdletBinding()]
 param(
-    [string]$TelegramBotToken = "<TELEGRAM_BOT_TOKEN>",
-    [string]$TelegramChatID = "<TELEGRAM_CHAT_ID>"
+    [string]$TelegramBotToken = '<TELEGRAM_BOT_TOKEN>',
+    [string]$TelegramChatID = '<TELEGRAM_CHAT_ID>',
+    [string]$TelegramBotTokenProtectedB64 = "",
+    [string]$TelegramChatIDProtectedB64 = "",
+    [switch]$Watchdog,
+    [switch]$InstallTasks,
+    [switch]$SkipScheduledTaskMaintenance
 )
 
 Set-StrictMode -Version Latest
@@ -27,17 +40,41 @@ $ErrorActionPreference = "Stop"
 # при скачивании через IWR, если при переносе в строке испортится UTF-8.
 function Uc { param([int[]]$C) -join ($C | ForEach-Object { [char]$_ }) }
 
+function Unprotect-RdpMonitorDpapiB64 {
+    param([Parameter(Mandatory = $true)][string]$Base64)
+    Add-Type -AssemblyName System.Security
+    $bytes = [Convert]::FromBase64String($Base64.Trim())
+    $plain = [System.Security.Cryptography.ProtectedData]::Unprotect(
+        $bytes,
+        $null,
+        [System.Security.Cryptography.DataProtectionScope]::LocalMachine
+    )
+    return [Text.Encoding]::UTF8.GetString($plain)
+}
+
 # ============================================
 # КОНФИГУРАЦИЯ
 # ============================================
 
-# Версия (обновляйте при значимых изменениях; пишется в лог и в консоль при интерактивном запуске)
-$ScriptVersion = "1.2.0"
+# Каталог установки (канонический путь к скрипту и данным)
+$script:InstallRoot = [System.IO.Path]::GetFullPath("$env:ProgramData\RDP-login-monitor")
+$script:CanonicalScriptName = "Login_Monitor.ps1"
+$script:ScheduledTaskNameMain = "RDP-Login-Monitor"
+$script:ScheduledTaskNameWatchdog = "RDP-Login-Monitor-Watchdog"
+$script:MutexName = "Global\RDP-Login-Monitor-Singleton-v1"
+$script:RdpInstanceMutex = $null
 
-# Логи
-$LogFile = "D:\Soft\Logs\login_monitor.log"
-$LogBackupFolder = "D:\Soft\Logs\Backup"
-$MaxBackupDays = 30
+# Версия: пишется в лог и в Telegram. При доменном развёртывании через шару см. DEPLOY.md —
+# триггер обновления на клиентах даёт файл version.txt на шаре (его номер можно поднять и без смены
+# строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
+# Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
+# исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
+$ScriptVersion = "1.3.0"
+
+# Логи (все под InstallRoot)
+$LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
+$LogBackupFolder = Join-Path $script:InstallRoot "Logs\Backup"
+$MaxBackupDays = 31
 
 # Ротация логов (ежедневно)
 $LogRotationHour = 0
@@ -45,12 +82,12 @@ $LogRotationMinute = 0
 
 # Heartbeat (только файл)
 $HeartbeatInterval = 3600
-$HeartbeatFile = "D:\Soft\Logs\last_heartbeat.txt"
+$HeartbeatFile = Join-Path $script:InstallRoot "Logs\last_heartbeat.txt"
 
 # Ежедневный отчет
 $DailyReportHour = 9
 $DailyReportMinute = 0
-$LastReportFile = "D:\Soft\Logs\last_daily_report.txt"
+$LastReportFile = Join-Path $script:InstallRoot "Logs\last_daily_report.txt"
 
 # RD Gateway
 $EnableRDGatewayMonitoring = $true
@@ -110,6 +147,9 @@ $IgnoreAdvapiNetworkLogonProcessContains = "Advapi"
 # ИНИЦИАЛИЗАЦИЯ
 # ============================================
 
+if (!(Test-Path -LiteralPath $script:InstallRoot)) {
+    New-Item -ItemType Directory -Path $script:InstallRoot -Force | Out-Null
+}
 $LogDir = Split-Path $LogFile -Parent
 if (!(Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
 if (!(Test-Path $LogBackupFolder)) { New-Item -ItemType Directory -Path $LogBackupFolder -Force | Out-Null }
@@ -149,23 +189,256 @@ function Write-Log {
     Write-Host ($logMessage.TrimEnd("`r`n"))
 }
 
+function Get-RdpMonitorThisScriptPath {
+    $p = $PSCommandPath
+    if ([string]::IsNullOrWhiteSpace($p)) { $p = $MyInvocation.MyCommand.Path }
+    if ([string]::IsNullOrWhiteSpace($p)) { return $null }
+    return [System.IO.Path]::GetFullPath($p)
+}
+
+function Get-RdpMonitorScriptPathFromCommandLine {
+    param([string]$CommandLine)
+    if ([string]::IsNullOrWhiteSpace($CommandLine)) { return $null }
+    $m = [regex]::Match($CommandLine, '(?i)-File\s+"([^"]+)"')
+    if ($m.Success) {
+        try { return [System.IO.Path]::GetFullPath($m.Groups[1].Value) } catch { return $null }
+    }
+    $m2 = [regex]::Match($CommandLine, '(?i)-File\s+(\S+)')
+    if ($m2.Success) {
+        try { return [System.IO.Path]::GetFullPath($m2.Groups[1].Value) } catch { return $null }
+    }
+    return $null
+}
+
+function Test-RdpMonitorCommandLineIsWatchdog {
+    param([string]$CommandLine)
+    return ($CommandLine -match '(?i)(^|\s)-Watchdog(\s|$)')
+}
+
+function Get-RdpLoginMonitorProcessInfos {
+    $result = [System.Collections.Generic.List[object]]::new()
+    try {
+        $procs = Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe' OR Name = 'pwsh.exe'" -ErrorAction Stop
+        foreach ($proc in $procs) {
+            $cl = [string]$proc.CommandLine
+            if ($cl -notmatch 'Login_Monitor\.ps1') { continue }
+            $scriptPath = Get-RdpMonitorScriptPathFromCommandLine -CommandLine $cl
+            $isWd = Test-RdpMonitorCommandLineIsWatchdog -CommandLine $cl
+            $result.Add([pscustomobject]@{
+                ProcessId = [int]$proc.ProcessId
+                ScriptPath = $scriptPath
+                IsWatchdog = [bool]$isWd
+                CommandLine = $cl
+            }) | Out-Null
+        }
+    } catch {
+        Write-Log "Предупреждение: перечень процессов Win32 (миграция экземпляров): $($_.Exception.Message)"
+    }
+    return @($result)
+}
+
+function Invoke-RdpMonitorProcessMigrationAndRelaunch {
+    $canonicalScript = [System.IO.Path]::GetFullPath((Join-Path $script:InstallRoot $script:CanonicalScriptName))
+    $thisPath = Get-RdpMonitorThisScriptPath
+    if ($null -eq $thisPath) {
+        Write-Log "Не удалось определить путь к текущему скрипту — продолжение невозможно."
+        exit 1
+    }
+
+    $infos = @(Get-RdpLoginMonitorProcessInfos)
+    $others = @($infos | Where-Object { $_.ProcessId -ne $PID })
+
+    foreach ($o in $others) {
+        if ($o.IsWatchdog) { continue }
+        if ($null -eq $o.ScriptPath) { continue }
+        $p = [System.IO.Path]::GetFullPath($o.ScriptPath)
+        if ($p -ne $canonicalScript) {
+            Write-Log "Останавливаю экземпляр монитора из другого каталога (PID $($o.ProcessId)): $p"
+            Stop-Process -Id $o.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    if ($thisPath -ne $canonicalScript) {
+        if (-not (Test-Path -LiteralPath $canonicalScript)) {
+            Write-Log "ОШИБКА: Канонический скрипт не найден: $canonicalScript. Скопируйте Login_Monitor.ps1 в $($script:InstallRoot) и запустите снова."
+            exit 1
+        }
+        Write-Log "Текущий запуск из $thisPath — передаю работу каноническому файлу $canonicalScript и завершаюсь."
+        Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $canonicalScript
+        ) -WindowStyle Hidden
+        exit 0
+    }
+
+}
+
+function Lock-RdpMonitorSingleInstance {
+    $mtx = New-Object System.Threading.Mutex($false, $script:MutexName)
+    $script:RdpInstanceMutex = $mtx
+    if (-not $mtx.WaitOne(0)) {
+        Write-Log "Экземпляр монитора уже активен (mutex). Выход без дублирования."
+        exit 0
+    }
+}
+
+function Get-RdpMonitorPowerShellExe {
+    return "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+}
+
+function Test-RdpMonitorScheduledTaskMatches {
+    param(
+        [Parameter(Mandatory = $true)][string]$TaskName,
+        [Parameter(Mandatory = $true)][string]$ExpectedExe,
+        [Parameter(Mandatory = $true)][string]$ExpectedArguments
+    )
+    try {
+        $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Select-Object -First 1
+        $a = @($t.Actions)[0]
+        if ($null -eq $a) { return $false }
+        $exe = [string]$a.Execute
+        $arg = [string]$a.Arguments
+        return (($exe.Trim() -eq $ExpectedExe.Trim()) -and ($arg.Trim() -eq $ExpectedArguments.Trim()))
+    } catch {
+        return $false
+    }
+}
+
+function Register-RdpMonitorScheduledTasksCore {
+    $psExe = Get-RdpMonitorPowerShellExe
+    $canonicalScript = [System.IO.Path]::GetFullPath((Join-Path $script:InstallRoot $script:CanonicalScriptName))
+    if (-not (Test-Path -LiteralPath $canonicalScript)) {
+        Write-Log "Задачи планировщика не созданы: нет файла $canonicalScript"
+        return
+    }
+
+    $argMain = "-NoProfile -ExecutionPolicy Bypass -File `"$canonicalScript`""
+    $argWd = "-NoProfile -ExecutionPolicy Bypass -File `"$canonicalScript`" -Watchdog"
+
+    $actionMain = New-ScheduledTaskAction -Execute $psExe -Argument $argMain
+    $triggerBoot = New-ScheduledTaskTrigger -AtStartup
+    $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+
+    Register-ScheduledTask -TaskName $script:ScheduledTaskNameMain -Action $actionMain -Trigger $triggerBoot `
+        -Principal $principal -Settings $settings -Force | Out-Null
+    Write-Log "Задача планировщика: $($script:ScheduledTaskNameMain) (запуск при старте ОС)."
+
+    $actionWd = New-ScheduledTaskAction -Execute $psExe -Argument $argWd
+    $trigger2 = New-ScheduledTaskTrigger -Once -At (Get-Date)
+    $trigger2.RepetitionInterval = New-TimeSpan -Minutes 5
+    $trigger2.RepetitionDuration = New-TimeSpan -Days 36500
+
+    Register-ScheduledTask -TaskName $script:ScheduledTaskNameWatchdog -Action $actionWd -Trigger $trigger2 `
+        -Principal $principal -Settings $settings -Force | Out-Null
+    Write-Log "Задача планировщика: $($script:ScheduledTaskNameWatchdog) (каждые 5 минут, контроль процесса)."
+}
+
+function Ensure-RdpMonitorScheduledTasks {
+    if ($SkipScheduledTaskMaintenance) {
+        Write-Log "Обслуживание задач планировщика пропущено (-SkipScheduledTaskMaintenance)."
+        return
+    }
+    $psExe = Get-RdpMonitorPowerShellExe
+    $canonicalScript = [System.IO.Path]::GetFullPath((Join-Path $script:InstallRoot $script:CanonicalScriptName))
+    $argMain = "-NoProfile -ExecutionPolicy Bypass -File `"$canonicalScript`""
+    $argWd = "-NoProfile -ExecutionPolicy Bypass -File `"$canonicalScript`" -Watchdog"
+
+    $needMain = -not (Test-RdpMonitorScheduledTaskMatches -TaskName $script:ScheduledTaskNameMain -ExpectedExe $psExe -ExpectedArguments $argMain)
+    $needWd = -not (Test-RdpMonitorScheduledTaskMatches -TaskName $script:ScheduledTaskNameWatchdog -ExpectedExe $psExe -ExpectedArguments $argWd)
+
+    if (-not $needMain -and -not $needWd) {
+        Write-Log "Задачи планировщика ($($script:ScheduledTaskNameMain), $($script:ScheduledTaskNameWatchdog)) соответствуют каноническим путям."
+        return
+    }
+
+    if ($needMain) { Write-Log "Требуется обновить или создать задачу: $($script:ScheduledTaskNameMain)" }
+    if ($needWd) { Write-Log "Требуется обновить или создать задачу: $($script:ScheduledTaskNameWatchdog)" }
+
+    Register-RdpMonitorScheduledTasksCore
+}
+
+function Start-RdpMonitorWatchdogMain {
+    $watchdogLog = Join-Path $script:InstallRoot "Logs\watchdog.log"
+    $canonicalScript = [System.IO.Path]::GetFullPath((Join-Path $script:InstallRoot $script:CanonicalScriptName))
+    function Write-WdLog {
+        param([string]$Message)
+        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        $line = "$timestamp - $Message" + [Environment]::NewLine
+        try {
+            [System.IO.File]::AppendAllText($watchdogLog, $line, $script:Utf8BomEncoding)
+        } catch { }
+        Write-Host ($line.TrimEnd("`r`n"))
+    }
+
+    Write-WdLog "Watchdog (версия $ScriptVersion): проверка экземпляра монитора. Ожидаемый скрипт: $canonicalScript"
+
+    try {
+        $mainRunning = $false
+        $infos = @(Get-RdpLoginMonitorProcessInfos)
+        foreach ($info in $infos) {
+            if ($info.IsWatchdog) { continue }
+            if ($null -eq $info.ScriptPath) { continue }
+            if ([System.IO.Path]::GetFullPath($info.ScriptPath) -ne $canonicalScript) { continue }
+            $mainRunning = $true
+            break
+        }
+
+        if (-not $mainRunning) {
+            Write-WdLog "Монитор не найден — запуск $canonicalScript"
+            Start-Process -FilePath (Get-RdpMonitorPowerShellExe) -ArgumentList @(
+                '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $canonicalScript
+            ) -WindowStyle Hidden
+        } else {
+            Write-WdLog "Монитор работает (канонический экземпляр найден)."
+        }
+    } catch {
+        Write-WdLog "Ошибка watchdog: $($_.Exception.Message)"
+        exit 1
+    }
+    exit 0
+}
+
+# --- Учётные данные Telegram (открытый текст или DPAPI Base64) ---
+if (-not [string]::IsNullOrWhiteSpace($TelegramBotTokenProtectedB64)) {
+    try {
+        $TelegramBotToken = Unprotect-RdpMonitorDpapiB64 -Base64 $TelegramBotTokenProtectedB64
+    } catch {
+        Write-Host "Ошибка расшифровки TelegramBotToken (DPAPI): $($_.Exception.Message)"
+        exit 1
+    }
+}
+if (-not [string]::IsNullOrWhiteSpace($TelegramChatIDProtectedB64)) {
+    try {
+        $TelegramChatID = Unprotect-RdpMonitorDpapiB64 -Base64 $TelegramChatIDProtectedB64
+    } catch {
+        Write-Host "Ошибка расшифровки TelegramChatID (DPAPI): $($_.Exception.Message)"
+        exit 1
+    }
+}
+if ($TelegramBotToken -eq '<TELEGRAM_BOT_TOKEN>') { $TelegramBotToken = "" }
+if ($TelegramChatID -eq '<TELEGRAM_CHAT_ID>') { $TelegramChatID = "" }
+
+if ($Watchdog) {
+    Start-RdpMonitorWatchdogMain
+    exit 0
+}
+
+if ($InstallTasks) {
+    $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($currentUser)
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        Write-Log "InstallTasks: нужны права администратора."
+        exit 1
+    }
+    Register-RdpMonitorScheduledTasksCore
+    Write-Log "InstallTasks: задачи планировщика обновлены."
+    exit 0
+}
+
 function ConvertTo-TelegramHtml {
     param([string]$Text)
     if ($null -eq $Text) { return '' }
     return [System.Net.WebUtility]::HtmlEncode([string]$Text)
-}
-
-try {
-    [System.Net.ServicePointManager]::SecurityProtocol =
-        [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
-    Write-Log "TLS 1.2 включен"
-} catch {
-    try {
-        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
-        Write-Log "TLS 1.2 установлен"
-    } catch {
-        Write-Log "ВНИМАНИЕ: Не удалось включить TLS 1.2"
-    }
 }
 
 function Send-TelegramMessage {
@@ -221,6 +494,23 @@ if (-not (Test-Administrator)) {
     exit 1
 }
 Write-Log "Скрипт запущен с правами администратора, версия $ScriptVersion"
+
+Invoke-RdpMonitorProcessMigrationAndRelaunch
+Lock-RdpMonitorSingleInstance
+Ensure-RdpMonitorScheduledTasks
+
+try {
+    [System.Net.ServicePointManager]::SecurityProtocol =
+        [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+    Write-Log "TLS 1.2 включен"
+} catch {
+    try {
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+        Write-Log "TLS 1.2 установлен"
+    } catch {
+        Write-Log "ВНИМАНИЕ: Не удалось включить TLS 1.2"
+    }
+}
 
 $script:IsWorkstation = $false
 $script:OsInstallKindLabel = ""
@@ -373,7 +663,8 @@ function Enable-SecurityAudit {
 
     # Logon/Logoff category GUID (not a user id).
     Write-Log "Trying Logon/Logoff category set via known GUID (fallback)..."
-    $guidSet = Invoke-AuditPol -Arguments '/set /category:"{69979849-797A-11D9-BED3-505054503030}" /success:enable /failure:enable'
+    $logonLogoffCategoryGuid = "69979849-797A-11D9-BED3-505054503030"
+    $guidSet = Invoke-AuditPol -Arguments ("/set /category:`"$logonLogoffCategoryGuid`" /success:enable /failure:enable")
     if ($guidSet.ExitCode -ne 0) {
         Write-Log ("auditpol GUID SET FAIL (code {0}):`n{1}" -f $guidSet.ExitCode, $guidSet.Text)
     }
