@@ -69,7 +69,7 @@ $script:RdpInstanceMutex = $null
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.3.4"
+$ScriptVersion = "1.3.5"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -192,6 +192,10 @@ function Write-Log {
 function Get-RdpMonitorThisScriptPath {
     $p = $PSCommandPath
     if ([string]::IsNullOrWhiteSpace($p)) { $p = $MyInvocation.MyCommand.Path }
+    # При запуске дочернего процесса через Start-Process иногда нет PSCommandPath — используем каталог скрипта.
+    if ([string]::IsNullOrWhiteSpace($p) -and -not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+        $p = Join-Path $PSScriptRoot $script:CanonicalScriptName
+    }
     if ([string]::IsNullOrWhiteSpace($p)) { return $null }
     return [System.IO.Path]::GetFullPath($p)
 }
@@ -409,9 +413,18 @@ function Start-RdpMonitorWatchdogMain {
 
         if (-not $mainRunning) {
             Write-WdLog "Монитор не найден — запуск $canonicalScript"
-            Start-Process -FilePath (Get-RdpMonitorPowerShellExe) -ArgumentList @(
+            $psExeWd = Get-RdpMonitorPowerShellExe
+            $started = Start-Process -FilePath $psExeWd -WorkingDirectory $script:InstallRoot -ArgumentList @(
                 '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $canonicalScript
-            ) -WindowStyle Hidden
+            ) -WindowStyle Hidden -PassThru
+            Write-WdLog "Монитор: создан процесс PID=$($started.Id)."
+            Start-Sleep -Seconds 5
+            $still = Get-Process -Id $started.Id -ErrorAction SilentlyContinue
+            if (-not $still) {
+                Write-WdLog "ПРЕДУПРЕЖДЕНИЕ: процесс монитора PID $($started.Id) завершился за несколько секунд — см. конец $script:LogFile (ошибка до цикла мониторинга)."
+            } else {
+                Write-WdLog "Монитор: процесс PID $($started.Id) ещё работает после старта."
+            }
         } else {
             Write-WdLog "Монитор работает (канонический экземпляр найден)."
         }
