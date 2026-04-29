@@ -61,15 +61,15 @@ $script:InstallRoot = [System.IO.Path]::GetFullPath("$env:ProgramData\RDP-login-
 $script:CanonicalScriptName = "Login_Monitor.ps1"
 $script:ScheduledTaskNameMain = "RDP-Login-Monitor"
 $script:ScheduledTaskNameWatchdog = "RDP-Login-Monitor-Watchdog"
-$script:MutexName = "Global\RDP-Login-Monitor-Singleton-v1"
-$script:RdpInstanceMutex = $null
+# Один экземпляр: эксклюзивная блокировка файла в InstallRoot (SYSTEM и интерактивный админ — одинаково; Global mutex давал «Отказано в доступе» между контекстами).
+$script:MonitorSingletonLockStream = $null
 
 # Версия: пишется в лог и в Telegram. При доменном развёртывании через шару см. DEPLOY.md —
 # триггер обновления на клиентах даёт файл version.txt на шаре (его номер можно поднять и без смены
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.3.5"
+$ScriptVersion = "1.3.9"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -277,11 +277,47 @@ function Invoke-RdpMonitorProcessMigrationAndRelaunch {
 }
 
 function Lock-RdpMonitorSingleInstance {
-    $mtx = New-Object System.Threading.Mutex($false, $script:MutexName)
-    $script:RdpInstanceMutex = $mtx
-    if (-not $mtx.WaitOne(0)) {
-        Write-Log "Экземпляр монитора уже активен (mutex). Выход без дублирования."
+    # Эксклюзивный поток (FileShare.None): пока монитор работает, файл нельзя удалить вручную —
+    # это нормально. DeleteOnClose: при любом завершении процесса ОС удалит файл при закрытии
+    # дескриптора (в т.ч. при «Снять задачу»), без «вечных» сирот на диске.
+    $lockPath = Join-Path $script:InstallRoot '.login_monitor_single_instance.lock'
+    try {
+        $script:MonitorSingletonLockStream = New-Object System.IO.FileStream(
+            $lockPath,
+            [System.IO.FileMode]::OpenOrCreate,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::None,
+            4096,
+            [System.IO.FileOptions]::DeleteOnClose
+        )
+    } catch [System.IO.IOException] {
+        Write-Log "Экземпляр монитора уже активен (блокировка файла). Выход без дублирования."
         exit 0
+    } catch {
+        Write-Log "Не удалось занять блокировку экземпляра (${lockPath}): $($_.Exception.Message)"
+        exit 1
+    }
+}
+
+function Release-RdpMonitorSingletonLock {
+    $lockPath = Join-Path $script:InstallRoot '.login_monitor_single_instance.lock'
+    if ($null -ne $script:MonitorSingletonLockStream) {
+        try {
+            $script:MonitorSingletonLockStream.Close()
+        } catch { }
+        try {
+            $script:MonitorSingletonLockStream.Dispose()
+        } catch { }
+        $script:MonitorSingletonLockStream = $null
+    }
+    if (Test-Path -LiteralPath $lockPath) {
+        try {
+            Remove-Item -LiteralPath $lockPath -Force -ErrorAction Stop
+        } catch {
+            try {
+                [System.IO.File]::Delete($lockPath)
+            } catch { }
+        }
     }
 }
 
@@ -1459,6 +1495,7 @@ function Start-LoginMonitor {
                 $nextReportCheck = Check-AndSendDailyReport
             }
         } catch {
+            if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
             Write-Log "Ошибка цикла мониторинга: $($_.Exception.Message)"
         }
         Start-Sleep -Seconds $MonitorInterval
@@ -1470,11 +1507,17 @@ try {
     Test-TelegramConnection | Out-Null
     Start-LoginMonitor -MonitorInterval 5 -MonitorInteractiveOnly
 } catch {
-    Write-Log "Критическая ошибка: $($_.Exception.Message)"
-    Send-StopNotification -Reason "Критическая ошибка: $($_.Exception.Message)"
-    $script:StopNotificationSent = $true
-    throw
+    if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) {
+        Write-Log "Выполнение прервано (Ctrl+C / Stop-Pipeline)."
+        $script:StopNotificationSent = $true
+    } else {
+        Write-Log "Критическая ошибка: $($_.Exception.Message)"
+        Send-StopNotification -Reason "Критическая ошибка: $($_.Exception.Message)"
+        $script:StopNotificationSent = $true
+        throw
+    }
 } finally {
+    Release-RdpMonitorSingletonLock
     if (-not $script:StopNotificationSent) {
         Send-StopNotification -Reason "Скрипт завершил работу"
     }
