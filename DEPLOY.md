@@ -47,7 +47,7 @@ Watchdog регистрируется через **`schtasks.exe /Create /SC MIN
 
 Перед созданием выполняется **`schtasks /Delete … /F`** (если задачи ещё не было, сообщение об ошибке подавляется — это нормально).
 
-Сразу после успешного **`/Create`** вызывается **`schtasks /Run`** для watchdog: первый прогон не ждёт следующего 5‑минутного окна расписания.
+Сразу после регистрации задач вызывается **`schtasks /Run`** и для **основной задачи**, и для **watchdog**: первый запуск не ждёт перезагрузку и ближайшее 5‑минутное окно.
 
 Если watchdog срабатывает, а основной монитор «не поднимается», смотрите **`Logs\watchdog.log`** (сообщение о PID и предупреждение, если процесс сразу завершился) и **конец `Logs\login_monitor.log`** — частая причина (исправлено в **1.3.5+**): пустой **`$PSCommandPath`** у процесса, запущенного через **`Start-Process`**; скрипт теперь подставляет путь через **`$PSScriptRoot`**.
 
@@ -81,25 +81,60 @@ schtasks /Query /TN "RDP-Login-Monitor-Watchdog"
 
 Итого: **обновляться «по сети» обязан именно `version.txt`**; строка **`$ScriptVersion`** нужна для прозрачности в мониторинге и может совпадать с шарой или отставать по «маркетингу», если вы сознательно крутите только patch в **`version.txt`**.
 
-## Групповая политика (GPO)
+## Групповая политика (GPO): проверенная схема
 
-1. Положите три файла на шару (см. выше).
-2. **Конфигурация компьютера** → **Политики** → **Windows** → **Сценарии (запуск/завершение)** → **Автозагрузка**.
-3. Добавьте сценарий PowerShell с **путём к установщику на шаре**, например:
+Ниже шаги, которые были проверены на практике для запуска деплоя при старте компьютера.
 
-   `\\contoso.local\NETLOGON\RDP-login-monitor\Deploy-LoginMonitor.ps1`
+1. Положите три файла на шару (см. выше), например:
 
-   Параметры можно оставить пустыми, если рядом на шаре лежат **`Login_Monitor.ps1`** и **`version.txt`**.
+   `\\B26\NETLOGON\RDP-login-monitor\`
 
-Скрипт выполняется от **SYSTEM** при старте ОС — этого достаточно для записи в **`ProgramData`** и регистрации задач.
+2. Создайте/настройте GPO и привяжите её к OU с **компьютерами** (не пользователями).
 
-Альтернатива: команда
+3. В GPO откройте:
+   **Конфигурация компьютера** → **Политики** → **Конфигурация Windows** → **Сценарии (запуск/завершение)** → **Автозагрузка**.
 
-```text
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "\\...\Deploy-LoginMonitor.ps1"
+4. На вкладке **«Сценарии PowerShell»** добавьте скрипт:
+
+   `\\B26\NETLOGON\RDP-login-monitor\Deploy-LoginMonitor.ps1`
+
+   Параметры можно оставить пустыми, если рядом на шаре лежат `Login_Monitor.ps1` и `version.txt`.
+
+5. Security Filtering:
+   - можно убрать `Authenticated Users`,
+   - добавить группу компьютеров (например `B26\RDP-Login`),
+   - убедиться, что у неё есть права **Read** + **Apply group policy**.
+
+6. Проверьте, что в группе действительно состоит объект компьютера, например `FVG-PC$`.
+
+7. Проверьте доступ на шару/NTFS для контекста компьютера (обычно через `Domain Computers` или целевую группу), потому что startup-скрипт выполняется от имени **SYSTEM**.
+
+### Важные нюансы
+
+- Кнопка **«Показать файлы»** в свойствах Startup показывает папку GPO в `SYSVOL` (`...\Policies\{GUID}\Machine\Scripts\Startup`).
+- Если вы указали в настройке сценария **UNC путь в NETLOGON**, ваш `.ps1` в этой папке `SYSVOL` не появится — это нормально.
+- После изменения membership компьютера в security-группе часто требуется **перезагрузка** (не только `gpupdate /force`), чтобы обновился токен компьютера.
+
+### Как запускать без ожидания перезагрузки
+
+- Startup-сценарий GPO штатно отрабатывает при загрузке ОС, но сам `Deploy-LoginMonitor.ps1` после `-InstallTasks` теперь инициирует немедленный `schtasks /Run`:
+  - `RDP-Login-Monitor`
+  - `RDP-Login-Monitor-Watchdog`
+- Поэтому после фактического запуска deploy монитор и watchdog стартуют сразу.
+
+### Диагностика GPO/Startup
+
+- События применения политики и startup-сценариев:
+  - `Event Viewer -> Applications and Services Logs -> Microsoft -> Windows -> GroupPolicy -> Operational`
+- Логи на клиенте:
+  - `C:\ProgramData\RDP-login-monitor\Logs\deploy.log`
+  - `C:\ProgramData\RDP-login-monitor\Logs\login_monitor.log`
+  - `C:\ProgramData\RDP-login-monitor\Logs\watchdog.log`
+- Быстрая ручная проверка deploy:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "\\B26\NETLOGON\RDP-login-monitor\Deploy-LoginMonitor.ps1"
 ```
-
-в сценарии **cmd** / отдельном **bat**.
 
 ## Ручная проверка
 
