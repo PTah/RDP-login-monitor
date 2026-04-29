@@ -69,7 +69,7 @@ $script:MonitorSingletonLockStream = $null
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.3.9"
+$ScriptVersion = "1.3.11"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -381,7 +381,22 @@ function Register-RdpMonitorScheduledTasksCore {
     }
     Write-Log "Задача планировщика: $($script:ScheduledTaskNameWatchdog) (schtasks, каждые 5 минут, контроль процесса)."
 
-    # Первый запуск по расписанию может быть почти через 5 мин — сразу ставим одноразовый прогон в очередь.
+    # Не ждём перезагрузку: сразу запускаем основную задачу.
+    $runMainEa = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'SilentlyContinue'
+        $runMainOut = & $schtasksExe /Run /TN $script:ScheduledTaskNameMain 2>&1
+        foreach ($line in @($runMainOut)) {
+            if ($null -ne $line -and "$line".Trim().Length -gt 0) {
+                Write-Log "schtasks main /Run: $line"
+            }
+        }
+    } finally {
+        $ErrorActionPreference = $runMainEa
+    }
+    Write-Log "Немедленный прогон основной задачи запрошен (schtasks /Run)."
+
+    # Первый запуск watchdog по расписанию может быть почти через 5 мин — ставим одноразовый прогон в очередь.
     $runEa = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'SilentlyContinue'
@@ -870,6 +885,7 @@ function Send-Heartbeat {
 
     if ($IsStartup) {
         $message = "<b>✅ Мониторинг логинов ЗАПУЩЕН</b>`r`n"
+        $message += "🏷️ Версия скрипта: $(ConvertTo-TelegramHtml $ScriptVersion)`r`n"
         $message += "🖥️ Сервер: $hHost`r`n"
         $message += "🕐 Время запуска: $timestamp"
         if ($script:OsInstallKindLabel) {
