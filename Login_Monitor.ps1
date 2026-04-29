@@ -69,7 +69,7 @@ $script:RdpInstanceMutex = $null
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.3.0"
+$ScriptVersion = "1.3.4"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -304,6 +304,7 @@ function Test-RdpMonitorScheduledTaskMatches {
 }
 
 function Register-RdpMonitorScheduledTasksCore {
+    Write-Log "Register-RdpMonitorScheduledTasksCore: ветка v$ScriptVersion (watchdog через schtasks /SC MINUTE, без CIM RepetitionInterval)."
     $psExe = Get-RdpMonitorPowerShellExe
     $canonicalScript = [System.IO.Path]::GetFullPath((Join-Path $script:InstallRoot $script:CanonicalScriptName))
     if (-not (Test-Path -LiteralPath $canonicalScript)) {
@@ -323,14 +324,37 @@ function Register-RdpMonitorScheduledTasksCore {
         -Principal $principal -Settings $settings -Force | Out-Null
     Write-Log "Задача планировщика: $($script:ScheduledTaskNameMain) (запуск при старте ОС)."
 
-    $actionWd = New-ScheduledTaskAction -Execute $psExe -Argument $argWd
-    $trigger2 = New-ScheduledTaskTrigger -Once -At (Get-Date)
-    $trigger2.RepetitionInterval = New-TimeSpan -Minutes 5
-    $trigger2.RepetitionDuration = New-TimeSpan -Days 36500
+    # Watchdog только через schtasks. /Delete при отсутствии задачи пишет в stderr — при $ErrorActionPreference Stop раньше рвал скрипт.
+    $schtasksExe = Join-Path $env:SystemRoot 'System32\schtasks.exe'
+    $delErrAction = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'SilentlyContinue'
+        & $schtasksExe /Delete /TN $script:ScheduledTaskNameWatchdog /F 2>$null | Out-Null
+    } finally {
+        $ErrorActionPreference = $delErrAction
+    }
 
-    Register-ScheduledTask -TaskName $script:ScheduledTaskNameWatchdog -Action $actionWd -Trigger $trigger2 `
-        -Principal $principal -Settings $settings -Force | Out-Null
-    Write-Log "Задача планировщика: $($script:ScheduledTaskNameWatchdog) (каждые 5 минут, контроль процесса)."
+    $trForSch = "`"$psExe`" $argWd"
+    $schOut = & $schtasksExe /Create /F /RU SYSTEM /RL HIGHEST /SC MINUTE /MO 5 /TN $script:ScheduledTaskNameWatchdog /TR $trForSch 2>&1
+    foreach ($line in @($schOut)) {
+        Write-Log "schtasks watchdog: $line"
+    }
+    Write-Log "Задача планировщика: $($script:ScheduledTaskNameWatchdog) (schtasks, каждые 5 минут, контроль процесса)."
+
+    # Первый запуск по расписанию может быть почти через 5 мин — сразу ставим одноразовый прогон в очередь.
+    $runEa = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'SilentlyContinue'
+        $runOut = & $schtasksExe /Run /TN $script:ScheduledTaskNameWatchdog 2>&1
+        foreach ($line in @($runOut)) {
+            if ($null -ne $line -and "$line".Trim().Length -gt 0) {
+                Write-Log "schtasks watchdog /Run: $line"
+            }
+        }
+    } finally {
+        $ErrorActionPreference = $runEa
+    }
+    Write-Log "Немедленный прогон watchdog запрошен (schtasks /Run)."
 }
 
 function Ensure-RdpMonitorScheduledTasks {

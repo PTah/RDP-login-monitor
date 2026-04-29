@@ -34,6 +34,34 @@
 
 Лог установки: **`C:\ProgramData\RDP-login-monitor\Logs\deploy.log`**.
 
+## Задачи планировщика после `-InstallTasks`
+
+Параметр **`Login_Monitor.ps1 -InstallTasks`** создаёт две задачи:
+
+| Имя | Назначение |
+|-----|------------|
+| **`RDP-Login-Monitor`** | Запуск основного монитора при старте ОС (`Register-ScheduledTask`, триггер «При запуске компьютера»). |
+| **`RDP-Login-Monitor-Watchdog`** | Тот же файл **`Login_Monitor.ps1`** с аргументом **`-Watchdog`**: короткая проверка «жив ли монитор», при необходимости поднимает процесс. |
+
+Watchdog регистрируется через **`schtasks.exe /Create /SC MINUTE /MO 5`** (а не через CIM-триггеры PowerShell): на части ОС у объектов триггера нет настраиваемых **`RepetitionInterval`** / длительность «раз и навсегда» режется планировщиком — из‑за этого раньше вторая задача могла не создаваться.
+
+Перед созданием выполняется **`schtasks /Delete … /F`** (если задачи ещё не было, сообщение об ошибке подавляется — это нормально).
+
+Сразу после успешного **`/Create`** вызывается **`schtasks /Run`** для watchdog: первый прогон не ждёт следующего 5‑минутного окна расписания.
+
+Проверка:
+
+```powershell
+Get-ScheduledTask -TaskName 'RDP-Login-Monitor','RDP-Login-Monitor-Watchdog' -ErrorAction SilentlyContinue
+schtasks /Query /TN "RDP-Login-Monitor-Watchdog"
+```
+
+Логи: **`...\Logs\login_monitor.log`**, **`...\Logs\watchdog.log`**.
+
+## Запуск Deploy и политики с файловой шары
+
+Если при запуске **`Deploy-LoginMonitor.ps1`** или **`Login_Monitor.ps1`** с UNC по **FQDN** (`\\dc.domain.local\...`) PowerShell сообщает про **цифровую подпись** / политику выполнения, чаще всего помогает путь по **короткому имени** контроллера: **`\\DC01\NETLOGON\...`** (клиент относит UNC к интрасети иначе). Параллельно убедитесь, что команда реально с **`powershell.exe -ExecutionPolicy Bypass -File "..."`**.
+
 ## Версии: `version.txt` и `$ScriptVersion`
 
 | Что | Роль |
