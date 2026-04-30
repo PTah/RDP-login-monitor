@@ -36,6 +36,7 @@ $ErrorActionPreference = "Stop"
 $InstallRoot = [System.IO.Path]::GetFullPath("$env:ProgramData\RDP-login-monitor")
 $LocalScript = Join-Path $InstallRoot "Login_Monitor.ps1"
 $VersionStampPath = Join-Path $InstallRoot "deployed_version.txt"
+$DeployUpdateMarkerPath = Join-Path $InstallRoot "deploy_last_update.txt"
 $DeployLogPath = Join-Path $InstallRoot "Logs\deploy.log"
 $ScriptName = "Login_Monitor.ps1"
 $VersionFileName = "version.txt"
@@ -222,6 +223,15 @@ try {
 
     [System.IO.File]::WriteAllText($VersionStampPath, "$shareVerRaw`r`n", $Utf8Bom)
     Write-DeployLog "Записана метка версии: $VersionStampPath"
+
+    $updStamp = Get-Date -Format "dd.MM.yyyy HH:mm:ss"
+    $updMarker = @(
+        "Version=$shareVerRaw"
+        "UpdatedAt=$updStamp"
+        "PendingStartupNotice=1"
+    ) -join "`r`n"
+    [System.IO.File]::WriteAllText($DeployUpdateMarkerPath, "$updMarker`r`n", $Utf8Bom)
+    Write-DeployLog "Записана метка обновления: $DeployUpdateMarkerPath (Version=$shareVerRaw; UpdatedAt=$updStamp)."
 
     if (-not $SkipStartMonitorAfterUpdate) {
         Start-Process -FilePath $PsExe -ArgumentList @(

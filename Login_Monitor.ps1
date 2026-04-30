@@ -69,7 +69,7 @@ $script:MonitorSingletonLockStream = $null
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.3.12"
+$ScriptVersion = "1.3.13"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -83,6 +83,7 @@ $LogRotationMinute = 0
 # Heartbeat (только файл)
 $HeartbeatInterval = 3600
 $HeartbeatFile = Join-Path $script:InstallRoot "Logs\last_heartbeat.txt"
+$DeployUpdateMarkerFile = Join-Path $script:InstallRoot "deploy_last_update.txt"
 
 # Ежедневный отчет
 $DailyReportHour = 9
@@ -883,9 +884,53 @@ function Send-Heartbeat {
     $timestamp = Get-Date -Format "dd.MM.yyyy HH:mm:ss"
     $hHost = (ConvertTo-TelegramHtml $env:COMPUTERNAME)
 
+    function Get-DeployUpdateMarker {
+        $info = [pscustomobject]@{
+            Version = $null
+            UpdatedAt = $null
+            PendingStartupNotice = $false
+        }
+        if (-not (Test-Path -LiteralPath $DeployUpdateMarkerFile)) { return $info }
+        try {
+            $lines = @((Get-Content -LiteralPath $DeployUpdateMarkerFile -ErrorAction Stop) | Where-Object { $_ -match '\S' })
+            foreach ($ln in $lines) {
+                $parts = $ln -split '=', 2
+                if ($parts.Count -ne 2) { continue }
+                $k = ($parts[0]).Trim()
+                $v = ($parts[1]).Trim()
+                switch ($k) {
+                    'Version' { $info.Version = $v }
+                    'UpdatedAt' { $info.UpdatedAt = $v }
+                    'PendingStartupNotice' { $info.PendingStartupNotice = ($v -eq '1' -or $v -ieq 'true') }
+                }
+            }
+        } catch { }
+        return $info
+    }
+
+    function Set-DeployUpdateMarkerPendingOff {
+        param([pscustomobject]$Marker)
+        try {
+            $ver = if ([string]::IsNullOrWhiteSpace($Marker.Version)) { '' } else { $Marker.Version }
+            $upd = if ([string]::IsNullOrWhiteSpace($Marker.UpdatedAt)) { '' } else { $Marker.UpdatedAt }
+            $content = @(
+                "Version=$ver"
+                "UpdatedAt=$upd"
+                "PendingStartupNotice=0"
+            ) -join "`r`n"
+            Write-TextFileUtf8Bom -Path $DeployUpdateMarkerFile -Text $content
+        } catch { }
+    }
+
     if ($IsStartup) {
         $message = "<b>✅ Мониторинг логинов ЗАПУЩЕН</b>`r`n"
-        $message += "🏷️ Версия скрипта: $(ConvertTo-TelegramHtml $ScriptVersion)`r`n"
+        $message += "🏷️ Версия скрипта: $(ConvertTo-TelegramHtml $ScriptVersion)"
+        $upd = Get-DeployUpdateMarker
+        if ($upd.PendingStartupNotice -and $upd.Version -eq $ScriptVersion -and -not [string]::IsNullOrWhiteSpace($upd.UpdatedAt)) {
+            $message += " (обновлён $(ConvertTo-TelegramHtml $upd.UpdatedAt))"
+            Set-DeployUpdateMarkerPendingOff -Marker $upd
+        }
+        $message += "`r`n"
         $message += "🖥️ Сервер: $hHost`r`n"
         $message += "🕐 Время запуска: $timestamp"
         if ($script:OsInstallKindLabel) {
@@ -1342,8 +1387,14 @@ function Format-RDGatewayEvent {
     $hTime = (ConvertTo-TelegramHtml ($TimeCreated.ToString('dd.MM.yyyy HH:mm:ss')))
 
     $message = "<b>"
-    if ($EventID -eq 302) { $message += "🖥️ УСПЕШНОЕ ПОДКЛЮЧЕНИЕ ЧЕРЕЗ RD GATEWAY" }
-    elseif ($EventID -eq 303) { $message += "❌ НЕУДАЧНОЕ ПОДКЛЮЧЕНИЕ ЧЕРЕЗ RD GATEWAY" }
+    if ($EventID -eq 302) { $message += "🖥️ ПОДКЛЮЧЕНИЕ ЧЕРЕЗ RD GATEWAY" }
+    elseif ($EventID -eq 303) {
+        if ($ErrorCode -ne "0" -and $ErrorCode -ne "N/A" -and -not [string]::IsNullOrWhiteSpace($ErrorCode)) {
+            $message += "⚠️ СЕАНС ЧЕРЕЗ RD GATEWAY ЗАВЕРШЁН С ОШИБКОЙ"
+        } else {
+            $message += "ℹ️ СЕАНС ЧЕРЕЗ RD GATEWAY ЗАВЕРШЁН"
+        }
+    }
     else { $message += "⚠️ СОБЫТИЕ RD GATEWAY" }
     $message += "</b>`r`n"
 
