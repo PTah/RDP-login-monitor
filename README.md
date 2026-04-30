@@ -2,6 +2,10 @@
 
 PowerShell-набор для мониторинга входов в Windows с отправкой уведомлений в Telegram.
 
+## Ключевые слова (для поиска репозитория)
+
+`rdp`, `rd-gateway`, `rdp-gateway`, `rds`, `remote-desktop`, `windows-security-log`, `eventlog`, `event-id-4624`, `event-id-4625`, `event-id-302`, `event-id-303`, `powershell`, `telegram-bot`, `watchdog`, `gpo`, `netlogon`, `domain-deployment`, `windows-server`, `monitoring`
+
 ## Актуальная схема (рекомендуется)
 
 - **`Login_Monitor.ps1`** — единый монитор: журнал Security (`4624`/`4625`), при необходимости RD Gateway (`302`/`303`), рабочие станции и серверы, ротация логов, heartbeat, отчёты. Устанавливается в **`C:\ProgramData\RDP-login-monitor\`**, задачи **`RDP-Login-Monitor`** и **`RDP-Login-Monitor-Watchdog`** создаются параметром **`-InstallTasks`** (watchdog через **`schtasks`**, см. **DEPLOY.md**).
