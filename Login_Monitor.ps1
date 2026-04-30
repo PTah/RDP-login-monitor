@@ -69,7 +69,7 @@ $script:MonitorSingletonLockStream = $null
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.3.11"
+$ScriptVersion = "1.3.12"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -1214,6 +1214,13 @@ function Test-RDGatewayLog {
     return $false
 }
 
+function Test-RdpMonitorStringLooksLikeIPv4 {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    $t = $Value.Trim()
+    return [bool]($t -match '^(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)$')
+}
+
 function Get-RDGatewayEventInfo {
     param($Event)
     $eventData = @{
@@ -1225,21 +1232,91 @@ function Get-RDGatewayEventInfo {
         ErrorCode = "N/A"
     }
     try {
-        switch ($Event.Id) {
-            302 {
-                if ($Event.Properties.Count -gt 0) { $eventData.Username = $Event.Properties[0].Value }
-                if ($Event.Properties.Count -gt 1) { $eventData.ExternalIP = $Event.Properties[1].Value }
-                if ($Event.Properties.Count -gt 2) { $eventData.InternalIP = $Event.Properties[2].Value }
-                if ($Event.Properties.Count -gt 3) { $eventData.Protocol = $Event.Properties[3].Value }
-                $eventData.ErrorCode = "0"
+        $map = Get-EventDataMap -Event $Event
+        $lc = @{}
+        foreach ($k in $map.Keys) {
+            try { $lc[$k.ToLowerInvariant()] = $map[$k] } catch { }
+        }
+        function Get-RdpGwMapVal([string[]]$Keys) {
+            foreach ($key in $Keys) {
+                $lk = $key.ToLowerInvariant()
+                if (-not $lc.ContainsKey($lk)) { continue }
+                $v = $lc[$lk]
+                if (-not [string]::IsNullOrWhiteSpace($v)) { return [string]$v }
             }
-            303 {
-                if ($Event.Properties.Count -gt 0) { $eventData.Username = $Event.Properties[0].Value }
-                if ($Event.Properties.Count -gt 1) { $eventData.ExternalIP = $Event.Properties[1].Value }
-                if ($Event.Properties.Count -gt 2) { $eventData.InternalIP = $Event.Properties[2].Value }
-                if ($Event.Properties.Count -gt 3) { $eventData.Protocol = $Event.Properties[3].Value }
-                if ($Event.Properties.Count -gt 4) { $eventData.ErrorCode = $Event.Properties[4].Value }
+            return $null
+        }
+
+        $u = Get-RdpGwMapVal @('username','user','authusername')
+        $ext = Get-RdpGwMapVal @('clientaddress','clientip','ipaddress','address','remoteaddress','sourceaddress')
+        $int = Get-RdpGwMapVal @('targetserver','targetname','resource','server','internaladdress','destinationaddress','targetaddress','devicename','computername')
+        $proto = Get-RdpGwMapVal @('protocol','transport','connectionprotocol','tunneltype')
+        $err = Get-RdpGwMapVal @('errorcode','statuscode','error','resultcode','status')
+
+        if ($u) { $eventData.Username = $u }
+        if ($ext) { $eventData.ExternalIP = $ext }
+        if ($int) { $eventData.InternalIP = $int }
+        if ($proto) { $eventData.Protocol = $proto }
+        if ($err) { $eventData.ErrorCode = $err }
+
+        $fillFromProps = ($lc.Count -eq 0) -or (
+            (($eventData.InternalIP -eq 'N/A' -or [string]::IsNullOrWhiteSpace($eventData.InternalIP)) -and (
+                    ($eventData.Protocol -eq 'N/A' -or [string]::IsNullOrWhiteSpace($eventData.Protocol)) -or
+                    (Test-RdpMonitorStringLooksLikeIPv4 $eventData.Protocol)
+                ))
+        )
+
+        if ($fillFromProps) {
+            switch ($Event.Id) {
+                302 {
+                    if ($Event.Properties.Count -gt 0) { $eventData.Username = [string]$Event.Properties[0].Value }
+                    if ($Event.Properties.Count -gt 1) { $eventData.ExternalIP = [string]$Event.Properties[1].Value }
+                    if ($Event.Properties.Count -gt 2) {
+                        $p2 = [string]$Event.Properties[2].Value
+                        $p3 = if ($Event.Properties.Count -gt 3) { [string]$Event.Properties[3].Value } else { '' }
+                        $p4 = if ($Event.Properties.Count -gt 4) { [string]$Event.Properties[4].Value } else { '' }
+                        if ([string]::IsNullOrWhiteSpace($p2) -and (Test-RdpMonitorStringLooksLikeIPv4 $p3)) {
+                            $eventData.InternalIP = $p3.Trim()
+                            if (-not [string]::IsNullOrWhiteSpace($p4)) {
+                                $eventData.Protocol = $p4.Trim()
+                            }
+                        } else {
+                            $eventData.InternalIP = $p2.Trim()
+                            if (-not [string]::IsNullOrWhiteSpace($p3)) { $eventData.Protocol = $p3.Trim() }
+                        }
+                    }
+                    $eventData.ErrorCode = "0"
+                }
+                303 {
+                    if ($Event.Properties.Count -gt 0) { $eventData.Username = [string]$Event.Properties[0].Value }
+                    if ($Event.Properties.Count -gt 1) { $eventData.ExternalIP = [string]$Event.Properties[1].Value }
+                    if ($Event.Properties.Count -gt 2) {
+                        $p2 = [string]$Event.Properties[2].Value
+                        $p3 = if ($Event.Properties.Count -gt 3) { [string]$Event.Properties[3].Value } else { '' }
+                        if ([string]::IsNullOrWhiteSpace($p2) -and (Test-RdpMonitorStringLooksLikeIPv4 $p3)) {
+                            $eventData.InternalIP = $p3.Trim()
+                            if ($Event.Properties.Count -gt 4) { $eventData.ErrorCode = [string]$Event.Properties[4].Value }
+                            if ($Event.Properties.Count -gt 5) { $eventData.Protocol = [string]$Event.Properties[5].Value }
+                        } else {
+                            $eventData.InternalIP = $p2.Trim()
+                            if (-not [string]::IsNullOrWhiteSpace($p3)) { $eventData.Protocol = $p3.Trim() }
+                            if ($Event.Properties.Count -gt 4) { $eventData.ErrorCode = [string]$Event.Properties[4].Value }
+                        }
+                    }
+                }
             }
+        } elseif ($Event.Id -eq 302 -and $eventData.ErrorCode -eq 'N/A') {
+            $eventData.ErrorCode = "0"
+        }
+
+        if ($Event.Id -eq 303 -and ($eventData.ErrorCode -eq 'N/A' -or [string]::IsNullOrWhiteSpace($eventData.ErrorCode)) -and $Event.Properties.Count -gt 4) {
+            $eventData.ErrorCode = [string]$Event.Properties[4].Value
+        }
+
+        if (($eventData.InternalIP -eq 'N/A' -or [string]::IsNullOrWhiteSpace($eventData.InternalIP)) -and
+            (Test-RdpMonitorStringLooksLikeIPv4 $eventData.Protocol)) {
+            $eventData.InternalIP = $eventData.Protocol.Trim()
+            $eventData.Protocol = 'N/A'
         }
     } catch {
         Write-Log "Ошибка при извлечении RD Gateway события: $($_.Exception.Message)"
