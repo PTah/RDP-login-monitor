@@ -122,6 +122,32 @@ schtasks /Query /TN "RDP-Login-Monitor-Watchdog"
   - `RDP-Login-Monitor-Watchdog`
 - Поэтому после фактического запуска deploy монитор и watchdog стартуют сразу.
 
+### Серверы без перезагрузок: периодический Deploy
+
+Если сервер перезагружается редко, одного Startup-сценария недостаточно для своевременного обновления. В этом случае добавьте отдельную задачу, которая периодически запускает `Deploy-LoginMonitor.ps1` с шары.
+
+Готовый скрипт в репозитории:
+
+- `Install-DeployScheduledTask.ps1`
+
+Пример (каждые 60 минут и сразу запустить):
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Install-DeployScheduledTask.ps1" `
+  -TaskName "RDP-Login-Monitor-Deploy" `
+  -DeployScriptPath "\\B26\NETLOGON\RDP-login-monitor\Deploy-LoginMonitor.ps1" `
+  -RepeatMinutes 60 `
+  -RunNow
+```
+
+Проверка:
+
+```powershell
+schtasks /Query /TN "RDP-Login-Monitor-Deploy" /V /FO LIST
+```
+
+Важно: эта задача отвечает только за доставку обновлений (через `version.txt`). За «живость» процесса по-прежнему отвечает `RDP-Login-Monitor-Watchdog`.
+
 ### Диагностика GPO/Startup
 
 - События применения политики и startup-сценариев:
