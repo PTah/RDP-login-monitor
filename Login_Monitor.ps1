@@ -1172,6 +1172,17 @@ function Get-RdpMonitorIgnoreListEntries {
         }
         $script:IgnoreListCache = @($entries)
         $script:IgnoreListCacheStampUtc = $stamp
+        $arr = $script:IgnoreListCache
+        $nIp = @($arr | Where-Object { $_.Kind -eq 'Ip' }).Count
+        $nUser = @($arr | Where-Object { $_.Kind -eq 'User' }).Count
+        $nWks = @($arr | Where-Object { $_.Kind -eq 'Workstation' }).Count
+        $nAny = @($arr | Where-Object { $_.Kind -eq 'Any' }).Count
+        $nTotal = $arr.Count
+        if ($nTotal -eq 0) {
+            Write-Log "ignore.lst обновлён: список правил пуст, игнорирование по файлу для Security 4624/4625 не задаётся."
+        } else {
+            Write-Log ("ignore.lst обновлён: добавлено игнорирование событий 4624/4625 по IP ({0}), пользователю ({1}), рабочей станции ({2}); универсальных правил ({3}). Всего записей: {4}." -f $nIp, $nUser, $nWks, $nAny, $nTotal)
+        }
         return $script:IgnoreListCache
     } catch {
         Write-Log "Предупреждение: не удалось прочитать ignore.lst: $($_.Exception.Message)"
