@@ -1,15 +1,15 @@
-# RDP Login Monitor
+﻿# RDP Login Monitor
 
 PowerShell-набор для мониторинга входов в Windows с отправкой уведомлений в Telegram.
 
 ## Актуальная схема (рекомендуется)
 
 - Базовый путь установки: **`C:\ProgramData\RDP-login-monitor\`**.
-- Основной скрипт: **`Login_Monitor.ps1`** (Security `4624/4625`, опционально RD Gateway `302/303`, heartbeat, ротация логов, уведомления).
+- Основной скрипт: **`Login_Monitor.ps1`** — журнал Security **`4624`/`4625`** (логика зависит от типа ОС: рабочая станция или сервер/КД), при наличии журнала — **Remote Connection Manager `1149`** (часто актуально для РС с RDP), при роли **RD Gateway** — **`302`/`303`**, **ежедневный отчёт** в Telegram (активные сессии через `quser`), **heartbeat**, **ротация логов**, уведомления в Telegram.
 - Установка задач: запуск **`Login_Monitor.ps1 -InstallTasks`** создаёт:
   - `RDP-Login-Monitor` (основной монитор),
   - `RDP-Login-Monitor-Watchdog` (контроль процесса каждые 5 минут).
-- Доменная доставка и обновления: **`Deploy-LoginMonitor.ps1`** + **`version.txt`** с шары `NETLOGON`.
+- Доменная доставка и обновления: **`Deploy-LoginMonitor.ps1`** + **`version.txt`** с шары `NETLOGON`. После успешного деплоя в приветственном сообщении Telegram может появиться отметка об обновлении (файл **`deploy_last_update.txt`** рядом с логами).
 - Для полной инструкции по деплою/GPO используйте **[DEPLOY.md](DEPLOY.md)**.
 - **`Encrypt-DpapiForRdpMonitor.ps1`** — опционально для подготовки DPAPI-строк токена/chat id.
 
@@ -64,7 +64,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\ProgramData\RDP-logi
   - `C:\ProgramData\RDP-login-monitor\Logs\login_monitor.log`
   - `C:\ProgramData\RDP-login-monitor\Logs\watchdog.log`
 - Heartbeat:
-  - `C:\ProgramData\RDP-login-monitor\Logs\last_heartbeat.txt` обновляется примерно раз в час (по `$HeartbeatInterval`).
+  - `C:\ProgramData\RDP-login-monitor\Logs\last_heartbeat.txt` обновляется по интервалу **`$HeartbeatInterval`** (по умолчанию раз в час).
+- Ежедневный отчёт: после первого прохождения дневного слота (по умолчанию **09:00**, задаётся **`$DailyReportHour`** / **`$DailyReportMinute`** в `Login_Monitor.ps1`) в Telegram уходит сводка по **`quser`**; метка последнего отчёта — `Logs\last_daily_report.txt`.
 - Telegram при старте: при установленном **RD Session Host** (или аналогичных компонентах RDS, не только шлюз) — строка про входы по RDP/RDS на этом сервере; при доступном журнале **RD Gateway** — отдельная строка про подключения к **внутренним целевым ПК** через шлюз (302/303). Узел только с ролью RD Gateway не дублирует формулировку «хост сессий».
 
 ## 5) Автоматический перезапуск при падении
@@ -74,6 +75,12 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\ProgramData\RDP-logi
 - проверяет, есть ли процесс `powershell.exe/pwsh.exe` с `Login_Monitor.ps1` в командной строке;
 - если процесса нет — запускает монитор;
 - если монитор уже есть — не дублирует экземпляр.
+
+## 6) Дополнительные параметры и прочие файлы
+
+- **`-SkipScheduledTaskMaintenance`**: при обычном запуске монитора не выполнять проверку/пересоздание задач планировщика (если регистрацию задач ведёте только через **`-InstallTasks`** или вручную).
+- **`Install-DeployScheduledTask.ps1`** — helper для периодического запуска **`Deploy-LoginMonitor.ps1`** с шары (см. **[DEPLOY.md](DEPLOY.md)**).
+- **`Watchdog_RDP_Monitor.ps1`** и **`Install-ScheduledTasks.ps1`** — **альтернативная** схема с отдельным watchdog-файлом и путями по умолчанию **`D:\Soft`**. Для новых установок рекомендуется встроенный режим **`-Watchdog`** в **`Login_Monitor.ps1`** и задачи **`RDP-Login-Monitor`** / **`RDP-Login-Monitor-Watchdog`**.
 
 ## Ключевые слова (для поиска репозитория)
 
