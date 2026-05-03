@@ -33,6 +33,18 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+function Test-DeployRunningElevated {
+    try {
+        $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+        # LocalSystem (GPO startup / задачи SYSTEM): не всегда даёт true на BuiltInRole::Administrator.
+        if ($null -ne $id.User -and $id.User.Value -eq 'S-1-5-18') { return $true }
+        $p = New-Object Security.Principal.WindowsPrincipal($id)
+        return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {
+        return $false
+    }
+}
+
 $InstallRoot = [System.IO.Path]::GetFullPath("$env:ProgramData\RDP-login-monitor")
 $LocalScript = Join-Path $InstallRoot "Login_Monitor.ps1"
 $VersionStampPath = Join-Path $InstallRoot "deployed_version.txt"
@@ -206,6 +218,11 @@ try {
         exit 0
     }
 
+    if (-not (Test-DeployRunningElevated)) {
+        Write-DeployLog "ОШИБКА: запустите Deploy из повышенной консоли PowerShell («Запуск от имени администратора»). Без этого дочерний Login_Monitor.ps1 -InstallTasks завершится с кодом 1 (нет прав на регистрацию задач)."
+        exit 0
+    }
+
     Stop-RdpLoginMonitorMainProcesses
 
     Copy-Item -LiteralPath $sourceScript -Destination $LocalScript -Force
@@ -214,9 +231,23 @@ try {
     $installArgs = @(
         '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $LocalScript, '-InstallTasks'
     )
-    $p = Start-Process -FilePath $PsExe -ArgumentList $installArgs -Wait -PassThru -WindowStyle Hidden
+    $instOut = Join-Path $InstallRoot "Logs\deploy_installtasks_stdout.log"
+    $instErr = Join-Path $InstallRoot "Logs\deploy_installtasks_stderr.log"
+    $p = Start-Process -FilePath $PsExe -ArgumentList $installArgs -Wait -PassThru -WindowStyle Hidden `
+        -RedirectStandardOutput $instOut -RedirectStandardError $instErr
     if ($p.ExitCode -ne 0) {
         Write-DeployLog "Предупреждение: InstallTasks завершился с кодом $($p.ExitCode)."
+        foreach ($pair in @(@($instOut, 'stdout'), @($instErr, 'stderr'))) {
+            $lp = $pair[0]
+            $lbl = $pair[1]
+            if (Test-Path -LiteralPath $lp) {
+                $tail = Get-Content -LiteralPath $lp -Tail 40 -ErrorAction SilentlyContinue
+                if ($tail) {
+                    Write-DeployLog "InstallTasks $lbl (хвост): $($tail -join ' | ')"
+                }
+            }
+        }
+        Write-DeployLog "Подсказка: полный вывод в Logs\deploy_installtasks_*.log; также см. login_monitor.log за это время."
     } else {
         Write-DeployLog "InstallTasks выполнен (код 0)."
     }

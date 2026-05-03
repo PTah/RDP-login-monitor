@@ -69,7 +69,7 @@ $script:MonitorSingletonLockStream = $null
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.4.0"
+$ScriptVersion = "1.4.1"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -491,6 +491,24 @@ function Start-RdpMonitorWatchdogMain {
     exit 0
 }
 
+# Watchdog и InstallTasks — до DPAPI/Telegram: Deploy вызывает -InstallTasks без зависимости от секретов на машине.
+if ($Watchdog) {
+    Start-RdpMonitorWatchdogMain
+    exit 0
+}
+
+if ($InstallTasks) {
+    $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($currentUser)
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        Write-Log "InstallTasks: нужны права администратора."
+        exit 1
+    }
+    Register-RdpMonitorScheduledTasksCore
+    Write-Log "InstallTasks: задачи планировщика обновлены."
+    exit 0
+}
+
 # --- Учётные данные Telegram (открытый текст или DPAPI Base64) ---
 if (-not [string]::IsNullOrWhiteSpace($TelegramBotTokenProtectedB64)) {
     try {
@@ -510,23 +528,6 @@ if (-not [string]::IsNullOrWhiteSpace($TelegramChatIDProtectedB64)) {
 }
 if ($TelegramBotToken -eq '<TELEGRAM_BOT_TOKEN>') { $TelegramBotToken = "" }
 if ($TelegramChatID -eq '<TELEGRAM_CHAT_ID>') { $TelegramChatID = "" }
-
-if ($Watchdog) {
-    Start-RdpMonitorWatchdogMain
-    exit 0
-}
-
-if ($InstallTasks) {
-    $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = New-Object Security.Principal.WindowsPrincipal($currentUser)
-    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        Write-Log "InstallTasks: нужны права администратора."
-        exit 1
-    }
-    Register-RdpMonitorScheduledTasksCore
-    Write-Log "InstallTasks: задачи планировщика обновлены."
-    exit 0
-}
 
 function ConvertTo-TelegramHtml {
     param([string]$Text)
