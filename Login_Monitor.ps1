@@ -69,7 +69,7 @@ $script:MonitorSingletonLockStream = $null
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.4.2"
+$ScriptVersion = "1.4.3"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -958,7 +958,7 @@ function Send-Heartbeat {
                     'Any' { 'Универсальное правило' }
                     default { 'Правило' }
                 }
-                $message += "• ${kindLabel}: $v`r`n"
+                $message += ('• {0}: {1}' -f $kindLabel, $v) + "`r`n"
             }
         } else {
             $message += "`r`n🚫 <b>Игнорируются:</b> не задано (ignore.lst отсутствует или пуст)."
