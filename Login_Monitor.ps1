@@ -69,7 +69,7 @@ $script:MonitorSingletonLockStream = $null
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.3.13"
+$ScriptVersion = "1.3.14"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -84,6 +84,10 @@ $LogRotationMinute = 0
 $HeartbeatInterval = 3600
 $HeartbeatFile = Join-Path $script:InstallRoot "Logs\last_heartbeat.txt"
 $DeployUpdateMarkerFile = Join-Path $script:InstallRoot "deploy_last_update.txt"
+# Построчные правила подавления уведомлений Security 4624/4625 (см. ignore.lst.example в репозитории).
+$script:IgnoreListPath = Join-Path $script:InstallRoot "ignore.lst"
+$script:IgnoreListCache = $null
+$script:IgnoreListCacheStampUtc = $null
 
 # Ежедневный отчет
 $DailyReportHour = 9
@@ -1105,6 +1109,126 @@ function Get-LogonTypeName {
     }
 }
 
+function Test-RdpMonitorUsernameMatchesToken {
+    param([string]$Username, [string]$Token)
+    if ([string]::IsNullOrWhiteSpace($Username) -or [string]::IsNullOrWhiteSpace($Token)) { return $false }
+    if ($Username -ieq $Token) { return $true }
+    if ($Token.Contains('\')) {
+        return ($Username -ieq $Token)
+    }
+    $i = $Username.LastIndexOf('\')
+    if ($i -ge 0 -and $i -lt ($Username.Length - 1)) {
+        $sam = $Username.Substring($i + 1)
+        if ($sam -ieq $Token) { return $true }
+    }
+    return $false
+}
+
+function Parse-RdpMonitorIgnoreListLine {
+    param([string]$RawLine)
+    $line = ([string]$RawLine).Trim()
+    if ($line.Length -eq 0) { return $null }
+    if ($line[0] -eq '#' -or $line[0] -eq ';') { return $null }
+    if ($line.StartsWith([char]0xFEFF)) { $line = $line.TrimStart([char]0xFEFF) }
+
+    if ($line -notmatch ':') {
+        return [pscustomobject]@{ Kind = 'Any'; Value = $line }
+    }
+
+    $idx = $line.IndexOf(':')
+    $left = $line.Substring(0, $idx).Trim()
+    $right = $line.Substring($idx + 1).Trim()
+    if ([string]::IsNullOrWhiteSpace($right)) { return $null }
+
+    if ($left -match '(?i)(рабоч|workstation|wks)') {
+        return [pscustomobject]@{ Kind = 'Workstation'; Value = $right }
+    }
+    if ($left -match '(?i)(польз|username|subject|account|target\s*user|\buser\b)') {
+        return [pscustomobject]@{ Kind = 'User'; Value = $right }
+    }
+    if ($left -match '(?i)(\bip\b|ip\s*адрес|ipaddress|адрес\s*ip)') {
+        return [pscustomobject]@{ Kind = 'Ip'; Value = $right }
+    }
+
+    return [pscustomobject]@{ Kind = 'Any'; Value = $right }
+}
+
+function Get-RdpMonitorIgnoreListEntries {
+    if (-not (Test-Path -LiteralPath $script:IgnoreListPath)) {
+        $script:IgnoreListCache = @()
+        $script:IgnoreListCacheStampUtc = $null
+        return $script:IgnoreListCache
+    }
+    try {
+        $fi = Get-Item -LiteralPath $script:IgnoreListPath -ErrorAction Stop
+        $stamp = $fi.LastWriteTimeUtc
+        if ($null -ne $script:IgnoreListCache -and $script:IgnoreListCacheStampUtc -eq $stamp) {
+            return $script:IgnoreListCache
+        }
+        $entries = [System.Collections.Generic.List[object]]::new()
+        foreach ($ln in (Get-Content -LiteralPath $script:IgnoreListPath -Encoding UTF8 -ErrorAction Stop)) {
+            $e = Parse-RdpMonitorIgnoreListLine -RawLine $ln
+            if ($null -ne $e) { $entries.Add($e) | Out-Null }
+        }
+        $script:IgnoreListCache = @($entries)
+        $script:IgnoreListCacheStampUtc = $stamp
+        return $script:IgnoreListCache
+    } catch {
+        Write-Log "Предупреждение: не удалось прочитать ignore.lst: $($_.Exception.Message)"
+        $script:IgnoreListCache = @()
+        $script:IgnoreListCacheStampUtc = $null
+        return $script:IgnoreListCache
+    }
+}
+
+function Test-RdpMonitorIgnoreListMatch {
+    param(
+        [string]$Username,
+        [string]$ComputerName,
+        [string]$SourceIP
+    )
+    $entries = @(Get-RdpMonitorIgnoreListEntries)
+    if ($entries.Count -eq 0) { return $false }
+
+    foreach ($e in $entries) {
+        $v = [string]$e.Value
+        if ([string]::IsNullOrWhiteSpace($v)) { continue }
+
+        switch ($e.Kind) {
+            'User' {
+                if (Test-RdpMonitorUsernameMatchesToken -Username $Username -Token $v) { return $true }
+            }
+            'Workstation' {
+                if (-not [string]::IsNullOrWhiteSpace($ComputerName) -and $ComputerName -ne '-' -and ($ComputerName -ieq $v)) {
+                    return $true
+                }
+            }
+            'Ip' {
+                if (-not [string]::IsNullOrWhiteSpace($SourceIP) -and $SourceIP -ne '-' -and ($SourceIP -ieq $v)) {
+                    return $true
+                }
+            }
+            'Any' {
+                if (Test-RdpMonitorStringLooksLikeIPv4 $v) {
+                    if (-not [string]::IsNullOrWhiteSpace($SourceIP) -and $SourceIP -ne '-' -and ($SourceIP -ieq $v)) {
+                        return $true
+                    }
+                    continue
+                }
+                if ($v.Contains('\')) {
+                    if (Test-RdpMonitorUsernameMatchesToken -Username $Username -Token $v) { return $true }
+                    continue
+                }
+                if (-not [string]::IsNullOrWhiteSpace($ComputerName) -and $ComputerName -ne '-' -and ($ComputerName -ieq $v)) {
+                    return $true
+                }
+                if (Test-RdpMonitorUsernameMatchesToken -Username $Username -Token $v) { return $true }
+            }
+        }
+    }
+    return $false
+}
+
 function Should-IgnoreEvent {
     param(
         [string]$Username,
@@ -1160,6 +1284,12 @@ function Should-IgnoreEvent {
 
     foreach ($pattern in $ExcludedComputerPatterns) {
         if ($ComputerName -like $pattern) { return $true }
+    }
+
+    if ($EventID -in 4624, 4625) {
+        if (Test-RdpMonitorIgnoreListMatch -Username $Username -ComputerName $ComputerName -SourceIP $SourceIP) {
+            return $true
+        }
     }
 
     return $false
