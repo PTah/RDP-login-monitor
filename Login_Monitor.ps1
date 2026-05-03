@@ -945,6 +945,23 @@ function Send-Heartbeat {
         } else {
             $message += "`r`n📌 <b>Режим:</b> сервер — Security 4624/4625, типы входа 2, 3, 10."
         }
+        $ignoreEntries = @(Get-RdpMonitorIgnoreListEntries)
+        if ($ignoreEntries.Count -gt 0) {
+            $message += "`r`n🚫 <b>Игнорируются:</b> Security 4624/4625 по правилам ignore.lst`r`n"
+            foreach ($e in $ignoreEntries) {
+                $v = ConvertTo-TelegramHtml ([string]$e.Value)
+                $kindLabel = switch ($e.Kind) {
+                    'User' { 'Пользователь' }
+                    'Workstation' { 'Рабочая станция' }
+                    'Ip' { 'IP' }
+                    'Any' { 'Универсальное правило' }
+                    default { 'Правило' }
+                }
+                $message += "• $kindLabel: $v`r`n"
+            }
+        } else {
+            $message += "`r`n🚫 <b>Игнорируются:</b> не задано (ignore.lst отсутствует или пуст)."
+        }
         if (Test-RDSDeploymentPresent) {
             $message += "`r`n🔐 <b>RDS (хост сессий):</b> обнаружены компоненты RDS помимо чистого шлюза — в мониторинг входят входы по RDP/RDS на этом узле (Security 4624/4625, типы входа по настройке скрипта)."
         }
