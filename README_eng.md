@@ -33,6 +33,7 @@ PowerShell toolkit for monitoring Windows logons with Telegram notifications.
 4. Run elevated (Security log access and task registration).
 5. Logs and auxiliary files:
    - `C:\ProgramData\RDP-login-monitor\Logs\`
+6. (Optional) Suppress some Security alerts via **`ignore.lst`** — see **section 7** below.
 
 ## 2) Manual run
 
@@ -81,6 +82,46 @@ For domain deployment from a share you do not configure the scheduler on clients
 - **`-SkipScheduledTaskMaintenance`**: during normal monitor startup, skip verification/recreation of scheduled tasks (if you manage tasks only via **`-InstallTasks`** or manually).
 - **`Install-DeployScheduledTask.ps1`** — helper to run **`Deploy-LoginMonitor.ps1`** from a share on a schedule (see **[DEPLOY.md](DEPLOY.md)**).
 - **`Watchdog_RDP_Monitor.ps1`** and **`Install-ScheduledTasks.ps1`** — **alternate** layout with a separate watchdog script and default paths under **`D:\Soft`**. For new installs, prefer the built-in **`-Watchdog`** in **`Login_Monitor.ps1`** and tasks **`RDP-Login-Monitor`** / **`RDP-Login-Monitor-Watchdog`**.
+- **`ignore.lst.example`** in the repo is a template for **`ignore.lst`** to suppress selected Security notifications (see section 7).
+
+## 7) Suppressing Security alerts: `ignore.lst`
+
+Place a file **`C:\ProgramData\RDP-login-monitor\ignore.lst`** next to **`Login_Monitor.ps1`**. Rules in this list are evaluated **only** for Telegram notifications from Security events **`4624`/`4625`** (successful/failed logons). Built-in exclusions in the script (`ExcludedUsers`, loopback IPs, service-style accounts, etc.) still apply to all event paths; **`ignore.lst`** adds **extra** matches **for 4624/4625 only**.
+
+**RD Gateway (`302`/`303`)**, **RCM `1149`**, the daily report, and heartbeat **are not controlled** by this file (for `1149` the list is not applied, even though a shared filter function runs).
+
+### How the file is loaded
+
+- The file is read during event processing; entries are **cached in memory**. If **`LastWriteTimeUtc`** changes (save after edit), the list is **reloaded automatically** — no monitor restart required.
+- Encoding: **UTF-8** (`Get-Content -Encoding UTF8`). A UTF-8 BOM at the start of a line is stripped when parsing.
+- Blank lines are skipped. Lines starting with **`#`** or **`;`** are comments.
+- If the line contains **`:`**, the **first** colon splits the line: the left part (trimmed) selects the rule kind, the right part is the value. If the right part is empty, the line is ignored.
+- If there is **no** colon, the whole trimmed line is one “match-any” value (see below).
+
+### Rule kinds (left part before the first `:`)
+
+| Left part (case-insensitive regex fragments) | Event field |
+| --- | --- |
+| `рабоч`, `workstation`, `wks` | workstation name (**WorkstationName** and similar XML fields) |
+| `польз`, `username`, `subject`, `account`, `target user`, whole word `user` | user name (**TargetUserName**, etc.) |
+| `ip`, `ip адрес`, `ipaddress`, `адрес ip` | source IP (**IpAddress**, etc.) when present |
+
+If the left part matches none of the above but a colon exists, the parser behaves like the Telegram line splitter: kind is **Any**, value is **only the right part** (the label on the left is discarded).
+
+### “Any” matching (no colon, or unknown label before `:`)
+
+Evaluated in order:
+
+1. If the value looks like **IPv4**, it is compared to the event source IP (exact match).
+2. If the value contains **`\`**, it is matched against the **account**: full `DOMAIN\user` equality **or** SAM after the last `\` (e.g. rule `IVANOV` matches `DOMAIN\IVANOV`).
+3. Otherwise: exact match against **workstation name** first, then the same account rules as in step 2.
+
+Explicit **User** / **Workstation** / **Ip** kinds only compare their respective field (user rules use the same full-name and SAM behavior as step 2).
+
+### Examples and deployment
+
+- See **`ignore.lst.example`** in the repo; copy it to the server as **`ignore.lst`** and edit.
+- **`Deploy-LoginMonitor.ps1`** does **not** copy this file — rules are usually host-specific; create **`ignore.lst`** manually or via your configuration tooling.
 
 ## Keywords (for discovery)
 
