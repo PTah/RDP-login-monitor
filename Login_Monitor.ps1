@@ -69,7 +69,7 @@ $script:MonitorSingletonLockStream = $null
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.4.3"
+$ScriptVersion = "1.4.4"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -1678,6 +1678,9 @@ function Start-LoginMonitor {
 
     while ($true) {
         try {
+            # ignore.lst: сверка mtime и лог при изменении файла (не только при событиях 4624/4625).
+            [void](Get-RdpMonitorIgnoreListEntries)
+
             $events = Get-WinEvent -FilterHashtable @{
                 LogName = 'Security'
                 ID = $monitorEvents
