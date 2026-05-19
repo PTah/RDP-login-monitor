@@ -1,5 +1,5 @@
 # Запуск: от администратора на ТОМ ЖЕ компьютере, где будет Login_Monitor.ps1.
-# Результат (Base64) вставьте в $TelegramBotTokenProtectedB64 / $TelegramChatIDProtectedB64.
+# Результат (Base64) вставьте в $TelegramBotTokenProtectedB64 / $TelegramChatIDProtectedB64 / $MailSmtpPasswordProtectedB64.
 param(
     [Parameter(Mandatory = $true)][string]$PlainText
 )

@@ -3,6 +3,7 @@
     Мониторинг логинов/попыток входа с уведомлениями в Telegram
 .DESCRIPTION
     Отслеживает события входа в систему (Security 4624/4625) и события RD Gateway (302/303),
+    на заданном КД — блокировки учётных записей (Security 4740) с IP из логов IIS ActiveSync,
     отправляет уведомления в Telegram, делает ротацию логов, heartbeat в файл и ежедневный отчет.
 .NOTES
     Требуется: PowerShell 5.0+, запуск от администратора.
@@ -28,6 +29,7 @@ param(
     [string]$TelegramChatID = '<TELEGRAM_CHAT_ID>',
     [string]$TelegramBotTokenProtectedB64 = "",
     [string]$TelegramChatIDProtectedB64 = "",
+    [string]$MailSmtpPasswordProtectedB64 = "",
     [switch]$Watchdog,
     [switch]$InstallTasks,
     [switch]$SkipScheduledTaskMaintenance
@@ -69,7 +71,7 @@ $script:MonitorSingletonLockStream = $null
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.4.4"
+$ScriptVersion = "1.5.2"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -147,6 +149,25 @@ $IgnoreAdvapiNetworkLogonSourceIps = @(
     "192.168.160.57"
 )
 $IgnoreAdvapiNetworkLogonProcessContains = "Advapi"
+
+# Блокировка учётной записи AD (Security 4740) + IP клиента из логов IIS ActiveSync.
+# Мониторинг включается только если скрипт запущен на узле, имя которого совпадает с $LockoutMonitorDomainController.
+$LockoutMonitorDomainController = ""
+$NetBiosDomainName = ""
+$ExchangeIisLogPath = ""
+$ExchangeServerHostForIisExclude = ""
+$ExchangeIisLogTailLines = 5000
+
+# Очередь оповещений: telegram, email (или tg, mail). Пусто = авто: настроенные каналы, порядок telegram → email.
+$NotifyOrder = ""
+$MailSmtpHost = ""
+$MailSmtpPort = 587
+$MailSmtpUser = ""
+$MailSmtpPassword = ""
+$MailFrom = ""
+$MailTo = ""
+$MailSmtpStartTls = $true
+$MailSmtpSsl = $false
 
 # ============================================
 # ИНИЦИАЛИЗАЦИЯ
@@ -529,6 +550,70 @@ if (-not [string]::IsNullOrWhiteSpace($TelegramChatIDProtectedB64)) {
 if ($TelegramBotToken -eq '<TELEGRAM_BOT_TOKEN>') { $TelegramBotToken = "" }
 if ($TelegramChatID -eq '<TELEGRAM_CHAT_ID>') { $TelegramChatID = "" }
 
+if (-not [string]::IsNullOrWhiteSpace($MailSmtpPasswordProtectedB64)) {
+    try {
+        $MailSmtpPassword = Unprotect-RdpMonitorDpapiB64 -Base64 $MailSmtpPasswordProtectedB64
+    } catch {
+        Write-Host "Ошибка расшифровки MailSmtpPassword (DPAPI): $($_.Exception.Message)"
+        exit 1
+    }
+}
+
+function Test-NotifyTelegramConfigured {
+    return (-not [string]::IsNullOrWhiteSpace($TelegramBotToken)) -and
+        (-not [string]::IsNullOrWhiteSpace($TelegramChatID))
+}
+
+function Test-NotifyEmailConfigured {
+    return (-not [string]::IsNullOrWhiteSpace($MailSmtpHost)) -and
+        (-not [string]::IsNullOrWhiteSpace($MailFrom)) -and
+        (-not [string]::IsNullOrWhiteSpace($MailTo))
+}
+
+function Get-NotifyOrderChannels {
+    $configured = [System.Collections.Generic.List[string]]::new()
+    if (Test-NotifyTelegramConfigured) { $configured.Add('telegram') | Out-Null }
+    if (Test-NotifyEmailConfigured) { $configured.Add('email') | Out-Null }
+
+    if ([string]::IsNullOrWhiteSpace($NotifyOrder)) {
+        return @($configured)
+    }
+
+    $requested = [System.Collections.Generic.List[string]]::new()
+    foreach ($part in ($NotifyOrder -split '[,\s;]+')) {
+        $p = $part.Trim().ToLowerInvariant()
+        if ([string]::IsNullOrWhiteSpace($p)) { continue }
+        $channel = switch -Regex ($p) {
+            '^(tg|telegram)$' { 'telegram' }
+            '^(mail|email|e-mail)$' { 'email' }
+            default {
+                Write-Log "NotifyOrder: неизвестный канал '$part' (ожидается telegram/tg или email/mail)"
+                $null
+            }
+        }
+        if ($null -eq $channel) { continue }
+        if ($configured.Contains($channel) -and -not $requested.Contains($channel)) {
+            $requested.Add($channel) | Out-Null
+        }
+    }
+    return @($requested)
+}
+
+function Get-NotifyChainHuman {
+    $channels = @(Get-NotifyOrderChannels)
+    if ($channels.Count -eq 0) {
+        return 'нет (ни Telegram, ни SMTP не настроены)'
+    }
+    $labels = foreach ($ch in $channels) {
+        switch ($ch) {
+            'telegram' { 'Telegram' }
+            'email' { 'Email (SMTP)' }
+            default { $ch }
+        }
+    }
+    return ($labels -join ' → ')
+}
+
 function ConvertTo-TelegramHtml {
     param([string]$Text)
     if ($null -eq $Text) { return '' }
@@ -561,6 +646,10 @@ function Send-TelegramMessage {
 }
 
 function Test-TelegramConnection {
+    if (-not (Test-NotifyTelegramConfigured)) {
+        Write-Log "Telegram: канал не настроен, проверка пропущена."
+        return $false
+    }
     Write-Log "Проверка подключения к Telegram API..."
     try {
         [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
@@ -575,6 +664,105 @@ function Test-TelegramConnection {
         return $false
     }
     return $false
+}
+
+function ConvertTo-EmailHtmlBody {
+    param([string]$TelegramHtmlMessage)
+    $inner = [string]$TelegramHtmlMessage
+    if ([string]::IsNullOrEmpty($inner)) { $inner = '' }
+    $inner = $inner -replace "`r`n", "<br>`r`n"
+    return @"
+<html>
+<body style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;line-height:1.4;">
+$inner
+</body>
+</html>
+"@
+}
+
+function Send-EmailNotification {
+    param(
+        [string]$Message,
+        [string]$Subject = "RDP Login Monitor"
+    )
+
+    if (-not (Test-NotifyEmailConfigured)) {
+        Write-Log "Email: SMTP не настроен (нужны MailSmtpHost, MailFrom, MailTo)"
+        return $false
+    }
+
+    try {
+        $toList = @($MailTo -split '[,;]' | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        if ($toList.Count -eq 0) {
+            Write-Log "Email: MailTo пуст или некорректен"
+            return $false
+        }
+
+        $mailParams = @{
+            To         = $toList
+            From       = $MailFrom.Trim()
+            Subject    = $Subject
+            Body       = (ConvertTo-EmailHtmlBody -TelegramHtmlMessage $Message)
+            BodyAsHtml = $true
+            SmtpServer = $MailSmtpHost.Trim()
+            Port       = [int]$MailSmtpPort
+            Encoding   = [System.Text.Encoding]::UTF8
+            ErrorAction = 'Stop'
+        }
+        if ($MailSmtpSsl -or $MailSmtpStartTls) {
+            $mailParams['UseSsl'] = $true
+        }
+        if (-not [string]::IsNullOrWhiteSpace($MailSmtpUser)) {
+            $securePass = if ([string]::IsNullOrWhiteSpace($MailSmtpPassword)) {
+                New-Object System.Security.SecureString
+            } else {
+                ConvertTo-SecureString $MailSmtpPassword -AsPlainText -Force
+            }
+            $mailParams['Credential'] = New-Object System.Management.Automation.PSCredential($MailSmtpUser.Trim(), $securePass)
+        }
+
+        Send-MailMessage @mailParams
+        return $true
+    } catch {
+        Write-Log "Ошибка отправки Email: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Test-MailSmtpConnection {
+    if (-not (Test-NotifyEmailConfigured)) {
+        Write-Log "Email: канал не настроен, проверка пропущена."
+        return $false
+    }
+    Write-Log "SMTP: $($MailSmtpHost):$MailSmtpPort (STARTTLS=$MailSmtpStartTls, SSL=$MailSmtpSsl), From=$MailFrom, To=$MailTo"
+    if (-not [string]::IsNullOrWhiteSpace($MailSmtpUser) -and [string]::IsNullOrWhiteSpace($MailSmtpPassword)) {
+        Write-Log "SMTP: задан MailSmtpUser, но пароль пуст (возможна ошибка при отправке)."
+    }
+    return $true
+}
+
+function Send-MonitorNotification {
+    param(
+        [string]$Message,
+        [string]$EmailSubject = "RDP Login Monitor"
+    )
+
+    $channels = @(Get-NotifyOrderChannels)
+    if ($channels.Count -eq 0) {
+        Write-Log "Оповещение не отправлено: нет настроенных каналов (Telegram и/или SMTP)"
+        return $false
+    }
+
+    $anyOk = $false
+    foreach ($ch in $channels) {
+        $ok = switch ($ch) {
+            'telegram' { Send-TelegramMessage -Message $Message }
+            'email' { Send-EmailNotification -Message $Message -Subject $EmailSubject }
+            default { $false }
+        }
+        if ($ok) { $anyOk = $true }
+    }
+    return $anyOk
 }
 
 function Test-Administrator {
@@ -963,6 +1151,8 @@ function Send-Heartbeat {
         } else {
             $message += "`r`n🚫 <b>Игнорируются:</b> не задано (ignore.lst отсутствует или пуст)."
         }
+        $notifyChain = Get-NotifyChainHuman
+        $message += "`r`n📢 <b>Каналы уведомлений:</b> $(ConvertTo-TelegramHtml $notifyChain)"
         if (Test-RDSDeploymentPresent) {
             $message += "`r`n🔐 <b>RDS (хост сессий):</b> обнаружены компоненты RDS помимо чистого шлюза — в мониторинг входят входы по RDP/RDS на этом узле (Security 4624/4625, типы входа по настройке скрипта)."
         }
@@ -974,8 +1164,16 @@ function Send-Heartbeat {
                 }
             } catch { }
         }
-        Send-TelegramMessage -Message $message | Out-Null
-        Write-Log "Отправлено уведомление о запуске скрипта"
+        if (Test-Lockout4740MonitoringActive) {
+            $message += "`r`n🔒 <b>Блокировки AD:</b> на этом КД отслеживается Security <b>4740</b> (блокировка учётной записи)."
+            if (-not [string]::IsNullOrWhiteSpace($ExchangeIisLogPath)) {
+                $message += " При событии — IP из логов IIS ActiveSync (<code>ExchangeIisLogPath</code>)."
+            } else {
+                $message += " IP из IIS не заданы (<code>ExchangeIisLogPath</code> пуст)."
+            }
+        }
+        Send-MonitorNotification -Message $message -EmailSubject "RDP Login Monitor: запуск" | Out-Null
+        Write-Log "Отправлено уведомление о запуске скрипта (каналы: $notifyChain)"
     } else {
         Write-TextFileUtf8Bom -Path $HeartbeatFile -Text $timestamp
     }
@@ -992,7 +1190,7 @@ function Send-StopNotification {
     $message += "🕐 Время остановки: $timestamp`r`n"
     $message += "📋 Причина: $hReason"
 
-    Send-TelegramMessage -Message $message | Out-Null
+    Send-MonitorNotification -Message $message -EmailSubject "RDP Login Monitor: остановка" | Out-Null
     Write-Log "Уведомление об остановке отправлено: $Reason"
 }
 
@@ -1602,7 +1800,7 @@ function Send-DailyReport {
         } else {
             $message += "`r`n<i>Список пользователей недоступен (quser пуст или недостаточно прав).</i>"
         }
-        Send-TelegramMessage -Message $message | Out-Null
+        Send-MonitorNotification -Message $message -EmailSubject "RDP Login Monitor: ежедневный отчёт" | Out-Null
         Write-TextFileUtf8Bom -Path $LastReportFile -Text ((Get-Date).ToString("yyyy-MM-dd HH:mm:ss"))
         Write-Log "Ежедневный отчет отправлен"
         return $true
@@ -1635,6 +1833,128 @@ function Check-AndSendDailyReport {
     return (Get-NextLocalSlotBoundary -Hour $DailyReportHour -Minute $DailyReportMinute)
 }
 
+function Test-Lockout4740MonitoringActive {
+    if ([string]::IsNullOrWhiteSpace($LockoutMonitorDomainController)) { return $false }
+    $configured = ($LockoutMonitorDomainController -split '\.')[0].Trim()
+    $local = ($env:COMPUTERNAME -split '\.')[0].Trim()
+    return ($configured -ieq $local)
+}
+
+function Get-Lockout4740EventInfo {
+    param($Event)
+    $info = [pscustomobject]@{
+        TimeCreated    = $Event.TimeCreated
+        Username       = ""
+        Domain         = ""
+        CallerComputer = ""
+    }
+    try {
+        $map = Get-EventDataMap -Event $Event
+        $info.Username = Get-FirstNonEmptyMapValue -DataMap $map -Keys @(
+            'TargetUserName', 'SamAccountName', 'AccountName'
+        )
+        $info.Domain = Get-FirstNonEmptyMapValue -DataMap $map -Keys @(
+            'TargetDomainName', 'TargetAccountDomain', 'AccountDomain'
+        )
+        $info.CallerComputer = Get-FirstNonEmptyMapValue -DataMap $map -Keys @(
+            'CallerComputerName', 'WorkstationName', 'Workstation'
+        )
+    } catch {
+        Write-Log "Ошибка разбора XML 4740: $($_.Exception.Message)"
+    }
+    if ([string]::IsNullOrWhiteSpace($info.Username) -and $Event.Properties.Count -ge 1) {
+        $info.Username = [string]$Event.Properties[0].Value
+    }
+    if ([string]::IsNullOrWhiteSpace($info.Domain) -and $Event.Properties.Count -ge 2) {
+        $info.Domain = [string]$Event.Properties[1].Value
+    }
+    if ([string]::IsNullOrWhiteSpace($info.CallerComputer) -and $Event.Properties.Count -ge 4) {
+        $info.CallerComputer = [string]$Event.Properties[3].Value
+    }
+    return $info
+}
+
+function Get-ExchangeActiveSyncIpsFromIisLog {
+    param(
+        [Parameter(Mandatory = $true)][string]$SamAccountName,
+        [string]$DomainNetBios = ""
+    )
+    if ([string]::IsNullOrWhiteSpace($ExchangeIisLogPath)) { return @() }
+    $logDir = $ExchangeIisLogPath.TrimEnd('\')
+    $logFile = Join-Path $logDir ("u_ex" + (Get-Date).ToUniversalTime().ToString("yyMMdd") + ".log")
+    if (-not (Test-Path -LiteralPath $logFile)) {
+        Write-Log "IIS: файл лога не найден: $logFile"
+        return @()
+    }
+    $domainPart = if ([string]::IsNullOrWhiteSpace($DomainNetBios)) { $NetBiosDomainName } else { $DomainNetBios }
+    $userPattern1 = if ([string]::IsNullOrWhiteSpace($domainPart)) {
+        $SamAccountName
+    } else {
+        "User=$domainPart%5C" + $SamAccountName
+    }
+    $userPattern2 = if ([string]::IsNullOrWhiteSpace($domainPart)) {
+        $SamAccountName
+    } else {
+        "$domainPart\" + $SamAccountName
+    }
+    $excludeHosts = @('127.0.0.1', '::1')
+    if (-not [string]::IsNullOrWhiteSpace($ExchangeServerHostForIisExclude)) {
+        $excludeHosts += $ExchangeServerHostForIisExclude.Trim()
+    }
+    $detected = [System.Collections.Generic.List[string]]::new()
+    try {
+        $lines = Get-Content -LiteralPath $logFile -Tail $ExchangeIisLogTailLines -ErrorAction Stop
+        foreach ($line in $lines) {
+            if ($line -notlike '*401 *' -or $line -notlike '*ActiveSync*') { continue }
+            if ($line -notlike "*$userPattern1*" -and $line -notlike "*$userPattern2*") { continue }
+            if ($line -notmatch '(?:\d{1,3}\.){3}\d{1,3}') { continue }
+            $ip = $Matches[0]
+            if ($excludeHosts -contains $ip) { continue }
+            if (-not $detected.Contains($ip)) { $detected.Add($ip) | Out-Null }
+        }
+    } catch {
+        Write-Log "IIS: ошибка чтения $logFile : $($_.Exception.Message)"
+    }
+    return @($detected)
+}
+
+function Format-Lockout4740TelegramMessage {
+    param(
+        [string]$Username,
+        [string]$Domain,
+        [datetime]$TimeCreated,
+        [string[]]$IisClientIps = @()
+    )
+    $domainLabel = if ([string]::IsNullOrWhiteSpace($Domain)) { $NetBiosDomainName } else { $Domain }
+    $accountDisplay = if ([string]::IsNullOrWhiteSpace($domainLabel)) {
+        $Username
+    } else {
+        "$domainLabel\$Username"
+    }
+    $hUser = ConvertTo-TelegramHtml $accountDisplay
+    $hTime = ConvertTo-TelegramHtml ($TimeCreated.ToString('dd.MM.yyyy HH:mm:ss'))
+
+    $message = "<b>🔒 Блокировка учётной записи AD (4740)</b>`r`n"
+    $message += "👤 Пользователь: $hUser`r`n"
+    $message += "🕐 Время: $hTime`r`n"
+
+    if ($IisClientIps.Count -gt 0) {
+        $message += "`r`n<b>🌐 IP (попытки ActiveSync, 401):</b>`r`n"
+        foreach ($ip in $IisClientIps) {
+            $netType = if ($ip -like '192.168.*' -or $ip -like '10.*' -or $ip -like '172.1[6-9].*' -or $ip -like '172.2[0-9].*' -or $ip -like '172.3[0-1].*') {
+                'внутренний'
+            } else {
+                'внешний'
+            }
+            $message += ('• {0} ({1})' -f (ConvertTo-TelegramHtml $ip), $netType) + "`r`n"
+        }
+    } elseif (-not [string]::IsNullOrWhiteSpace($ExchangeIisLogPath)) {
+        $message += "`r`n<i>IP в логах IIS ActiveSync для этого пользователя не найдены.</i>`r`n"
+    }
+
+    return $message
+}
+
 function Start-LoginMonitor {
     param(
         [int]$MonitorInterval = 5,
@@ -1655,6 +1975,17 @@ function Start-LoginMonitor {
         Write-Log "Режим сервера: Security — LogonType 2, 3, 10"
     }
     Write-Log "========================================"
+    Write-Log "Каналы уведомлений: $(Get-NotifyChainHuman)"
+
+    $lockout4740Enabled = Test-Lockout4740MonitoringActive
+    if ($lockout4740Enabled) {
+        Write-Log "Мониторинг блокировок AD (4740) включён на этом КД ($LockoutMonitorDomainController)."
+        if (-not [string]::IsNullOrWhiteSpace($ExchangeIisLogPath)) {
+            Write-Log "Обогащение: IIS ActiveSync — $ExchangeIisLogPath"
+        }
+    } elseif (-not [string]::IsNullOrWhiteSpace($LockoutMonitorDomainController)) {
+        Write-Log "Мониторинг 4740 задан для КД '$LockoutMonitorDomainController', но этот узел — $env:COMPUTERNAME (блокировки не отслеживаются)."
+    }
 
     Cleanup-OldLogs
     Send-Heartbeat -IsStartup
@@ -1674,6 +2005,7 @@ function Start-LoginMonitor {
     $lastCheckTime = (Get-Date).AddSeconds(-10)
     $lastGatewayCheckTime = (Get-Date).AddSeconds(-10)
     $lastRcmCheckTime = (Get-Date).AddSeconds(-10)
+    $lastLockout4740CheckTime = (Get-Date).AddSeconds(-10)
     $monitorEvents = @(4624, 4625, 4648)
 
     while ($true) {
@@ -1733,7 +2065,8 @@ function Start-LoginMonitor {
                             -SecurityLogComputerName $event.MachineName
 
                         Write-Log "Notify: ID=$($event.Id) User=$($eventInfo.Username) LT=$($eventInfo.LogonType) IP=$($eventInfo.SourceIP)"
-                        Send-TelegramMessage -Message $formattedMessage | Out-Null
+                        Send-MonitorNotification -Message $formattedMessage `
+                            -EmailSubject "RDP Login Monitor: вход (ID $($event.Id))" | Out-Null
                     }
                 }
                 $lastCheckTime = ($events | Measure-Object -Property TimeCreated -Maximum | Select-Object -ExpandProperty Maximum).AddSeconds(1)
@@ -1759,7 +2092,8 @@ function Start-LoginMonitor {
                             -ErrorCode $ei.ErrorCode `
                             -TimeCreated $ei.TimeCreated
                         Write-Log "Notify RDG: ID=$($event.Id) User=$($ei.Username)"
-                        Send-TelegramMessage -Message $msg | Out-Null
+                        Send-MonitorNotification -Message $msg `
+                            -EmailSubject "RDP Login Monitor: RD Gateway ($($event.Id))" | Out-Null
                     }
                     $lastGatewayCheckTime = ($gatewayEvents | Measure-Object -Property TimeCreated -Maximum | Select-Object -ExpandProperty Maximum).AddSeconds(1)
                 }
@@ -1783,9 +2117,36 @@ function Start-LoginMonitor {
                         $msg = Format-Rcm1149Event -Username $rcmInfo.Username -ClientIP $rcmInfo.ClientIP `
                             -TimeCreated $rcmInfo.TimeCreated -SecurityLogComputerName $event.MachineName
                         Write-Log "Notify RCM 1149: User=$($rcmInfo.Username) IP=$($rcmInfo.ClientIP)"
-                        Send-TelegramMessage -Message $msg | Out-Null
+                        Send-MonitorNotification -Message $msg `
+                            -EmailSubject "RDP Login Monitor: RDP 1149" | Out-Null
                     }
                     $lastRcmCheckTime = ($rcmEvents | Measure-Object -Property TimeCreated -Maximum | Select-Object -ExpandProperty Maximum).AddSeconds(1)
+                }
+            }
+
+            if ($lockout4740Enabled) {
+                $lockoutEvents = Get-WinEvent -FilterHashtable @{
+                    LogName = 'Security'
+                    ID = 4740
+                    StartTime = $lastLockout4740CheckTime
+                } -ErrorAction SilentlyContinue
+
+                if ($lockoutEvents) {
+                    foreach ($event in $lockoutEvents) {
+                        if ($event.TimeCreated -le $lastLockout4740CheckTime) { continue }
+                        $lo = Get-Lockout4740EventInfo -Event $event
+                        if ([string]::IsNullOrWhiteSpace($lo.Username)) { continue }
+
+                        $domainForIis = if ([string]::IsNullOrWhiteSpace($lo.Domain)) { $NetBiosDomainName } else { $lo.Domain }
+                        $iisIps = @(Get-ExchangeActiveSyncIpsFromIisLog -SamAccountName $lo.Username -DomainNetBios $domainForIis)
+
+                        $msg = Format-Lockout4740TelegramMessage -Username $lo.Username -Domain $lo.Domain `
+                            -TimeCreated $lo.TimeCreated -IisClientIps $iisIps
+                        Write-Log "Notify 4740: User=$($lo.Username) IIS_IPs=$($iisIps -join ', ')"
+                        Send-MonitorNotification -Message $msg `
+                            -EmailSubject "RDP Login Monitor: блокировка УЗ $($lo.Username)" | Out-Null
+                    }
+                    $lastLockout4740CheckTime = ($lockoutEvents | Measure-Object -Property TimeCreated -Maximum | Select-Object -ExpandProperty Maximum).AddSeconds(1)
                 }
             }
 
@@ -1810,7 +2171,17 @@ function Start-LoginMonitor {
 
 $script:StopNotificationSent = $false
 try {
-    Test-TelegramConnection | Out-Null
+    $notifyChannels = @(Get-NotifyOrderChannels)
+    if ($notifyChannels.Count -eq 0) {
+        Write-Log "ВНИМАНИЕ: не настроен ни один канал оповещений (Telegram и/или SMTP в конфигурации скрипта)."
+    } else {
+        foreach ($notifyCh in $notifyChannels) {
+            switch ($notifyCh) {
+                'telegram' { Test-TelegramConnection | Out-Null }
+                'email' { Test-MailSmtpConnection | Out-Null }
+            }
+        }
+    }
     Start-LoginMonitor -MonitorInterval 5 -MonitorInteractiveOnly
 } catch {
     if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) {
