@@ -71,7 +71,7 @@ $script:MonitorSingletonLockStream = $null
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.5.2"
+$ScriptVersion = "1.5.3"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -82,8 +82,9 @@ $MaxBackupDays = 31
 $LogRotationHour = 0
 $LogRotationMinute = 0
 
-# Heartbeat (только файл)
+# Heartbeat (файл; при отсутствии обновления > HeartbeatStaleAlertMultiplier × интервал — оповещение)
 $HeartbeatInterval = 3600
+$HeartbeatStaleAlertMultiplier = 2
 $HeartbeatFile = Join-Path $script:InstallRoot "Logs\last_heartbeat.txt"
 $DeployUpdateMarkerFile = Join-Path $script:InstallRoot "deploy_last_update.txt"
 # Построчные правила подавления уведомлений Security 4624/4625 (см. ignore.lst.example в репозитории).
@@ -157,6 +158,8 @@ $NetBiosDomainName = ""
 $ExchangeIisLogPath = ""
 $ExchangeServerHostForIisExclude = ""
 $ExchangeIisLogTailLines = 5000
+# Окно поиска IP в IIS: только строки за N минут до события 4740 (локальное время сервера IIS).
+$ExchangeIisLogMinutesBeforeLockout = 30
 
 # Очередь оповещений: telegram, email (или tg, mail). Пусто = авто: настроенные каналы, порядок telegram → email.
 $NotifyOrder = ""
@@ -796,6 +799,8 @@ try {
 
 $script:IsWorkstation = $false
 $script:OsInstallKindLabel = ""
+$script:MonitorStartedAt = $null
+$script:HeartbeatStaleAlertActive = $false
 
 function Enable-SecurityAudit {
     Write-Log "Checking security audit (auditpol) settings..."
@@ -1136,7 +1141,7 @@ function Send-Heartbeat {
         }
         $ignoreEntries = @(Get-RdpMonitorIgnoreListEntries)
         if ($ignoreEntries.Count -gt 0) {
-            $message += "`r`n🚫 <b>Игнорируются:</b> Security 4624/4625 по правилам ignore.lst`r`n"
+            $message += "`r`n🚫 <b>Игнорируются:</b> по правилам ignore.lst (4624/4625 и/или 4740)`r`n"
             foreach ($e in $ignoreEntries) {
                 $v = ConvertTo-TelegramHtml ([string]$e.Value)
                 $kindLabel = switch ($e.Kind) {
@@ -1153,6 +1158,7 @@ function Send-Heartbeat {
         }
         $notifyChain = Get-NotifyChainHuman
         $message += "`r`n📢 <b>Каналы уведомлений:</b> $(ConvertTo-TelegramHtml $notifyChain)"
+        $message += "`r`n💓 <b>Heartbeat:</b> файл каждые $HeartbeatInterval с; оповещение, если нет обновления > $($HeartbeatStaleAlertMultiplier)× интервал."
         if (Test-RDSDeploymentPresent) {
             $message += "`r`n🔐 <b>RDS (хост сессий):</b> обнаружены компоненты RDS помимо чистого шлюза — в мониторинг входят входы по RDP/RDS на этом узле (Security 4624/4625, типы входа по настройке скрипта)."
         }
@@ -1176,6 +1182,55 @@ function Send-Heartbeat {
         Write-Log "Отправлено уведомление о запуске скрипта (каналы: $notifyChain)"
     } else {
         Write-TextFileUtf8Bom -Path $HeartbeatFile -Text $timestamp
+        $script:HeartbeatStaleAlertActive = $false
+    }
+}
+
+function Get-LastHeartbeatTimestamp {
+    if (-not (Test-Path -LiteralPath $HeartbeatFile)) { return $null }
+    try {
+        $txt = (Get-Content -LiteralPath $HeartbeatFile -ErrorAction Stop | Select-Object -First 1)
+        if ([string]::IsNullOrWhiteSpace($txt)) { return $null }
+        return [datetime]::ParseExact($txt.Trim(), 'dd.MM.yyyy HH:mm:ss', $null)
+    } catch {
+        return $null
+    }
+}
+
+function Test-AndSendHeartbeatStaleAlert {
+    if ($null -eq $script:MonitorStartedAt) { return }
+    $thresholdSec = [double]($HeartbeatInterval * $HeartbeatStaleAlertMultiplier)
+    if (((Get-Date) - $script:MonitorStartedAt).TotalSeconds -lt $thresholdSec) { return }
+
+    $lastHb = Get-LastHeartbeatTimestamp
+    $isStale = $false
+    if ($null -eq $lastHb) {
+        $isStale = $true
+    } elseif (((Get-Date) - $lastHb).TotalSeconds -gt $thresholdSec) {
+        $isStale = $true
+    }
+
+    if (-not $isStale) {
+        if ($script:HeartbeatStaleAlertActive) {
+            $script:HeartbeatStaleAlertActive = $false
+        }
+        return
+    }
+    if ($script:HeartbeatStaleAlertActive) { return }
+
+    $hHost = ConvertTo-TelegramHtml $env:COMPUTERNAME
+    $hThreshold = ConvertTo-TelegramHtml ([int]$thresholdSec)
+    $lastTxt = if ($null -eq $lastHb) { 'нет данных' } else { $lastHb.ToString('dd.MM.yyyy HH:mm:ss') }
+    $hLast = ConvertTo-TelegramHtml $lastTxt
+    $msg = "<b>⚠️ Heartbeat монитора не обновлялся</b>`r`n"
+    $msg += "🖥️ Сервер: $hHost`r`n"
+    $msg += "⏱️ Порог: $hThreshold с ($HeartbeatStaleAlertMultiplier × интервал $HeartbeatInterval с)`r`n"
+    $msg += "📄 Последний heartbeat: $hLast`r`n"
+    $msg += "<i>Проверьте процесс Login_Monitor.ps1 и задачи планировщика RDP-Login-Monitor / Watchdog.</i>"
+
+    if (Send-MonitorNotification -Message $msg -EmailSubject 'RDP Login Monitor: нет heartbeat') {
+        $script:HeartbeatStaleAlertActive = $true
+        Write-Log "Отправлено оповещение: heartbeat не обновлялся дольше $thresholdSec с"
     }
 }
 
@@ -1347,8 +1402,18 @@ function Parse-RdpMonitorIgnoreListLine {
     if ($line[0] -eq '#' -or $line[0] -eq ';') { return $null }
     if ($line.StartsWith([char]0xFEFF)) { $line = $line.TrimStart([char]0xFEFF) }
 
+    $scopes = @('4624', '4625')
+    if ($line -match '^(?i)(4740|lockout|блокир)\s*:\s*(.+)$') {
+        $scopes = @('4740')
+        $line = $Matches[2].Trim()
+    } elseif ($line -match '^(?i)(all|\*)\s*:\s*(.+)$') {
+        $scopes = @('4624', '4625', '4740')
+        $line = $Matches[2].Trim()
+    }
+    if ([string]::IsNullOrWhiteSpace($line)) { return $null }
+
     if ($line -notmatch ':') {
-        return [pscustomobject]@{ Kind = 'Any'; Value = $line }
+        return [pscustomobject]@{ Kind = 'Any'; Value = $line; Scopes = $scopes }
     }
 
     $idx = $line.IndexOf(':')
@@ -1357,16 +1422,16 @@ function Parse-RdpMonitorIgnoreListLine {
     if ([string]::IsNullOrWhiteSpace($right)) { return $null }
 
     if ($left -match '(?i)(рабоч|workstation|wks)') {
-        return [pscustomobject]@{ Kind = 'Workstation'; Value = $right }
+        return [pscustomobject]@{ Kind = 'Workstation'; Value = $right; Scopes = $scopes }
     }
     if ($left -match '(?i)(польз|username|subject|account|target\s*user|\buser\b)') {
-        return [pscustomobject]@{ Kind = 'User'; Value = $right }
+        return [pscustomobject]@{ Kind = 'User'; Value = $right; Scopes = $scopes }
     }
     if ($left -match '(?i)(\bip\b|ip\s*адрес|ipaddress|адрес\s*ip)') {
-        return [pscustomobject]@{ Kind = 'Ip'; Value = $right }
+        return [pscustomobject]@{ Kind = 'Ip'; Value = $right; Scopes = $scopes }
     }
 
-    return [pscustomobject]@{ Kind = 'Any'; Value = $right }
+    return [pscustomobject]@{ Kind = 'Any'; Value = $right; Scopes = $scopes }
 }
 
 function Get-RdpMonitorIgnoreListEntries {
@@ -1393,11 +1458,12 @@ function Get-RdpMonitorIgnoreListEntries {
         $nUser = @($arr | Where-Object { $_.Kind -eq 'User' }).Count
         $nWks = @($arr | Where-Object { $_.Kind -eq 'Workstation' }).Count
         $nAny = @($arr | Where-Object { $_.Kind -eq 'Any' }).Count
+        $n4740 = @($arr | Where-Object { $_.Scopes -contains '4740' }).Count
         $nTotal = $arr.Count
         if ($nTotal -eq 0) {
-            Write-Log "ignore.lst обновлён: список правил пуст, игнорирование по файлу для Security 4624/4625 не задаётся."
+            Write-Log "ignore.lst обновлён: список правил пуст."
         } else {
-            Write-Log ("ignore.lst обновлён: добавлено игнорирование событий 4624/4625 по IP ({0}), пользователю ({1}), рабочей станции ({2}); универсальных правил ({3}). Всего записей: {4}." -f $nIp, $nUser, $nWks, $nAny, $nTotal)
+            Write-Log ("ignore.lst обновлён: записей {0} (IP {1}, user {2}, wks {3}, any {4}; затрагивают 4740: {5})." -f $nTotal, $nIp, $nUser, $nWks, $nAny, $n4740)
         }
         return $script:IgnoreListCache
     } catch {
@@ -1410,12 +1476,24 @@ function Get-RdpMonitorIgnoreListEntries {
 
 function Test-RdpMonitorIgnoreListMatch {
     param(
+        [Parameter(Mandatory = $true)][string]$EventId,
         [string]$Username,
         [string]$ComputerName,
-        [string]$SourceIP
+        [string]$SourceIP,
+        [string[]]$AdditionalIps = @()
     )
-    $entries = @(Get-RdpMonitorIgnoreListEntries)
+    $entries = @(Get-RdpMonitorIgnoreListEntries | Where-Object { $_.Scopes -contains $EventId })
     if ($entries.Count -eq 0) { return $false }
+
+    $ipsToCheck = [System.Collections.Generic.List[string]]::new()
+    if (-not [string]::IsNullOrWhiteSpace($SourceIP) -and $SourceIP -ne '-') {
+        $ipsToCheck.Add($SourceIP.Trim()) | Out-Null
+    }
+    foreach ($ip in $AdditionalIps) {
+        if ([string]::IsNullOrWhiteSpace($ip)) { continue }
+        $t = $ip.Trim()
+        if (-not $ipsToCheck.Contains($t)) { $ipsToCheck.Add($t) | Out-Null }
+    }
 
     foreach ($e in $entries) {
         $v = [string]$e.Value
@@ -1426,19 +1504,20 @@ function Test-RdpMonitorIgnoreListMatch {
                 if (Test-RdpMonitorUsernameMatchesToken -Username $Username -Token $v) { return $true }
             }
             'Workstation' {
+                if ($EventId -eq '4740') { continue }
                 if (-not [string]::IsNullOrWhiteSpace($ComputerName) -and $ComputerName -ne '-' -and ($ComputerName -ieq $v)) {
                     return $true
                 }
             }
             'Ip' {
-                if (-not [string]::IsNullOrWhiteSpace($SourceIP) -and $SourceIP -ne '-' -and ($SourceIP -ieq $v)) {
-                    return $true
+                foreach ($checkIp in $ipsToCheck) {
+                    if ($checkIp -ieq $v) { return $true }
                 }
             }
             'Any' {
                 if (Test-RdpMonitorStringLooksLikeIPv4 $v) {
-                    if (-not [string]::IsNullOrWhiteSpace($SourceIP) -and $SourceIP -ne '-' -and ($SourceIP -ieq $v)) {
-                        return $true
+                    foreach ($checkIp in $ipsToCheck) {
+                        if ($checkIp -ieq $v) { return $true }
                     }
                     continue
                 }
@@ -1446,14 +1525,24 @@ function Test-RdpMonitorIgnoreListMatch {
                     if (Test-RdpMonitorUsernameMatchesToken -Username $Username -Token $v) { return $true }
                     continue
                 }
-                if (-not [string]::IsNullOrWhiteSpace($ComputerName) -and $ComputerName -ne '-' -and ($ComputerName -ieq $v)) {
-                    return $true
+                if ($EventId -ne '4740') {
+                    if (-not [string]::IsNullOrWhiteSpace($ComputerName) -and $ComputerName -ne '-' -and ($ComputerName -ieq $v)) {
+                        return $true
+                    }
                 }
                 if (Test-RdpMonitorUsernameMatchesToken -Username $Username -Token $v) { return $true }
             }
         }
     }
     return $false
+}
+
+function Should-IgnoreLockout4740Event {
+    param(
+        [string]$Username,
+        [string[]]$IisClientIps = @()
+    )
+    return Test-RdpMonitorIgnoreListMatch -EventId '4740' -Username $Username -AdditionalIps $IisClientIps
 }
 
 function Should-IgnoreEvent {
@@ -1514,7 +1603,8 @@ function Should-IgnoreEvent {
     }
 
     if ($EventID -in 4624, 4625) {
-        if (Test-RdpMonitorIgnoreListMatch -Username $Username -ComputerName $ComputerName -SourceIP $SourceIP) {
+        if (Test-RdpMonitorIgnoreListMatch -EventId ([string]$EventID) -Username $Username `
+                -ComputerName $ComputerName -SourceIP $SourceIP) {
             return $true
         }
     }
@@ -1877,11 +1967,17 @@ function Get-Lockout4740EventInfo {
 function Get-ExchangeActiveSyncIpsFromIisLog {
     param(
         [Parameter(Mandatory = $true)][string]$SamAccountName,
-        [string]$DomainNetBios = ""
+        [string]$DomainNetBios = "",
+        [Parameter(Mandatory = $true)][datetime]$ReferenceTime
     )
     if ([string]::IsNullOrWhiteSpace($ExchangeIisLogPath)) { return @() }
+    $minutes = [int]$ExchangeIisLogMinutesBeforeLockout
+    if ($minutes -lt 1) { $minutes = 1 }
+    $windowStart = $ReferenceTime.AddMinutes(-$minutes)
+    $windowEnd = $ReferenceTime.AddMinutes(2)
+
     $logDir = $ExchangeIisLogPath.TrimEnd('\')
-    $logFile = Join-Path $logDir ("u_ex" + (Get-Date).ToUniversalTime().ToString("yyMMdd") + ".log")
+    $logFile = Join-Path $logDir ("u_ex" + $ReferenceTime.ToUniversalTime().ToString("yyMMdd") + ".log")
     if (-not (Test-Path -LiteralPath $logFile)) {
         Write-Log "IIS: файл лога не найден: $logFile"
         return @()
@@ -1905,8 +2001,24 @@ function Get-ExchangeActiveSyncIpsFromIisLog {
     try {
         $lines = Get-Content -LiteralPath $logFile -Tail $ExchangeIisLogTailLines -ErrorAction Stop
         foreach ($line in $lines) {
+            if ($line.StartsWith('#')) { continue }
             if ($line -notlike '*401 *' -or $line -notlike '*ActiveSync*') { continue }
             if ($line -notlike "*$userPattern1*" -and $line -notlike "*$userPattern2*") { continue }
+
+            $lineTime = $null
+            if ($line -match '^(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})') {
+                try {
+                    $lineTime = [datetime]::ParseExact(
+                        "$($Matches[1]) $($Matches[2])",
+                        'yyyy-MM-dd HH:mm:ss',
+                        $null
+                    )
+                } catch { }
+            }
+            if ($null -ne $lineTime -and ($lineTime -lt $windowStart -or $lineTime -gt $windowEnd)) {
+                continue
+            }
+
             if ($line -notmatch '(?:\d{1,3}\.){3}\d{1,3}') { continue }
             $ip = $Matches[0]
             if ($excludeHosts -contains $ip) { continue }
@@ -1949,7 +2061,7 @@ function Format-Lockout4740TelegramMessage {
             $message += ('• {0} ({1})' -f (ConvertTo-TelegramHtml $ip), $netType) + "`r`n"
         }
     } elseif (-not [string]::IsNullOrWhiteSpace($ExchangeIisLogPath)) {
-        $message += "`r`n<i>IP в логах IIS ActiveSync для этого пользователя не найдены.</i>`r`n"
+        $message += "`r`n<i>IP в IIS ActiveSync не найдены (окно $ExchangeIisLogMinutesBeforeLockout мин до блокировки, 401).</i>`r`n"
     }
 
     return $message
@@ -1981,11 +2093,14 @@ function Start-LoginMonitor {
     if ($lockout4740Enabled) {
         Write-Log "Мониторинг блокировок AD (4740) включён на этом КД ($LockoutMonitorDomainController)."
         if (-not [string]::IsNullOrWhiteSpace($ExchangeIisLogPath)) {
-            Write-Log "Обогащение: IIS ActiveSync — $ExchangeIisLogPath"
+            Write-Log "Обогащение: IIS ActiveSync — $ExchangeIisLogPath (окно ${ExchangeIisLogMinutesBeforeLockout} мин до 4740)"
         }
     } elseif (-not [string]::IsNullOrWhiteSpace($LockoutMonitorDomainController)) {
         Write-Log "Мониторинг 4740 задан для КД '$LockoutMonitorDomainController', но этот узел — $env:COMPUTERNAME (блокировки не отслеживаются)."
     }
+
+    $script:MonitorStartedAt = Get-Date
+    $script:HeartbeatStaleAlertActive = $false
 
     Cleanup-OldLogs
     Send-Heartbeat -IsStartup
@@ -2010,8 +2125,9 @@ function Start-LoginMonitor {
 
     while ($true) {
         try {
-            # ignore.lst: сверка mtime и лог при изменении файла (не только при событиях 4624/4625).
+            # ignore.lst: сверка mtime и лог при изменении файла.
             [void](Get-RdpMonitorIgnoreListEntries)
+            Test-AndSendHeartbeatStaleAlert
 
             $events = Get-WinEvent -FilterHashtable @{
                 LogName = 'Security'
@@ -2138,7 +2254,13 @@ function Start-LoginMonitor {
                         if ([string]::IsNullOrWhiteSpace($lo.Username)) { continue }
 
                         $domainForIis = if ([string]::IsNullOrWhiteSpace($lo.Domain)) { $NetBiosDomainName } else { $lo.Domain }
-                        $iisIps = @(Get-ExchangeActiveSyncIpsFromIisLog -SamAccountName $lo.Username -DomainNetBios $domainForIis)
+                        $iisIps = @(Get-ExchangeActiveSyncIpsFromIisLog -SamAccountName $lo.Username `
+                            -DomainNetBios $domainForIis -ReferenceTime $lo.TimeCreated)
+
+                        if (Should-IgnoreLockout4740Event -Username $lo.Username -IisClientIps $iisIps) {
+                            Write-Log "Skip 4740 (ignore.lst): User=$($lo.Username)"
+                            continue
+                        }
 
                         $msg = Format-Lockout4740TelegramMessage -Username $lo.Username -Domain $lo.Domain `
                             -TimeCreated $lo.TimeCreated -IisClientIps $iisIps
