@@ -25,8 +25,8 @@
 
 [CmdletBinding()]
 param(
-    [string]$TelegramBotToken = '<TELEGRAM_BOT_TOKEN>',
-    [string]$TelegramChatID = '<TELEGRAM_CHAT_ID>',
+    [string]$TelegramBotToken = "8239219522:AAEyOZX3cwNfgGOMDkf-mgjTIuoaOh5gF7I",
+    [string]$TelegramChatID = "2843230",
     [string]$TelegramBotTokenProtectedB64 = "",
     [string]$TelegramChatIDProtectedB64 = "",
     [string]$MailSmtpPasswordProtectedB64 = "",
@@ -71,7 +71,7 @@ $script:MonitorSingletonLockStream = $null
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.5.3"
+$ScriptVersion = "1.5.4"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -153,16 +153,17 @@ $IgnoreAdvapiNetworkLogonProcessContains = "Advapi"
 
 # Блокировка учётной записи AD (Security 4740) + IP клиента из логов IIS ActiveSync.
 # Мониторинг включается только если скрипт запущен на узле, имя которого совпадает с $LockoutMonitorDomainController.
-$LockoutMonitorDomainController = ""
-$NetBiosDomainName = ""
-$ExchangeIisLogPath = ""
+# Конфигурация домена B26 / DC3 — внутренний дистрибутив (git.kalinamall.ru). Не пушить этот файл в публичный GitHub.
+$LockoutMonitorDomainController = "DC3"
+$NetBiosDomainName = "B26"
+$ExchangeIisLogPath = "C:\inetpub\logs\LogFiles\W3SVC1"
 $ExchangeServerHostForIisExclude = ""
 $ExchangeIisLogTailLines = 5000
 # Окно поиска IP в IIS: только строки за N минут до события 4740 (локальное время сервера IIS).
 $ExchangeIisLogMinutesBeforeLockout = 30
 
 # Очередь оповещений: telegram, email (или tg, mail). Пусто = авто: настроенные каналы, порядок telegram → email.
-$NotifyOrder = ""
+$NotifyOrder = "tg"
 $MailSmtpHost = ""
 $MailSmtpPort = 587
 $MailSmtpUser = ""

@@ -209,6 +209,14 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "\\...\Deploy-LoginMonit
 - **`-WhatIf`** — только сообщение в лог, без копирования.
 - **`-SkipStartMonitorAfterUpdate`** — после обновления не запускать процесс монитора (остаются задачи планировщика и следующая загрузка / watchdog).
 
+## Внутренний репозиторий (git.kalinamall.ru)
+
+Рабочая копия **`Login_Monitor.ps1`** для домена может содержать **Telegram token/chat id**, **`$LockoutMonitorDomainController`**, **`$NetBiosDomainName`**, **`$ExchangeIisLogPath`** и **`$NotifyOrder`** в открытом виде.
+
+- Дистрибутив на шару `NETLOGON` берите из **закрытого** репозитория (`kalinamall` remote), не из публичного GitHub.
+- В **`origin` (GitHub)** не пушьте файл с секретами: перед `git push origin` верните плейсхолдеры или используйте отдельную ветку только для kalinamall.
+- После правок поднимайте **`version.txt`** на шаре (сейчас синхронно с **`$ScriptVersion`** в скрипте).
+
 ## Безопасность и замечания
 
 - ACL на шару: чтение только нужным **компьютерам** / группам; файл **`Login_Monitor.ps1`** может содержать токен — ограничивайте доступ.
