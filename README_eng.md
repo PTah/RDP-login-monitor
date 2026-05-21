@@ -1,17 +1,17 @@
 ﻿# RDP Login Monitor
 
-PowerShell toolkit for monitoring Windows logons with Telegram notifications.
+PowerShell toolkit for monitoring Windows logons with Telegram and/or Email (SMTP) notifications.
 
 ## Recommended layout
 
 - Installation root: **`C:\ProgramData\RDP-login-monitor\`**.
-- Main script: **`Login_Monitor.ps1`** — Security log **`4624`/`4625`** (behavior depends on OS type: workstation vs server/domain controller), optional **Remote Connection Manager `1149`** when the log is available (often useful for RDP-enabled workstations), **RD Gateway** events **`302`/`303`** when the gateway role/log is present, **daily report** to Telegram (active sessions via `quser`), **heartbeat**, **log rotation**, Telegram alerts.
+- Main script: **`Login_Monitor.ps1`** — Security log **`4624`/`4625`** (behavior depends on OS type: workstation vs server/domain controller), optional **Remote Connection Manager `1149`** when the log is available (often useful for RDP-enabled workstations), **RD Gateway** events **`302`/`303`** when the gateway role/log is present, on the **DC where the monitor runs** (hostname matches **`$LockoutMonitorDomainController`**) — **`4740`** (account lockout + IPs from IIS ActiveSync), **daily report** (active sessions via `quser`), **heartbeat**, **log rotation**, alerts via Telegram and/or Email.
 - Scheduled tasks: run **`Login_Monitor.ps1 -InstallTasks`** to register:
   - `RDP-Login-Monitor` (main monitor),
   - `RDP-Login-Monitor-Watchdog` (process health check every 5 minutes).
-- Domain delivery and upgrades: **`Deploy-LoginMonitor.ps1`** + **`version.txt`** on a share such as `NETLOGON`. After a successful deploy, the startup Telegram message may include an update note (file **`deploy_last_update.txt`** next to logs).
+- Domain delivery and upgrades: **`Deploy-LoginMonitor.ps1`** + **`version.txt`** on a share such as `NETLOGON`. After a successful deploy, the startup notification may include an update note (file **`deploy_last_update.txt`** next to logs).
 - Full deploy/GPO guidance: **[DEPLOY.md](DEPLOY.md)**.
-- **`Encrypt-DpapiForRdpMonitor.ps1`** — optional helper to prepare DPAPI-protected Base64 for the bot token / chat id.
+- **`Encrypt-DpapiForRdpMonitor.ps1`** — optional helper to prepare DPAPI-protected Base64 for the bot token / chat id and SMTP password (`$MailSmtpPasswordProtectedB64`).
 
 ## Notable behavior
 
@@ -27,13 +27,16 @@ PowerShell toolkit for monitoring Windows logons with Telegram notifications.
 2. Copy at least:
    - `Login_Monitor.ps1`
    - (for domain rollout on a share) `Deploy-LoginMonitor.ps1` and `version.txt`.
-3. Edit `Login_Monitor.ps1` and set the bot token / chat:
-   - `$TelegramBotToken` or `$TelegramBotTokenProtectedB64`
-   - `$TelegramChatID` or `$TelegramChatIDProtectedB64`
+3. Edit `Login_Monitor.ps1` and configure notification channels:
+   - **Telegram:** `$TelegramBotToken` / `$TelegramChatID` or `...ProtectedB64`
+   - **Email (SMTP):** `$MailSmtpHost`, `$MailFrom`, `$MailTo`, `$MailSmtpPort` (default 587), optionally `$MailSmtpUser` / `$MailSmtpPassword` (or `$MailSmtpPasswordProtectedB64` via DPAPI), `$MailSmtpStartTls` / `$MailSmtpSsl`
+   - **Order:** `$NotifyOrder` — empty = auto (Telegram → Email, configured channels only); otherwise `telegram,email`, `email`, etc. (`tg`, `mail` are accepted)
 4. Run elevated (Security log access and task registration).
 5. Logs and auxiliary files:
    - `C:\ProgramData\RDP-login-monitor\Logs\`
 6. (Optional) Suppress some Security alerts via **`ignore.lst`** — see **section 7** below.
+7. (Optional) AD account lockout monitoring on a DC — **`$LockoutMonitorDomainController`** (short hostname of the machine **where the monitor is installed and running**), **`$NetBiosDomainName`**, **`$ExchangeIisLogPath`**, **`$ExchangeIisLogMinutesBeforeLockout`** (default 30), **`$ExchangeIisLogTailLines`** (default 5000), **`$ExchangeServerHostForIisExclude`**. Alerts include the user from event **4740** and client IPs from IIS within the time window before lockout. In **`ignore.lst`** use prefix **`4740:`** or **`all:`** — see **`ignore.lst.example`**.
+8. Heartbeat: if **`Logs\last_heartbeat.txt`** is not updated for longer than **`$HeartbeatStaleAlertMultiplier` × `$HeartbeatInterval`** (default 2×1 h) — alert via Telegram/Email.
 
 ## 2) Manual run
 
@@ -66,8 +69,10 @@ For domain deployment from a share you do not configure the scheduler on clients
   - `C:\ProgramData\RDP-login-monitor\Logs\watchdog.log`
 - Heartbeat:
   - `C:\ProgramData\RDP-login-monitor\Logs\last_heartbeat.txt` updates on **`$HeartbeatInterval`** (hourly by default).
-- Daily report: after the first daily window (default **09:00**, controlled by **`$DailyReportHour`** / **`$DailyReportMinute`** in `Login_Monitor.ps1`), Telegram receives a `quser` summary; last run marker: `Logs\last_daily_report.txt`.
-- Startup Telegram message: with **RD Session Host** (or broader RDS session components, not gateway-only) you get the RDS/RDP session-host line; when the **RD Gateway** log is available you get a separate line about connections to **internal targets** through the gateway (302/303). A gateway-only node does not duplicate the “session host” wording.
+- Daily report: after the first daily window (default **09:00**, controlled by **`$DailyReportHour`** / **`$DailyReportMinute`** in `Login_Monitor.ps1`), a `quser` summary is sent (Telegram/Email); last run marker: `Logs\last_daily_report.txt`.
+- Stale heartbeat: if **`last_heartbeat.txt`** is stale beyond **`$HeartbeatStaleAlertMultiplier` × `$HeartbeatInterval`** — alert via Telegram/Email (see preparation step 8).
+- At startup (Telegram/Email): **notification channels** line (actual delivery order) plus RDS/4740 mode per configuration.
+- Startup message (Telegram): with **RD Session Host** (or broader RDS session components, not gateway-only) you get the RDS/RDP session-host line; when the **RD Gateway** log is available you get a separate line about connections to **internal targets** through the gateway (302/303). A gateway-only node does not duplicate the “session host” wording.
 
 ## 5) Automatic restart on failure
 
@@ -86,9 +91,9 @@ For domain deployment from a share you do not configure the scheduler on clients
 
 ## 7) Suppressing Security alerts: `ignore.lst`
 
-Place a file **`C:\ProgramData\RDP-login-monitor\ignore.lst`** next to **`Login_Monitor.ps1`**. Rules in this list are evaluated **only** for Telegram notifications from Security events **`4624`/`4625`** (successful/failed logons). Built-in exclusions in the script (`ExcludedUsers`, loopback IPs, service-style accounts, etc.) still apply to all event paths; **`ignore.lst`** adds **extra** matches **for 4624/4625 only**.
+Place a file **`C:\ProgramData\RDP-login-monitor\ignore.lst`** next to **`Login_Monitor.ps1`**. By default rules apply to **`4624`/`4625`**; prefix **`4740:`** (or **`lockout:`**) — account lockouts only; **`all:`** — logons and **4740**. For **4740**, rule type **`ip:`** is matched against IPs from IIS ActiveSync. Built-in script exclusions still apply to all event types except **4740** (lockouts use **`ignore.lst`** and built-in user checks only).
 
-**RD Gateway (`302`/`303`)**, **RCM `1149`**, the daily report, and heartbeat **are not controlled** by this file (for `1149` the list is not applied, even though a shared filter function runs).
+**RD Gateway (`302`/`303`)**, **RCM `1149`**, the daily report, and heartbeat **are not controlled** by this file.
 
 ### How the file is loaded
 
@@ -98,7 +103,17 @@ Place a file **`C:\ProgramData\RDP-login-monitor\ignore.lst`** next to **`Login_
 - If the line contains **`:`**, the **first** colon splits the line: the left part (trimmed) selects the rule kind, the right part is the value. If the right part is empty, the line is ignored.
 - If there is **no** colon, the whole trimmed line is one “match-any” value (see below).
 
-### Rule kinds (left part before the first `:`)
+### Scope prefix (at the start of the line, before the rule type)
+
+| Prefix | Events |
+| --- | --- |
+| *(none)* | **4624**, **4625** |
+| `4740:`, `lockout:` | **4740** |
+| `all:`, `*:` | **4624**, **4625**, **4740** |
+
+Example: `4740:user:svc_sync` — do not alert on lockout for that account.
+
+### Rule kinds (left part before the first `:` after the scope prefix)
 
 | Left part (case-insensitive regex fragments) | Event field |
 | --- | --- |
@@ -125,4 +140,4 @@ Explicit **User** / **Workstation** / **Ip** kinds only compare their respective
 
 ## Keywords (for discovery)
 
-`rdp`, `rd-gateway`, `rdp-gateway`, `rds`, `remote-desktop`, `windows-security-log`, `eventlog`, `event-id-4624`, `event-id-4625`, `event-id-302`, `event-id-303`, `powershell`, `telegram-bot`, `watchdog`, `gpo`, `netlogon`, `domain-deployment`, `windows-server`, `monitoring`
+`rdp`, `rd-gateway`, `rdp-gateway`, `rds`, `remote-desktop`, `windows-security-log`, `eventlog`, `event-id-4624`, `event-id-4625`, `event-id-4740`, `event-id-302`, `event-id-303`, `account-lockout`, `active-sync`, `exchange`, `iis`, `smtp`, `email`, `powershell`, `telegram-bot`, `watchdog`, `gpo`, `netlogon`, `domain-deployment`, `windows-server`, `monitoring`
