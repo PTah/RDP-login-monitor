@@ -25,7 +25,7 @@ $ErrorActionPreference = 'Stop'
 # КОНФИГУРАЦИЯ
 # ============================================
 
-$ScriptVersion = '1.6.5'
+$ScriptVersion = '1.6.6'
 $script:InstallRoot = [System.IO.Path]::GetFullPath("$env:ProgramData\RDP-login-monitor")
 $script:CanonicalScriptName = 'Exchange-MailSecurity.ps1'
 $LogFile = Join-Path $script:InstallRoot 'Logs\exchange_mail_security.log'
@@ -201,6 +201,16 @@ Initialize-NotifyCredentials -TelegramBotTokenProtectedB64 $TelegramBotTokenProt
     -MailSmtpPasswordProtectedB64 $MailSmtpPasswordProtectedB64 -MailSmtpPassword $mailPass
 if ($TelegramBotToken -eq '<TELEGRAM_BOT_TOKEN>') { $TelegramBotToken = '' }
 if ($TelegramChatID -eq '<TELEGRAM_CHAT_ID>') { $TelegramChatID = '' }
+
+function Get-ExchangeInboxScanScopeLabel {
+    if (-not $VipMailboxesOnly) {
+        if ($MaxMailboxesPerRun -gt 0) { return "all mailboxes (limit $MaxMailboxesPerRun)" }
+        return 'all mailboxes'
+    }
+    $n = @($VipMailboxes | Where-Object { $_ }).Count
+    $p = @($VipMailboxPatterns | Where-Object { $_ }).Count
+    return "VIP list=$n patterns=$p"
+}
 
 function Send-ExchangeInstallNotification {
     $scope = Get-ExchangeInboxScanScopeLabel
@@ -379,16 +389,6 @@ function Test-MailboxInVipScope {
         if ($smtp -like $pat) { return $true }
     }
     return $false
-}
-
-function Get-ExchangeInboxScanScopeLabel {
-    if (-not $VipMailboxesOnly) {
-        if ($MaxMailboxesPerRun -gt 0) { return "all mailboxes (limit $MaxMailboxesPerRun)" }
-        return 'all mailboxes'
-    }
-    $n = @($VipMailboxes | Where-Object { $_ }).Count
-    $p = @($VipMailboxPatterns | Where-Object { $_ }).Count
-    return "VIP list=$n patterns=$p"
 }
 
 # ============================================
