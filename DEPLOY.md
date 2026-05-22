@@ -18,7 +18,7 @@
 
 При выпуске новой сборки обновляйте на шаре **`Login_Monitor.ps1`** и при необходимости **`version.txt`** (логика описана в разделе «Версии»).
 
-На сервере публикации можно использовать скрипт **`update-rdp-monitor.ps1`** из репозитория (копия на диск, например `C:\soft\update-rdp-monitor.ps1`): `git pull` с **git.kalinamall.ru** и копирование трёх файлов в `\\b26\NETLOGON\RDP-login-monitor\`.
+На сервере публикации (например DC3): клон в `C:\Soft\Git\RDP-login-monitor`, скрипт **`update-rdp-monitor.ps1`** — при отсутствии remote сам добавит `origin` на `https://git.kalinamall.ru/PapaTramp/RDP-login-monitor.git`, выполнит `git pull` и скопирует три файла в `\\b26\NETLOGON\RDP-login-monitor\`. Лог: `C:\soft\Logs\update-rdp-monitor.log`.
 
 ## Как это работает
 

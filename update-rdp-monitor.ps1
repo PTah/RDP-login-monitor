@@ -1,19 +1,20 @@
 <#
 .SYNOPSIS
-    Обновляет локальный клон RDP-login-monitor с git.kalinamall.ru и копирует дистрибутив на NETLOGON.
+    Obnovlyaet klon RDP-login-monitor s git.kalinamall.ru i kopiruet dist na NETLOGON.
 .DESCRIPTION
-    Запуск на сервере с доступом к \\b26\NETLOGON (SYSVOL), например с правами администратора домена.
-    Копируются: Login_Monitor.ps1, version.txt, Deploy-LoginMonitor.ps1.
+    Dlya servera publikatsii (napr. DC3). Ne trebuet imenovaniya remote: pri otsutstvii
+    dobavlyaetsya origin ili vypolnyaetsya git pull po URL.
+    Kopiruyutsya: Login_Monitor.ps1, version.txt, Deploy-LoginMonitor.ps1.
 .EXAMPLE
-    C:\soft\update-rdp-monitor.ps1
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\soft\update-rdp-monitor.ps1
 .EXAMPLE
-    C:\soft\update-rdp-monitor.ps1 -RepoPath 'C:\soft\Git\RDP-login-monitor' -WhatIf
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\soft\update-rdp-monitor.ps1 -WhatIf
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
-    [string]$RepoPath = 'C:\soft\Git\RDP-login-monitor',
+    [string]$RepoPath = 'C:\Soft\Git\RDP-login-monitor',
     [string]$NetlogonDest = '\\b26\NETLOGON\RDP-login-monitor',
-    [string]$GitRemote = 'kalinamall',
+    [string]$GitUrl = 'https://git.kalinamall.ru/PapaTramp/RDP-login-monitor.git',
     [string]$GitBranch = 'main',
     [string]$LogFile = 'C:\soft\Logs\update-rdp-monitor.log'
 )
@@ -29,75 +30,110 @@ function Write-UpdateLog {
     if (-not (Test-Path -LiteralPath $dir)) {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
-    Add-Content -LiteralPath $LogFile -Value $line -Encoding UTF8
+    $utf8Bom = New-Object System.Text.UTF8Encoding $true
+    [System.IO.File]::AppendAllText($LogFile, $line + [Environment]::NewLine, $utf8Bom)
+}
+
+function Invoke-GitCommand {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [string]$WorkingDirectory = $RepoPath
+    )
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        Push-Location -LiteralPath $WorkingDirectory
+        $out = & git @Arguments 2>&1
+        $code = $LASTEXITCODE
+    } finally {
+        Pop-Location
+        $ErrorActionPreference = $prevEap
+    }
+    foreach ($line in @($out)) {
+        if ($null -ne $line -and "$line".Length -gt 0) {
+            Write-UpdateLog "git: $line"
+        }
+    }
+    if ($code -ne 0) {
+        throw ("git {0} failed (exit {1})" -f ($Arguments -join ' '), $code)
+    }
+    return @($out)
 }
 
 function Ensure-GitAvailable {
-    $git = Get-Command git -ErrorAction SilentlyContinue
-    if (-not $git) {
-        throw 'Git не найден в PATH. Установите Git for Windows или добавьте git.exe в PATH.'
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+        throw 'git.exe not found in PATH. Install Git for Windows.'
     }
 }
 
+function Ensure-GitRepository {
+    $gitDir = Join-Path $RepoPath '.git'
+    if (-not (Test-Path -LiteralPath $gitDir)) {
+        throw "Not a git repo (no .git): $RepoPath. Clone first: git clone $GitUrl `"$RepoPath`""
+    }
+}
+
+function Get-ConfiguredGitRemoteName {
+    $names = @(Invoke-GitCommand -Arguments @('remote') | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+    if ($names.Count -gt 0) {
+        if ('origin' -in $names) { return 'origin' }
+        return $names[0]
+    }
+    return $null
+}
+
+function Ensure-GitOriginRemote {
+    $name = Get-ConfiguredGitRemoteName
+    if ($null -ne $name) {
+        Write-UpdateLog "Using remote: $name"
+        return $name
+    }
+    Write-UpdateLog "No remotes; adding origin -> $GitUrl"
+    Invoke-GitCommand -Arguments @('remote', 'add', 'origin', $GitUrl)
+    return 'origin'
+}
+
 function Update-Repository {
-    if (-not (Test-Path -LiteralPath (Join-Path $RepoPath '.git'))) {
-        throw "Не найден git-репозиторий: $RepoPath (нет папки .git). Сначала выполните: git clone https://git.kalinamall.ru/PapaTramp/RDP-login-monitor.git `"$RepoPath`""
-    }
-    Push-Location -LiteralPath $RepoPath
-    try {
-        $remotes = @(git remote 2>&1)
-        if ($GitRemote -notin $remotes) {
-            if ('origin' -in $remotes) {
-                Write-UpdateLog "Remote '$GitRemote' не найден, используется origin."
-                $script:GitRemote = 'origin'
-            } else {
-                throw "Нет remote '$GitRemote'. Доступные: $($remotes -join ', '). Добавьте: git remote add kalinamall https://git.kalinamall.ru/PapaTramp/RDP-login-monitor.git"
-            }
-        }
-        Write-UpdateLog "git fetch $GitRemote"
-        git fetch $GitRemote 2>&1 | ForEach-Object { Write-UpdateLog $_ }
-        Write-UpdateLog "git pull $GitRemote $GitBranch"
-        git pull $GitRemote $GitBranch 2>&1 | ForEach-Object { Write-UpdateLog $_ }
-        $head = (git rev-parse --short HEAD 2>&1)
-        Write-UpdateLog "HEAD после pull: $head"
-    } finally {
-        Pop-Location
-    }
+    Ensure-GitRepository
+    $remote = Ensure-GitOriginRemote
+    Invoke-GitCommand -Arguments @('fetch', $remote, $GitBranch)
+    Invoke-GitCommand -Arguments @('pull', $remote, $GitBranch)
+    $null = Invoke-GitCommand -Arguments @('rev-parse', '--short', 'HEAD')
 }
 
 function Publish-DistributionFiles {
     if (-not (Test-Path -LiteralPath $NetlogonDest)) {
         if ($PSCmdlet.ShouldProcess($NetlogonDest, 'Create directory')) {
             New-Item -ItemType Directory -Path $NetlogonDest -Force | Out-Null
-            Write-UpdateLog "Создан каталог: $NetlogonDest"
+            Write-UpdateLog "Created: $NetlogonDest"
         }
     }
     foreach ($name in $DistFiles) {
         $src = Join-Path $RepoPath $name
         if (-not (Test-Path -LiteralPath $src)) {
-            throw "В репозитории нет файла: $src"
+            throw "Missing in repo: $src"
         }
         $dst = Join-Path $NetlogonDest $name
         if ($PSCmdlet.ShouldProcess($dst, "Copy from $src")) {
             Copy-Item -LiteralPath $src -Destination $dst -Force
-            Write-UpdateLog "Скопировано: $name -> $NetlogonDest"
+            Write-UpdateLog "Copied: $name -> $NetlogonDest"
         }
     }
     $verFile = Join-Path $NetlogonDest 'version.txt'
     if (Test-Path -LiteralPath $verFile) {
         $ver = (Get-Content -LiteralPath $verFile -Raw).Trim()
-        Write-UpdateLog "Версия на NETLOGON: $ver"
+        Write-UpdateLog "NETLOGON version: $ver"
     }
 }
 
 try {
-    Write-UpdateLog '=== Старт обновления RDP-login-monitor -> NETLOGON ==='
+    Write-UpdateLog '=== RDP-login-monitor: git pull -> NETLOGON ==='
     Ensure-GitAvailable
     Update-Repository
     Publish-DistributionFiles
-    Write-UpdateLog '=== Готово ==='
+    Write-UpdateLog '=== Done ==='
     exit 0
 } catch {
-    Write-UpdateLog "ОШИБКА: $($_.Exception.Message)"
+    Write-UpdateLog "ERROR: $($_.Exception.Message)"
     exit 1
 }
