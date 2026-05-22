@@ -25,7 +25,7 @@ $ErrorActionPreference = 'Stop'
 # КОНФИГУРАЦИЯ
 # ============================================
 
-$ScriptVersion = '1.6.4'
+$ScriptVersion = '1.6.5'
 $script:InstallRoot = [System.IO.Path]::GetFullPath("$env:ProgramData\RDP-login-monitor")
 $script:CanonicalScriptName = 'Exchange-MailSecurity.ps1'
 $LogFile = Join-Path $script:InstallRoot 'Logs\exchange_mail_security.log'
@@ -65,6 +65,10 @@ $VipMailboxesOnly = $false
 $VipMailboxes = @()              # точные PrimarySmtpAddress: user@domain.com
 $VipMailboxPatterns = @()        # wildcard: *@kalinamall.ru, director*, finance*
 $ExcludeMailboxPatterns = @('HealthMailbox*', 'DiscoveryMailbox*', 'SystemMailbox*')
+# Skip Inbox rules scan (corrupt rule store / Get-InboxRule fails). Override in exchange_monitor.settings.ps1
+$SkipInboxScanMailboxes = @(
+    'k.selezneva@kalinamall.ru'
+)
 $ScanDisabledInboxRulesWithExternalForward = $true   # отключённые правила с внешней пересылкой
 $SuppressAlertsOnFirstBaselineRun = $true            # первый скан: baseline без всплеска алертов
 $SendInboxScanSummary = $true                      # краткая сводка после скана
@@ -341,6 +345,17 @@ function Test-MailboxExcluded {
     return $false
 }
 
+function Test-MailboxSkipInboxScan {
+    param([string]$PrimarySmtp)
+    if ([string]::IsNullOrWhiteSpace($PrimarySmtp)) { return $false }
+    $smtp = $PrimarySmtp.Trim().ToLowerInvariant()
+    foreach ($skip in $SkipInboxScanMailboxes) {
+        if ([string]::IsNullOrWhiteSpace($skip)) { continue }
+        if ($smtp -eq $skip.Trim().ToLowerInvariant()) { return $true }
+    }
+    return $false
+}
+
 function Test-VipMailboxScopeConfigured {
     if (-not $VipMailboxesOnly) { return $true }
     $hasList = @($VipMailboxes | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -gt 0
@@ -554,7 +569,9 @@ function Get-MailboxListForScan {
         }
         $set = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
         foreach ($v in $VipMailboxes) {
-            if (-not [string]::IsNullOrWhiteSpace($v)) { $null = $set.Add($v.Trim().ToLowerInvariant()) }
+            if ([string]::IsNullOrWhiteSpace($v)) { continue }
+            if (Test-MailboxSkipInboxScan -PrimarySmtp $v) { continue }
+            $null = $set.Add($v.Trim().ToLowerInvariant())
         }
         if ($VipMailboxPatterns.Count -gt 0) {
             $all = @(Get-Mailbox -ResultSize Unlimited -ErrorAction Stop)
@@ -562,6 +579,7 @@ function Get-MailboxListForScan {
                 $smtp = [string]$mb.PrimarySmtpAddress
                 if ([string]::IsNullOrWhiteSpace($smtp)) { continue }
                 if (Test-MailboxExcluded -PrimarySmtp $smtp) { continue }
+                if (Test-MailboxSkipInboxScan -PrimarySmtp $smtp) { continue }
                 if (Test-MailboxInVipScope -PrimarySmtp $smtp) {
                     $null = $set.Add($smtp.ToLowerInvariant())
                 }
@@ -576,6 +594,7 @@ function Get-MailboxListForScan {
         $smtp = [string]$mb.PrimarySmtpAddress
         if ([string]::IsNullOrWhiteSpace($smtp)) { continue }
         if (Test-MailboxExcluded -PrimarySmtp $smtp) { continue }
+        if (Test-MailboxSkipInboxScan -PrimarySmtp $smtp) { continue }
         $list.Add($smtp.ToLowerInvariant()) | Out-Null
         if ($MaxMailboxesPerRun -gt 0 -and $list.Count -ge $MaxMailboxesPerRun) { break }
     }
@@ -665,7 +684,18 @@ function Scan-InboxRulesForMailbox {
         [System.Collections.Generic.List[object]]$Findings
     )
 
-    $rules = @(Get-InboxRule -Mailbox $Mailbox -ErrorAction SilentlyContinue)
+    if (Test-MailboxSkipInboxScan -PrimarySmtp $Mailbox) {
+        Write-ExchLog "Inbox rules: SKIP $Mailbox (SkipInboxScanMailboxes)"
+        return
+    }
+
+    try {
+        $rules = @(Get-InboxRule -Mailbox $Mailbox -ErrorAction Stop)
+    } catch {
+        Write-ExchLog "Inbox rules: SKIP $Mailbox (Get-InboxRule failed: $($_.Exception.Message))"
+        return
+    }
+
     foreach ($rule in $rules) {
         if ($rule.Enabled) {
             Add-InboxRuleExternalForwardFindings -Rule $rule -Mailbox $Mailbox -InternalDomains $InternalDomains -Findings $Findings
@@ -742,15 +772,15 @@ function Invoke-ExchangeInboxAndForwardingScan {
     if ($ScanInboxRules) {
         $mailboxes = @(Get-MailboxListForScan)
         $mailboxCount = $mailboxes.Count
+        $skipList = @($SkipInboxScanMailboxes | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        if ($skipList.Count -gt 0) {
+            Write-ExchLog "Inbox rules: SkipInboxScanMailboxes: $($skipList -join ', ')"
+        }
         Write-ExchLog "Inbox rules: mailboxes to scan: $mailboxCount ($scopeLabel)"
         $idx = 0
         foreach ($mb in $mailboxes) {
             $idx++
-            try {
-                Scan-InboxRulesForMailbox -Mailbox $mb -InternalDomains $internalDomains -Findings $findings
-            } catch {
-                Write-ExchLog "Inbox rules: error $mb : $($_.Exception.Message)"
-            }
+            Scan-InboxRulesForMailbox -Mailbox $mb -InternalDomains $internalDomains -Findings $findings
             if ($idx % $InboxScanBatchSize -eq 0) {
                 Write-ExchLog "Inbox rules: processed $idx / $($mailboxes.Count)"
                 Start-Sleep -Seconds $InboxScanBatchDelaySeconds

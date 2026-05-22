@@ -210,8 +210,11 @@ schtasks /Query /TN "RDP-Exchange-MailSecurity-Watchdog" /V /FO LIST
 | `$InboxScanBatchSize` | 50 | Пауза каждые N ящиков |
 | `$InboxScanBatchDelaySeconds` | 3 | Задержка между батчами |
 | `$ExcludeMailboxPatterns` | HealthMailbox*, … | Исключения |
+| `$SkipInboxScanMailboxes` | `k.selezneva@kalinamall.ru` | Не вызывать `Get-InboxRule` (битый rule store) |
 
 Переопределение — в **`exchange_monitor.settings.ps1`**.
+
+После починки ящика удалите его из `$SkipInboxScanMailboxes`.
 
 ## Формат оповещения (пересылка)
 

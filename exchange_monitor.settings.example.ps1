@@ -47,3 +47,8 @@ $QueueMessageCountThreshold = 150
 
 # Удалённый EMS (если скрипт не на Exchange)
 # $ExchangeServerFqdn = 'fifth.kalinamall.ru'
+
+# Не сканировать Inbox rules (битое хранилище правил / Watson на Get-InboxRule)
+# $SkipInboxScanMailboxes = @(
+#     'k.selezneva@kalinamall.ru'
+# )
