@@ -18,7 +18,7 @@ PowerShell toolkit for monitoring Windows logons with Telegram and/or Email (SMT
 - **`.ps1` encoding**: `.editorconfig` and `.gitattributes` encourage **`*.ps1`** as **UTF-8 with BOM** and **CRLF**, reducing mojibake and PowerShell parse issues.
 - **Log encoding**: `login_monitor.log` / `watchdog.log` are written as **UTF-8 with BOM** (BOM is applied to existing files if missing) so viewers like **FAR Manager** do not mis-detect encoding.
 - **`auditpol` on Russian Windows**: auditing checks use the **`Вход/выход`** category and **`Вход в систему` / `Выход из системы`** subcategories (expect **`Успех и сбой`**), avoiding errors such as `0x00000057` when English names like `Logon` are absent on a localized OS.
-- **Stability**: `auditpol` is invoked via `cmd.exe` with merged stdout/stderr so `$ErrorActionPreference = 'Stop'` does not abort on stderr-only output.
+- **Stability**: `auditpol` is invoked via full path `%SystemRoot%\System32\auditpol.exe` (no PATH dependency); stdout and stderr are merged via `ProcessStartInfo`.
 
 ## 1) Preparation
 

@@ -71,7 +71,7 @@ $script:MonitorSingletonLockStream = $null
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.5.5"
+$ScriptVersion = "1.5.6"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -806,15 +806,28 @@ $script:HeartbeatStaleAlertActive = $false
 function Enable-SecurityAudit {
     Write-Log "Checking security audit (auditpol) settings..."
 
-    # auditpol writes to stderr; do not throw under $ErrorActionPreference = Stop.
+    # auditpol: full path (PATH on some hosts omits System32). Merge stdout+stderr via ProcessStartInfo.
     function Invoke-AuditPol {
         param([Parameter(Mandatory = $true)][string]$Arguments)
-        $cmd = "auditpol $Arguments 2>&1"
-        $text = cmd.exe /c $cmd
-        $code = $LASTEXITCODE
+        $auditpolExe = Join-Path $env:SystemRoot 'System32\auditpol.exe'
+        if (-not (Test-Path -LiteralPath $auditpolExe)) {
+            throw "auditpol.exe not found: $auditpolExe"
+        }
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $auditpolExe
+        $psi.Arguments = $Arguments
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        $stdout = $proc.StandardOutput.ReadToEnd()
+        $stderr = $proc.StandardError.ReadToEnd()
+        $proc.WaitForExit()
+        $text = ($stdout + $stderr).Trim()
         return [pscustomobject]@{
-            ExitCode = $code
-            Text = ($text | Out-String).Trim()
+            ExitCode = $proc.ExitCode
+            Text     = $text
         }
     }
 
