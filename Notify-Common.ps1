@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Общие функции уведомлений (Telegram / SMTP) для скриптов RDP-login-monitor.
 .DESCRIPTION
@@ -75,7 +75,7 @@ function Get-NotifyOrderChannels {
             '^(tg|telegram)$' { 'telegram' }
             '^(mail|email|e-mail)$' { 'email' }
             default {
-                Write-NotifyLog "NotifyOrder: неизвестный канал '$part'"
+                Write-NotifyLog "NotifyOrder: unknown channel '$part'"
                 $null
             }
         }
@@ -89,7 +89,7 @@ function Get-NotifyOrderChannels {
 
 function Get-NotifyChainHuman {
     $channels = @(Get-NotifyOrderChannels)
-    if ($channels.Count -eq 0) { return 'нет (ни Telegram, ни SMTP не настроены)' }
+    if ($channels.Count -eq 0) { return 'none (Telegram and SMTP not configured)' }
     $labels = foreach ($ch in $channels) {
         switch ($ch) {
             'telegram' { 'Telegram' }
@@ -110,7 +110,7 @@ function Send-TelegramMessage {
     param([string]$Message)
 
     if (-not (Test-NotifyTelegramConfigured)) {
-        Write-NotifyLog "Telegram: не задан токен/chat_id"
+        Write-NotifyLog 'Telegram: token or chat_id missing'
         return $false
     }
 
@@ -126,7 +126,7 @@ function Send-TelegramMessage {
         $null = Invoke-RestMethod -Uri $uri -Method Post -Body $body -ErrorAction Stop -TimeoutSec 30
         return $true
     } catch {
-        Write-NotifyLog "Ошибка отправки в Telegram: $($_.Exception.Message)"
+        Write-NotifyLog "Telegram send error: $($_.Exception.Message)"
         return $false
     }
 }
@@ -152,7 +152,7 @@ function Send-EmailNotification {
     )
 
     if (-not (Test-NotifyEmailConfigured)) {
-        Write-NotifyLog "Email: SMTP не настроен"
+        Write-NotifyLog 'Email: SMTP not configured'
         return $false
     }
 
@@ -184,7 +184,7 @@ function Send-EmailNotification {
         Send-MailMessage @mailParams
         return $true
     } catch {
-        Write-NotifyLog "Ошибка отправки Email: $($_.Exception.Message)"
+        Write-NotifyLog "Email send error: $($_.Exception.Message)"
         return $false
     }
 }
@@ -197,7 +197,7 @@ function Send-MonitorNotification {
 
     $channels = @(Get-NotifyOrderChannels)
     if ($channels.Count -eq 0) {
-        Write-NotifyLog "Оповещение не отправлено: нет каналов"
+        Write-NotifyLog 'Notification skipped: no channels configured'
         return $false
     }
 

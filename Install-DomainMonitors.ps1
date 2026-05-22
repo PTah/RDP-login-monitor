@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Register scheduled tasks for domain monitors (Exchange; AD later).
 .PARAMETER Target

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Deploy domain monitor scripts (Exchange / AD) from share to ProgramData.
 .PARAMETER Target
@@ -45,6 +45,20 @@ function Write-DeployLog {
 function Write-TextFileUtf8Bom {
     param([string]$Path, [string]$Text)
     [System.IO.File]::WriteAllText($Path, $Text, $Utf8Bom)
+}
+
+function Copy-ScriptFileWithUtf8Bom {
+    param(
+        [Parameter(Mandatory = $true)][string]$SourcePath,
+        [Parameter(Mandatory = $true)][string]$DestPath
+    )
+    $raw = [System.IO.File]::ReadAllBytes($SourcePath)
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    $text = $utf8NoBom.GetString($raw)
+    if ($text.Length -gt 0 -and [int][char]$text[0] -eq 0xFEFF) {
+        $text = $text.Substring(1)
+    }
+    [System.IO.File]::WriteAllText($DestPath, $text, $Utf8Bom)
 }
 
 function Resolve-SourceShareRoot {
@@ -128,7 +142,11 @@ foreach ($name in $filesToCopy) {
         Write-DeployLog "WhatIf: copy $src -> $dst"
         continue
     }
-    Copy-Item -LiteralPath $src -Destination $dst -Force
+    if ($name -like '*.ps1') {
+        Copy-ScriptFileWithUtf8Bom -SourcePath $src -DestPath $dst
+    } else {
+        Copy-Item -LiteralPath $src -Destination $dst -Force
+    }
     Write-DeployLog "Copied: $name"
 }
 

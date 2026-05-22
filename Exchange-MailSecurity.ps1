@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Мониторинг Exchange: очереди транспорта, пересылка на внешние адреса (Inbox rules + mailbox forwarding + transport rules).
 .DESCRIPTION
@@ -25,7 +25,7 @@ $ErrorActionPreference = 'Stop'
 # КОНФИГУРАЦИЯ
 # ============================================
 
-$ScriptVersion = '1.6.1'
+$ScriptVersion = '1.6.3'
 $script:InstallRoot = [System.IO.Path]::GetFullPath("$env:ProgramData\RDP-login-monitor")
 $script:CanonicalScriptName = 'Exchange-MailSecurity.ps1'
 $LogFile = Join-Path $script:InstallRoot 'Logs\exchange_mail_security.log'
@@ -172,7 +172,7 @@ function Register-ExchangeMonitorScheduledTasks {
     & $schtasksExe /Run /TN $script:ScheduledTaskWatchdog 2>&1 | Out-Null
     $ErrorActionPreference = 'Stop'
 
-    Write-ExchLog "InstallTasks: зарегистрированы $($script:ScheduledTaskQueues), $($script:ScheduledTaskInbox), $($script:ScheduledTaskWatchdog)"
+    Write-ExchLog "InstallTasks: registered $($script:ScheduledTaskQueues), $($script:ScheduledTaskInbox), $($script:ScheduledTaskWatchdog)"
 }
 
 if ($Watchdog) { $Mode = 'Watchdog' }
@@ -183,7 +183,7 @@ if (-not (Test-Path -LiteralPath $notifyPath)) {
     $notifyPath = Join-Path (Split-Path -Parent (Get-ExchangeMonitorScriptPath)) 'Notify-Common.ps1'
 }
 if (-not (Test-Path -LiteralPath $notifyPath)) {
-    Write-Host "Не найден Notify-Common.ps1 рядом с $script:InstallRoot"
+    Write-Host "Notify-Common.ps1 not found near $script:InstallRoot"
     exit 1
 }
 . $notifyPath
@@ -200,25 +200,26 @@ if ($TelegramChatID -eq '<TELEGRAM_CHAT_ID>') { $TelegramChatID = '' }
 
 function Send-ExchangeInstallNotification {
     $scope = Get-ExchangeInboxScanScopeLabel
-    $vipNote = if ($VipMailboxesOnly) { "VIP: да ($scope)" } else { 'VIP: нет (полный скан)' }
-    $msg = "<b>✅ Exchange Mail Security установлен</b>`r`n"
-    $msg += "🖥️ $(ConvertTo-TelegramHtml $env:COMPUTERNAME) | v$ScriptVersion`r`n"
-    $msg += "📢 Каналы: $(ConvertTo-TelegramHtml (Get-NotifyChainHuman))`r`n"
-    $msg += "📬 Inbox/пересылка: $vipNote`r`n"
-    $msg += "📋 Очереди: порог $QueueMessageCountThreshold | Inbox 02:00 | Queues /10 мин`r`n"
-    $msg += "🛡️ Первый скан: $(if ($SuppressAlertsOnFirstBaselineRun) { 'baseline без всплеска алертов' } else { 'алерт по всем находкам' })"
+    $vipNote = if ($VipMailboxesOnly) { "VIP on ($scope)" } else { 'VIP off (full scan)' }
+    $firstScan = if ($SuppressAlertsOnFirstBaselineRun) { 'baseline, no alert flood on first run' } else { 'alert on all findings' }
+    $msg = "<b>Exchange Mail Security installed</b>`r`n"
+    $msg += "Host: $(ConvertTo-TelegramHtml $env:COMPUTERNAME) | v$ScriptVersion`r`n"
+    $msg += "Notify: $(ConvertTo-TelegramHtml (Get-NotifyChainHuman))`r`n"
+    $msg += "Inbox/forward: $vipNote`r`n"
+    $msg += "Queues threshold: $QueueMessageCountThreshold | Inbox 02:00 | Queues every 10 min`r`n"
+    $msg += "First scan: $firstScan"
     Send-MonitorNotification -Message $msg -EmailSubject 'Exchange Mail Security: install' | Out-Null
 }
 
 if ($InstallTasks) {
     if (-not (Test-RunningElevated)) {
-        Write-Host 'InstallTasks: нужны права администратора.'
+        Write-Host 'InstallTasks: run as Administrator.'
         exit 1
     }
     Register-ExchangeMonitorScheduledTasks
     if ((Test-NotifyTelegramConfigured) -or (Test-NotifyEmailConfigured)) {
         Send-ExchangeInstallNotification
-        Write-ExchLog 'InstallTasks: отправлено уведомление об установке'
+        Write-ExchLog 'InstallTasks: install notification sent'
     }
     exit 0
 }
@@ -269,7 +270,7 @@ function Import-ExchangeManagementShell {
         return $true
     }
 
-    throw 'Не удалось загрузить Exchange Management Shell (snap-in / RemoteExchange / укажите $ExchangeServerFqdn).'
+    throw 'Failed to load Exchange Management Shell (snap-in / RemoteExchange / set $ExchangeServerFqdn).'
 }
 
 # ============================================
@@ -367,12 +368,12 @@ function Test-MailboxInVipScope {
 
 function Get-ExchangeInboxScanScopeLabel {
     if (-not $VipMailboxesOnly) {
-        if ($MaxMailboxesPerRun -gt 0) { return "все ящики (лимит $MaxMailboxesPerRun)" }
-        return 'все ящики'
+        if ($MaxMailboxesPerRun -gt 0) { return "all mailboxes (limit $MaxMailboxesPerRun)" }
+        return 'all mailboxes'
     }
     $n = @($VipMailboxes | Where-Object { $_ }).Count
     $p = @($VipMailboxPatterns | Where-Object { $_ }).Count
-    return "VIP: список=$n, шаблонов=$p"
+    return "VIP list=$n patterns=$p"
 }
 
 # ============================================
@@ -416,30 +417,30 @@ function Format-ForwardingFindingMessage {
     $hSev = ConvertTo-TelegramHtml $Finding.Severity
     $hostName = ConvertTo-TelegramHtml $env:COMPUTERNAME
 
-    $msg = "<b>📧 Exchange: пересылка на внешний адрес</b>`r`n"
-    $msg += "🖥️ Сервер: $hostName`r`n"
-    $msg += "📋 Тип: $hType`r`n"
-    $msg += "📬 Ящик: $hMb`r`n"
+    $msg = "<b>Exchange: external forward</b>`r`n"
+    $msg += "Host: $hostName`r`n"
+    $msg += "Type: $hType`r`n"
+    $msg += "Mailbox: $hMb`r`n"
     if (-not [string]::IsNullOrWhiteSpace($Finding.RuleName)) {
-        $msg += "📎 Правило: $hRule`r`n"
+        $msg += "Rule: $hRule`r`n"
     }
-    $msg += "➡️ Куда: $hTarget (внешний)`r`n"
-    $msg += "⚠️ Важность: $hSev`r`n"
+    $msg += "Target: $hTarget (external)`r`n"
+    $msg += "Severity: $hSev`r`n"
 
     if ($Finding.Extra.ContainsKey('Enabled')) {
-        $msg += "✅ Включено: $(ConvertTo-TelegramHtml ([string]$Finding.Extra['Enabled']))`r`n"
+        $msg += "Enabled: $(ConvertTo-TelegramHtml ([string]$Finding.Extra['Enabled']))`r`n"
     }
     if ($Finding.Extra.ContainsKey('DeleteMessage')) {
-        $msg += "🗑️ DeleteMessage: $(ConvertTo-TelegramHtml ([string]$Finding.Extra['DeleteMessage']))`r`n"
+        $msg += "DeleteMessage: $(ConvertTo-TelegramHtml ([string]$Finding.Extra['DeleteMessage']))`r`n"
     }
     if ($Finding.Extra.ContainsKey('MarkAsRead')) {
-        $msg += "👁️ MarkAsRead: $(ConvertTo-TelegramHtml ([string]$Finding.Extra['MarkAsRead']))`r`n"
+        $msg += "MarkAsRead: $(ConvertTo-TelegramHtml ([string]$Finding.Extra['MarkAsRead']))`r`n"
     }
     if ($Finding.Extra.ContainsKey('DeliverToMailboxAndForward')) {
-        $msg += "📤 DeliverToMailboxAndForward: $(ConvertTo-TelegramHtml ([string]$Finding.Extra['DeliverToMailboxAndForward']))`r`n"
+        $msg += "DeliverToMailboxAndForward: $(ConvertTo-TelegramHtml ([string]$Finding.Extra['DeliverToMailboxAndForward']))`r`n"
     }
     if ($Finding.Extra.ContainsKey('Property')) {
-        $msg += "🔀 Поле правила: $(ConvertTo-TelegramHtml ([string]$Finding.Extra['Property']))`r`n"
+        $msg += "Rule property: $(ConvertTo-TelegramHtml ([string]$Finding.Extra['Property']))`r`n"
     }
 
     return $msg
@@ -455,7 +456,7 @@ function Get-ForwardingBaseline {
         if ($null -ne $raw.FindingIds) { $ids = @($raw.FindingIds) }
         return @{ FindingIds = $ids; LastScanUtc = $raw.LastScanUtc }
     } catch {
-        Write-ExchLog "Baseline: не прочитан ($($_.Exception.Message))"
+        Write-ExchLog "Baseline: read failed ($($_.Exception.Message))"
         return @{ FindingIds = @(); LastScanUtc = $null }
     }
 }
@@ -499,7 +500,7 @@ function Save-QueueAlertState {
 
 function Invoke-ExchangeQueueScan {
     Import-ExchangeManagementShell
-    Write-ExchLog "Queues: порог MessageCount > $QueueMessageCountThreshold"
+    Write-ExchLog "Queues: threshold MessageCount > $QueueMessageCountThreshold"
 
     $queues = @(Get-Queue -ErrorAction Stop)
     $hot = @($queues | Where-Object { $_.MessageCount -gt $QueueMessageCountThreshold })
@@ -507,7 +508,7 @@ function Invoke-ExchangeQueueScan {
     $now = Get-Date
 
     if ($hot.Count -eq 0) {
-        Write-ExchLog "Queues: OK (всего $($queues.Count), выше порога 0)"
+        Write-ExchLog "Queues: OK (total $($queues.Count), above threshold 0)"
         Write-TextFileUtf8Bom -Path $QueuesHeartbeatFile -Text (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
         return
     }
@@ -518,21 +519,21 @@ function Invoke-ExchangeQueueScan {
         if ($state.ContainsKey($qKey)) { $lastAlert = $state[$qKey] }
         $cooldownOk = ($null -eq $lastAlert) -or (((Get-Date).ToUniversalTime() - $lastAlert.ToUniversalTime()).TotalSeconds -ge $QueueAlertCooldownSeconds)
         if (-not $cooldownOk) {
-            Write-ExchLog "Queues: $($q.Identity) count=$($q.MessageCount) — cooldown, пропуск алерта"
+            Write-ExchLog "Queues: $($q.Identity) count=$($q.MessageCount) - cooldown, skip alert"
             continue
         }
 
         $hId = ConvertTo-TelegramHtml $q.Identity
-        $msg = "<b>📬 Exchange: очередь транспорта</b>`r`n"
-        $msg += "🖥️ Сервер: $(ConvertTo-TelegramHtml $env:COMPUTERNAME)`r`n"
-        $msg += "📋 Очередь: $hId`r`n"
-        $msg += "📊 Сообщений: <b>$($q.MessageCount)</b> (порог $QueueMessageCountThreshold)`r`n"
-        $msg += "📌 Статус: $(ConvertTo-TelegramHtml ([string]$q.Status))`r`n"
-        $msg += "🕐 $(ConvertTo-TelegramHtml (Get-Date -Format 'dd.MM.yyyy HH:mm:ss'))"
+        $msg = "<b>Exchange: transport queue</b>`r`n"
+        $msg += "Host: $(ConvertTo-TelegramHtml $env:COMPUTERNAME)`r`n"
+        $msg += "Queue: $hId`r`n"
+        $msg += "Messages: <b>$($q.MessageCount)</b> (threshold $QueueMessageCountThreshold)`r`n"
+        $msg += "Status: $(ConvertTo-TelegramHtml ([string]$q.Status))`r`n"
+        $msg += "Time: $(ConvertTo-TelegramHtml (Get-Date -Format 'dd.MM.yyyy HH:mm:ss'))"
 
         if (Send-MonitorNotification -Message $msg -EmailSubject 'Exchange: transport queue') {
             $state[$qKey] = $now
-            Write-ExchLog "Queues: алерт отправлен для $($q.Identity)"
+            Write-ExchLog "Queues: alert sent for $($q.Identity)"
         }
     }
 
@@ -549,7 +550,7 @@ function Get-MailboxListForScan {
 
     if ($VipMailboxesOnly) {
         if (-not (Test-VipMailboxScopeConfigured)) {
-            throw 'VipMailboxesOnly=$true, но VipMailboxes и VipMailboxPatterns пусты — задайте список в exchange_monitor.settings.ps1'
+            throw 'VipMailboxesOnly=$true but VipMailboxes and VipMailboxPatterns are empty - set them in exchange_monitor.settings.ps1'
         }
         $set = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
         foreach ($v in $VipMailboxes) {
@@ -611,7 +612,7 @@ function Scan-MailboxForwardingSettings {
             if (-not (Test-IsExternalSmtpAddress -SmtpAddress $t -InternalDomains $InternalDomains -WhitelistDomains $ExternalDomainWhitelist)) {
                 continue
             }
-            $sev = 'Высокая'
+            $sev = 'High'
             $Findings.Add((New-ForwardingFinding -FindingType 'MailboxForwarding' -Mailbox $primary `
                 -RuleName '' -TargetAddress $t -Severity $sev -Extra @{
                     DeliverToMailboxAndForward = [string]$mb.DeliverToMailboxAndForward
@@ -640,11 +641,11 @@ function Add-InboxRuleExternalForwardFindings {
             if (-not (Test-IsExternalSmtpAddress -SmtpAddress $addr -InternalDomains $InternalDomains -WhitelistDomains $ExternalDomainWhitelist)) {
                 continue
             }
-            $sev = 'Высокая'
+            $sev = 'High'
             if (-not $Rule.Enabled) {
-                $sev = 'Средняя (правило отключено)'
+                $sev = 'Medium (rule disabled)'
             } elseif ($Rule.DeleteMessage -or $Rule.MarkAsRead) {
-                $sev = 'Критическая'
+                $sev = 'Critical'
             }
             $Findings.Add((New-ForwardingFinding -FindingType 'InboxRule' -Mailbox $Mailbox `
                 -RuleName [string]$Rule.Name -TargetAddress $addr -Severity $sev -Extra @{
@@ -697,7 +698,7 @@ function Scan-TransportRulesExternalForward {
                     continue
                 }
                 $Findings.Add((New-ForwardingFinding -FindingType 'TransportRule' -Mailbox '(transport)' `
-                    -RuleName [string]$rule.Name -TargetAddress $addr -Severity 'Высокая' -Extra @{})) | Out-Null
+                    -RuleName [string]$rule.Name -TargetAddress $addr -Severity 'High' -Extra @{})) | Out-Null
             }
         }
     }
@@ -715,20 +716,20 @@ function Send-ExchangeInboxScanSummary {
     if (-not $SendInboxScanSummary) { return }
 
     $hHost = ConvertTo-TelegramHtml $env:COMPUTERNAME
-    $msg = "<b>📊 Exchange: итог скана пересылки</b>`r`n"
-    $msg += "🖥️ $hHost | v$ScriptVersion`r`n"
-    $msg += "🔎 Охват: $(ConvertTo-TelegramHtml $ScopeLabel)`r`n"
-    $msg += "📬 Ящиков (Inbox rules): $MailboxCount`r`n"
-    $msg += "📋 Находок всего: $TotalFindings | новых: $NewFindings`r`n"
+    $msg = "<b>Exchange: forwarding scan summary</b>`r`n"
+    $msg += "Host: $hHost | v$ScriptVersion`r`n"
+    $msg += "Scope: $(ConvertTo-TelegramHtml $ScopeLabel)`r`n"
+    $msg += "Mailboxes (Inbox rules): $MailboxCount`r`n"
+    $msg += "Findings total: $TotalFindings | new: $NewFindings`r`n"
     if ($FirstBaselineSeeded) {
-        $msg += "<i>Первый baseline: алерты по существующим пересылкам подавлены (SuppressAlertsOnFirstBaselineRun).</i>`r`n"
+        $msg += "<i>First baseline: existing forwards suppressed (SuppressAlertsOnFirstBaselineRun).</i>`r`n"
     }
     Send-MonitorNotification -Message $msg -EmailSubject 'Exchange: scan summary' | Out-Null
 }
 
 function Invoke-ExchangeInboxAndForwardingScan {
     $scopeLabel = Get-ExchangeInboxScanScopeLabel
-    Write-ExchLog "Inbox/Forwarding scan v$ScriptVersion; охват: $scopeLabel; каналы: $(Get-NotifyChainHuman)"
+    Write-ExchLog "Inbox/Forwarding scan v$ScriptVersion; scope: $scopeLabel; notify: $(Get-NotifyChainHuman)"
     Import-ExchangeManagementShell
     $internalDomains = Get-InternalAcceptedDomainNames
     Write-ExchLog "Accepted domains (internal): $($internalDomains -join ', ')"
@@ -741,17 +742,17 @@ function Invoke-ExchangeInboxAndForwardingScan {
     if ($ScanInboxRules) {
         $mailboxes = @(Get-MailboxListForScan)
         $mailboxCount = $mailboxes.Count
-        Write-ExchLog "Inbox rules: ящиков к скану: $mailboxCount ($scopeLabel)"
+        Write-ExchLog "Inbox rules: mailboxes to scan: $mailboxCount ($scopeLabel)"
         $idx = 0
         foreach ($mb in $mailboxes) {
             $idx++
             try {
                 Scan-InboxRulesForMailbox -Mailbox $mb -InternalDomains $internalDomains -Findings $findings
             } catch {
-                Write-ExchLog "Inbox rules: ошибка $mb : $($_.Exception.Message)"
+                Write-ExchLog "Inbox rules: error $mb : $($_.Exception.Message)"
             }
             if ($idx % $InboxScanBatchSize -eq 0) {
-                Write-ExchLog "Inbox rules: обработано $idx / $($mailboxes.Count)"
+                Write-ExchLog "Inbox rules: processed $idx / $($mailboxes.Count)"
                 Start-Sleep -Seconds $InboxScanBatchDelaySeconds
             }
         }
@@ -765,14 +766,14 @@ function Invoke-ExchangeInboxAndForwardingScan {
     foreach ($id in $baseline.FindingIds) { $null = $prevSet.Add($id) }
 
     $newFindings = @($findings | Where-Object { -not $prevSet.Contains($_.Id) })
-    Write-ExchLog "Forwarding: всего $($findings.Count), новых $($newFindings.Count)"
+    Write-ExchLog "Forwarding: total $($findings.Count), new $($newFindings.Count)"
 
     $isFirstBaseline = ($baseline.FindingIds.Count -eq 0) -and ($findings.Count -gt 0)
     $firstBaselineSeeded = $false
 
     $toAlert = if ($AlertOnlyOnNewForwardingFindings) { $newFindings } else { @($findings) }
     if ($SuppressAlertsOnFirstBaselineRun -and $isFirstBaseline) {
-        Write-ExchLog 'Forwarding: первый baseline — алерты по находкам подавлены (SuppressAlertsOnFirstBaselineRun)'
+        Write-ExchLog 'Forwarding: first baseline - alerts suppressed (SuppressAlertsOnFirstBaselineRun)'
         $firstBaselineSeeded = $true
         $toAlert = @()
     }
@@ -782,17 +783,17 @@ function Invoke-ExchangeInboxAndForwardingScan {
     }
 
     if ($findings.Count -eq 0 -and $NotifyWhenForwardingScanClean) {
-        $summary = "<b>✅ Exchange: скан пересылки</b>`r`nВнешняя пересылка (Inbox / mailbox / transport) не обнаружена.`r`n🖥️ $(ConvertTo-TelegramHtml $env:COMPUTERNAME)"
+        $summary = "<b>Exchange: forwarding scan</b>`r`nNo external forward (Inbox / mailbox / transport).`r`nHost: $(ConvertTo-TelegramHtml $env:COMPUTERNAME)"
         Send-MonitorNotification -Message $summary -EmailSubject 'Exchange: forward scan OK' | Out-Null
     } elseif ($newFindings.Count -eq 0 -and $AlertOnlyOnNewForwardingFindings) {
-        Write-ExchLog 'Forwarding: изменений нет (только известные находки в baseline)'
+        Write-ExchLog 'Forwarding: no changes (known findings in baseline only)'
     }
 
     Save-ForwardingBaseline -FindingIds $allIds
     Write-TextFileUtf8Bom -Path $InboxHeartbeatFile -Text (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
     Send-ExchangeInboxScanSummary -TotalFindings $findings.Count -NewFindings $newFindings.Count `
         -MailboxCount $mailboxCount -FirstBaselineSeeded $firstBaselineSeeded -ScopeLabel $scopeLabel
-    Write-ExchLog 'Inbox/Forwarding scan завершён'
+    Write-ExchLog 'Inbox/Forwarding scan finished'
 }
 
 # ============================================
@@ -816,12 +817,12 @@ function Invoke-ExchangeWatchdog {
 
     $qAge = Get-HeartbeatAgeSeconds -Path $QueuesHeartbeatFile
     if ($qAge -gt $QueuesHeartbeatStaleSeconds) {
-        $issues.Add("Очереди: нет успешного скана > $([int]$qAge) с (порог $QueuesHeartbeatStaleSeconds с)") | Out-Null
+        $issues.Add("Queues: no successful scan > $([int]$qAge) s (threshold $QueuesHeartbeatStaleSeconds s)") | Out-Null
     }
 
     $iAge = Get-HeartbeatAgeSeconds -Path $InboxHeartbeatFile
     if ($iAge -gt $InboxHeartbeatStaleSeconds) {
-        $issues.Add("Inbox/Forwarding: нет успешного скана > $([int]$iAge) с (порог $InboxHeartbeatStaleSeconds с)") | Out-Null
+        $issues.Add("Inbox/Forwarding: no successful scan > $([int]$iAge) s (threshold $InboxHeartbeatStaleSeconds s)") | Out-Null
     }
 
     if ($issues.Count -eq 0) {
@@ -829,14 +830,14 @@ function Invoke-ExchangeWatchdog {
         exit 0
     }
 
-    $msg = "<b>⚠️ Exchange Mail Security: watchdog</b>`r`n"
-    $msg += "🖥️ $(ConvertTo-TelegramHtml $env:COMPUTERNAME)`r`n"
+    $msg = "<b>Exchange Mail Security: watchdog</b>`r`n"
+    $msg += "Host: $(ConvertTo-TelegramHtml $env:COMPUTERNAME)`r`n"
     foreach ($iss in $issues) {
-        $msg += "• $(ConvertTo-TelegramHtml $iss)`r`n"
+        $msg += "- $(ConvertTo-TelegramHtml $iss)`r`n"
     }
 
     Send-MonitorNotification -Message $msg -EmailSubject 'Exchange monitor: watchdog' | Out-Null
-    Write-WdLog "Watchdog: отправлено оповещение ($($issues.Count) проблем)"
+    Write-WdLog "Watchdog: alert sent ($($issues.Count) issue(s))"
     exit 1
 }
 
@@ -845,7 +846,7 @@ function Invoke-ExchangeWatchdog {
 # ============================================
 
 if (-not (Test-RunningElevated)) {
-    Write-ExchLog 'ПРЕДУПРЕЖДЕНИЕ: скрипт без прав администратора — EMS/задачи могут не работать.'
+    Write-ExchLog 'WARNING: not running elevated - EMS/tasks may fail.'
 }
 
 Write-ExchLog "=== Exchange-MailSecurity v$ScriptVersion Mode=$Mode ==="
@@ -855,10 +856,10 @@ try {
         'Queues' { Invoke-ExchangeQueueScan }
         'Inbox' { Invoke-ExchangeInboxAndForwardingScan }
         'Watchdog' { Invoke-ExchangeWatchdog }
-        default { throw "Неизвестный Mode: $Mode" }
+        default { throw "Unknown Mode: $Mode" }
     }
 } catch {
-    Write-ExchLog "ОШИБКА: $($_.Exception.Message)"
+    Write-ExchLog "ERROR: $($_.Exception.Message)"
     if ($_.ScriptStackTrace) { Write-ExchLog $_.ScriptStackTrace }
     exit 1
 }
