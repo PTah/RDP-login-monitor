@@ -25,7 +25,7 @@ $ErrorActionPreference = 'Stop'
 # КОНФИГУРАЦИЯ
 # ============================================
 
-$ScriptVersion = '1.6.6'
+$ScriptVersion = '1.6.7'
 $script:InstallRoot = [System.IO.Path]::GetFullPath("$env:ProgramData\RDP-login-monitor")
 $script:CanonicalScriptName = 'Exchange-MailSecurity.ps1'
 $LogFile = Join-Path $script:InstallRoot 'Logs\exchange_mail_security.log'
@@ -245,7 +245,7 @@ if ($InstallTasks) {
 $script:ExchangeSessionLoaded = $false
 
 function Import-ExchangeManagementShell {
-    if ($script:ExchangeSessionLoaded) { return $true }
+    if ($script:ExchangeSessionLoaded) { return }
 
     $snapins = @(Get-PSSnapin -Registered -ErrorAction SilentlyContinue | Where-Object {
         $_.Name -match 'Microsoft\.Exchange\.Management\.PowerShell'
@@ -254,7 +254,7 @@ function Import-ExchangeManagementShell {
         Add-PSSnapin -Name $snapins[0].Name -ErrorAction Stop
         $script:ExchangeSessionLoaded = $true
         Write-ExchLog "Exchange: snap-in $($snapins[0].Name)"
-        return $true
+        return
     }
 
     $rex = Join-Path ${env:ExchangeInstallPath} 'bin\RemoteExchange.ps1'
@@ -272,7 +272,7 @@ function Import-ExchangeManagementShell {
         Import-ExchangeCmdlet -DisableNameVerifying -ErrorAction Stop
         $script:ExchangeSessionLoaded = $true
         Write-ExchLog "Exchange: RemoteExchange $rex"
-        return $true
+        return
     }
 
     if (-not [string]::IsNullOrWhiteSpace($ExchangeServerFqdn)) {
@@ -281,7 +281,7 @@ function Import-ExchangeManagementShell {
         Import-PSSession $session -DisableNameChecking -AllowClobber -ErrorAction Stop | Out-Null
         $script:ExchangeSessionLoaded = $true
         Write-ExchLog "Exchange: PSSession $uri"
-        return $true
+        return
     }
 
     throw 'Failed to load Exchange Management Shell (snap-in / RemoteExchange / set $ExchangeServerFqdn).'
@@ -292,7 +292,7 @@ function Import-ExchangeManagementShell {
 # ============================================
 
 function Get-InternalAcceptedDomainNames {
-    Import-ExchangeManagementShell
+    $null = Import-ExchangeManagementShell
     $names = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $domains = Get-AcceptedDomain -ErrorAction Stop
     foreach ($d in $domains) {
@@ -514,7 +514,7 @@ function Save-QueueAlertState {
 }
 
 function Invoke-ExchangeQueueScan {
-    Import-ExchangeManagementShell
+    $null = Import-ExchangeManagementShell
     Write-ExchLog "Queues: threshold MessageCount > $QueueMessageCountThreshold"
 
     $queues = @(Get-Queue -ErrorAction Stop)
@@ -561,7 +561,7 @@ function Invoke-ExchangeQueueScan {
 # ============================================
 
 function Get-MailboxListForScan {
-    Import-ExchangeManagementShell
+    $null = Import-ExchangeManagementShell
 
     if ($VipMailboxesOnly) {
         if (-not (Test-VipMailboxScopeConfigured)) {
@@ -760,9 +760,9 @@ function Send-ExchangeInboxScanSummary {
 function Invoke-ExchangeInboxAndForwardingScan {
     $scopeLabel = Get-ExchangeInboxScanScopeLabel
     Write-ExchLog "Inbox/Forwarding scan v$ScriptVersion; scope: $scopeLabel; notify: $(Get-NotifyChainHuman)"
-    Import-ExchangeManagementShell
+    $null = Import-ExchangeManagementShell
     $internalDomains = Get-InternalAcceptedDomainNames
-    Write-ExchLog "Accepted domains (internal): $($internalDomains -join ', ')"
+    Write-ExchLog "Accepted domains (internal): $(@($internalDomains) -join ', ')"
 
     $findings = [System.Collections.Generic.List[object]]::new()
 
