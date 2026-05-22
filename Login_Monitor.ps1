@@ -71,7 +71,7 @@ $script:MonitorSingletonLockStream = $null
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.5.7"
+$ScriptVersion = "1.5.8"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -154,7 +154,7 @@ $IgnoreAdvapiNetworkLogonProcessContains = "Advapi"
 # Блокировка учётной записи AD (Security 4740) + IP клиента из логов IIS ActiveSync.
 # Мониторинг включается только если скрипт запущен на узле, имя которого совпадает с $LockoutMonitorDomainController.
 # Конфигурация домена B26 / DC3 — внутренний дистрибутив (git.kalinamall.ru). Не пушить этот файл в публичный GitHub.
-$LockoutMonitorDomainController = "DC3"
+$LockoutMonitorDomainController = "K6A-DC3"
 $NetBiosDomainName = "B26"
 $ExchangeIisLogPath = "\\fifth.kalinamall.ru\c$\inetpub\logs\LogFiles\W3SVC1"
 $ExchangeServerHostForIisExclude = ""
