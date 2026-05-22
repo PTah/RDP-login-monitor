@@ -114,9 +114,14 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "\\B26\NETLOGON\RDP-logi
 ### 3. Локальные настройки (один раз)
 
 ```powershell
-Copy-Item "C:\ProgramData\RDP-login-monitor\exchange_monitor.settings.example.ps1" `
-  "C:\ProgramData\RDP-login-monitor\exchange_monitor.settings.ps1"
-notepad C:\ProgramData\RDP-login-monitor\exchange_monitor.settings.ps1
+# После Deploy v1.6.4+ образец лежит в ProgramData; иначе — с NETLOGON:
+$ex = 'C:\ProgramData\RDP-login-monitor'
+$src = Join-Path $ex 'exchange_monitor.settings.example.ps1'
+if (-not (Test-Path -LiteralPath $src)) {
+    $src = '\\B26\NETLOGON\RDP-login-monitor\exchange_monitor.settings.example.ps1'
+}
+Copy-Item -LiteralPath $src -Destination (Join-Path $ex 'exchange_monitor.settings.ps1')
+notepad (Join-Path $ex 'exchange_monitor.settings.ps1')
 ```
 
 Задайте:

@@ -28,7 +28,8 @@ $PsExe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
 $ExchangeFiles = @(
     'Exchange-MailSecurity.ps1',
     'Notify-Common.ps1',
-    'Install-DomainMonitors.ps1'
+    'Install-DomainMonitors.ps1',
+    'exchange_monitor.settings.example.ps1'
 )
 
 function Write-DeployLog {

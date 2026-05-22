@@ -25,7 +25,7 @@ $ErrorActionPreference = 'Stop'
 # КОНФИГУРАЦИЯ
 # ============================================
 
-$ScriptVersion = '1.6.3'
+$ScriptVersion = '1.6.4'
 $script:InstallRoot = [System.IO.Path]::GetFullPath("$env:ProgramData\RDP-login-monitor")
 $script:CanonicalScriptName = 'Exchange-MailSecurity.ps1'
 $LogFile = Join-Path $script:InstallRoot 'Logs\exchange_mail_security.log'
