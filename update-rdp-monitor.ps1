@@ -4,7 +4,7 @@
 .DESCRIPTION
     Dlya servera publikatsii (napr. DC3). Ne trebuet imenovaniya remote: pri otsutstvii
     dobavlyaetsya origin ili vypolnyaetsya git pull po URL.
-    Kopiruyutsya: Login_Monitor.ps1, version.txt, Deploy-LoginMonitor.ps1.
+    Kopiruyutsya: polnyj spisok v Docs/deploy-netlogon-publish.md.
 .EXAMPLE
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\soft\update-rdp-monitor.ps1
 .EXAMPLE
@@ -20,7 +20,16 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$DistFiles = @('Login_Monitor.ps1', 'version.txt', 'Deploy-LoginMonitor.ps1')
+$DistFiles = @(
+    'Login_Monitor.ps1',
+    'version.txt',
+    'Deploy-LoginMonitor.ps1',
+    'Exchange-MailSecurity.ps1',
+    'Notify-Common.ps1',
+    'Install-DomainMonitors.ps1',
+    'Deploy-DomainMonitors.ps1',
+    'exchange_monitor.settings.example.ps1'
+)
 
 function Write-UpdateLog {
     param([string]$Message)

@@ -10,7 +10,7 @@ PowerShell toolkit for monitoring Windows logons with Telegram and/or Email (SMT
   - `RDP-Login-Monitor` (main monitor),
   - `RDP-Login-Monitor-Watchdog` (process health check every 5 minutes).
 - Domain delivery and upgrades: **`Deploy-LoginMonitor.ps1`** + **`version.txt`** on a share such as `NETLOGON`. After a successful deploy, the startup notification may include an update note (file **`deploy_last_update.txt`** next to logs).
-- Full deploy/GPO guidance: **[DEPLOY.md](DEPLOY.md)**.
+- Deployment docs: **[Docs/README.md](Docs/README.md)** (RDP monitor, Exchange, NETLOGON).
 - **`Encrypt-DpapiForRdpMonitor.ps1`** — optional helper to prepare DPAPI-protected Base64 for the bot token / chat id and SMTP password (`$MailSmtpPasswordProtectedB64`).
 
 ## Notable behavior
@@ -20,6 +20,7 @@ PowerShell toolkit for monitoring Windows logons with Telegram and/or Email (SMT
 - **`auditpol` on Russian Windows**: auditing checks use the **`Вход/выход`** category and **`Вход в систему` / `Выход из системы`** subcategories (expect **`Успех и сбой`**), avoiding errors such as `0x00000057` when English names like `Logon` are absent on a localized OS.
 - **Stability**: `auditpol` is invoked via full path `%SystemRoot%\System32\auditpol.exe` (no PATH dependency); stdout and stderr are merged via `ProcessStartInfo`.
 - **`4625` burst alerts**: when `$FailedLogonRateLimitEnabled` is true — tier 1: **5** failures in **60** s per **IP+user**; tier 2: **12** in **60** s per **IP** (spray). Below thresholds, individual `4625` alerts are sent; during a burst, aggregated alerts replace per-event noise. No automatic IP blocking. Tune at the top of `Login_Monitor.ps1`.
+- **Exchange Mail Security** (`Exchange-MailSecurity.ps1`): Exchange server only — queues, external forwarding, watchdog. See **[Docs/exchange-mail-security.md](Docs/exchange-mail-security.md)**.
 
 ## 1) Preparation
 
@@ -61,7 +62,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\ProgramData\RDP-logi
 
 The script registers `RDP-Login-Monitor` and `RDP-Login-Monitor-Watchdog`, then triggers an immediate first run.
 
-For domain deployment from a share you do not configure the scheduler on clients by hand — use `Deploy-LoginMonitor.ps1` (see `DEPLOY.md`).
+For domain deployment from a share you do not configure the scheduler on clients by hand — use `Deploy-LoginMonitor.ps1` (see [Docs/deploy-rdp-login-monitor.md](Docs/deploy-rdp-login-monitor.md)).
 
 ## 4) Post-install checks
 

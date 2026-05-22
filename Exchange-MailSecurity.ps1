@@ -1,0 +1,733 @@
+<#
+.SYNOPSIS
+    Мониторинг Exchange: очереди транспорта, пересылка на внешние адреса (Inbox rules + mailbox forwarding + transport rules).
+.DESCRIPTION
+    Запуск на сервере с Exchange Management Shell (локальный snap-in или remote).
+    Режимы: -Mode Queues (каждые 10 мин по задаче), -Mode Inbox (ежедневный скан), -Watchdog (проверка heartbeat).
+    Установка задач: -InstallTasks
+.NOTES
+    Каталог: C:\ProgramData\RDP-login-monitor\
+    Опционально: exchange_monitor.settings.ps1 в том же каталоге (секреты, whitelist).
+#>
+
+[CmdletBinding()]
+param(
+    [ValidateSet('Queues', 'Inbox', 'Watchdog')]
+    [string]$Mode = 'Queues',
+    [switch]$InstallTasks,
+    [switch]$Watchdog
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+# ============================================
+# КОНФИГУРАЦИЯ
+# ============================================
+
+$ScriptVersion = '1.6.0'
+$script:InstallRoot = [System.IO.Path]::GetFullPath("$env:ProgramData\RDP-login-monitor")
+$script:CanonicalScriptName = 'Exchange-MailSecurity.ps1'
+$LogFile = Join-Path $script:InstallRoot 'Logs\exchange_mail_security.log'
+$WatchdogLogFile = Join-Path $script:InstallRoot 'Logs\exchange_watchdog.log'
+$QueuesHeartbeatFile = Join-Path $script:InstallRoot 'Logs\last_exchange_queues_ok.txt'
+$InboxHeartbeatFile = Join-Path $script:InstallRoot 'Logs\last_exchange_inbox_scan_ok.txt'
+$ForwardingBaselineFile = Join-Path $script:InstallRoot 'Logs\exchange_forwarding_baseline.json'
+$QueueAlertStateFile = Join-Path $script:InstallRoot 'Logs\exchange_queue_alert_state.json'
+
+# --- Уведомления (как Login_Monitor.ps1; можно вынести в exchange_monitor.settings.ps1) ---
+$NotifyOrder = 'tg'
+$TelegramBotToken = ''
+$TelegramChatID = ''
+$TelegramBotTokenProtectedB64 = ''
+$TelegramChatIDProtectedB64 = ''
+$MailSmtpHost = ''
+$MailSmtpPort = 587
+$MailSmtpUser = ''
+$MailSmtpPassword = ''
+$MailSmtpPasswordProtectedB64 = ''
+$MailFrom = ''
+$MailTo = ''
+$MailSmtpStartTls = $true
+$MailSmtpSsl = $false
+
+# --- Exchange / сканирование ---
+$ExchangeServerFqdn = ''   # пусто = локальный snap-in на этом сервере
+$QueueMessageCountThreshold = 150
+$QueueAlertCooldownSeconds = 900
+$ExternalDomainWhitelist = @()   # partner-bank.ru
+$AlertOnlyOnNewForwardingFindings = $true
+$ScanMailboxForwarding = $true
+$ScanInboxRules = $true
+$ScanTransportRules = $true
+$VipMailboxesOnly = $false
+$VipMailboxes = @()   # user@domain.com
+$ExcludeMailboxPatterns = @('HealthMailbox*', 'DiscoveryMailbox*', 'SystemMailbox*')
+$InboxScanBatchSize = 50
+$InboxScanBatchDelaySeconds = 3
+$MaxMailboxesPerRun = 0   # 0 = без лимита
+$QueuesHeartbeatStaleSeconds = 1200    # 20 мин
+$InboxHeartbeatStaleSeconds = 93600   # 26 ч
+$NotifyWhenForwardingScanClean = $false   # true = ежедневное «внешняя пересылка не найдена»
+
+$script:ScheduledTaskQueues = 'RDP-Exchange-TransportQueues'
+$script:ScheduledTaskInbox = 'RDP-Exchange-InboxRules'
+$script:ScheduledTaskWatchdog = 'RDP-Exchange-MailSecurity-Watchdog'
+
+# ============================================
+# ИНИЦИАЛИЗАЦИЯ
+# ============================================
+
+if (!(Test-Path -LiteralPath $script:InstallRoot)) {
+    New-Item -ItemType Directory -Path $script:InstallRoot -Force | Out-Null
+}
+$LogDir = Split-Path $LogFile -Parent
+if (!(Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
+
+$script:Utf8BomEncoding = New-Object System.Text.UTF8Encoding $true
+
+$SettingsFile = Join-Path $script:InstallRoot 'exchange_monitor.settings.ps1'
+if (Test-Path -LiteralPath $SettingsFile) {
+    . $SettingsFile
+}
+
+function Write-NotifyLog {
+    param([string]$Message)
+    Write-ExchLog $Message
+}
+
+function Write-ExchLog {
+    param([string]$Message)
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $logMessage = "$timestamp - $Message" + [Environment]::NewLine
+    [System.IO.File]::AppendAllText($LogFile, $logMessage, $script:Utf8BomEncoding)
+    Write-Host ($logMessage.TrimEnd("`r`n"))
+}
+
+function Write-WdLog {
+    param([string]$Message)
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $line = "$timestamp - $Message" + [Environment]::NewLine
+    [System.IO.File]::AppendAllText($WatchdogLogFile, $line, $script:Utf8BomEncoding)
+    Write-Host ($line.TrimEnd("`r`n"))
+}
+
+function Test-RunningElevated {
+    try {
+        $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+        if ($null -ne $id.User -and $id.User.Value -eq 'S-1-5-18') { return $true }
+        $p = New-Object Security.Principal.WindowsPrincipal($id)
+        return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch { return $false }
+}
+
+function Get-ExchangeMonitorScriptPath {
+    $p = $PSCommandPath
+    if ([string]::IsNullOrWhiteSpace($p)) { $p = $MyInvocation.MyCommand.Path }
+    if ([string]::IsNullOrWhiteSpace($p)) { return (Join-Path $script:InstallRoot $script:CanonicalScriptName) }
+    return [System.IO.Path]::GetFullPath($p)
+}
+
+function Get-ExchangeMonitorPowerShellExe {
+    return "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+}
+
+# --- InstallTasks / Watchdog до dot-source уведомлений ---
+
+function Register-ExchangeMonitorScheduledTasks {
+    $psExe = Get-ExchangeMonitorPowerShellExe
+    $scriptPath = Get-ExchangeMonitorScriptPath
+    $argQueues = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -Mode Queues"
+    $argInbox = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -Mode Inbox"
+    $argWd = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -Watchdog"
+
+    $schtasksExe = Join-Path $env:SystemRoot 'System32\schtasks.exe'
+    $delEa = $ErrorActionPreference
+    $ErrorActionPreference = 'SilentlyContinue'
+
+    foreach ($tn in @($script:ScheduledTaskQueues, $script:ScheduledTaskInbox, $script:ScheduledTaskWatchdog)) {
+        & $schtasksExe /Delete /TN $tn /F 2>$null | Out-Null
+    }
+    $ErrorActionPreference = $delEa
+
+    $trQueues = "`"$psExe`" $argQueues"
+    $outQ = & $schtasksExe /Create /F /RU SYSTEM /RL HIGHEST /SC MINUTE /MO 10 /TN $script:ScheduledTaskQueues /TR $trQueues 2>&1
+    foreach ($line in @($outQ)) { Write-ExchLog "schtasks queues: $line" }
+
+    $trInbox = "`"$psExe`" $argInbox"
+    $outI = & $schtasksExe /Create /F /RU SYSTEM /RL HIGHEST /SC DAILY /ST 02:00 /TN $script:ScheduledTaskInbox /TR $trInbox 2>&1
+    foreach ($line in @($outI)) { Write-ExchLog "schtasks inbox: $line" }
+
+    $trWd = "`"$psExe`" $argWd"
+    $outW = & $schtasksExe /Create /F /RU SYSTEM /RL HIGHEST /SC MINUTE /MO 15 /TN $script:ScheduledTaskWatchdog /TR $trWd 2>&1
+    foreach ($line in @($outW)) { Write-ExchLog "schtasks watchdog: $line" }
+
+    $ErrorActionPreference = 'SilentlyContinue'
+    & $schtasksExe /Run /TN $script:ScheduledTaskQueues 2>&1 | Out-Null
+    & $schtasksExe /Run /TN $script:ScheduledTaskWatchdog 2>&1 | Out-Null
+    $ErrorActionPreference = 'Stop'
+
+    Write-ExchLog "InstallTasks: зарегистрированы $($script:ScheduledTaskQueues), $($script:ScheduledTaskInbox), $($script:ScheduledTaskWatchdog)"
+}
+
+if ($InstallTasks) {
+    if (-not (Test-RunningElevated)) {
+        Write-Host 'InstallTasks: нужны права администратора.'
+        exit 1
+    }
+    Register-ExchangeMonitorScheduledTasks
+    exit 0
+}
+
+if ($Watchdog) { $Mode = 'Watchdog' }
+
+# Уведомления
+$notifyPath = Join-Path $script:InstallRoot 'Notify-Common.ps1'
+if (-not (Test-Path -LiteralPath $notifyPath)) {
+    $notifyPath = Join-Path (Split-Path -Parent (Get-ExchangeMonitorScriptPath)) 'Notify-Common.ps1'
+}
+if (-not (Test-Path -LiteralPath $notifyPath)) {
+    Write-Host "Не найден Notify-Common.ps1 рядом с $script:InstallRoot"
+    exit 1
+}
+. $notifyPath
+
+$tgToken = [ref]$TelegramBotToken
+$tgChat = [ref]$TelegramChatID
+$mailPass = [ref]$MailSmtpPassword
+Initialize-NotifyCredentials -TelegramBotTokenProtectedB64 $TelegramBotTokenProtectedB64 `
+    -TelegramChatIDProtectedB64 $TelegramChatIDProtectedB64 `
+    -TelegramBotToken $tgToken -TelegramChatID $tgChat `
+    -MailSmtpPasswordProtectedB64 $MailSmtpPasswordProtectedB64 -MailSmtpPassword $mailPass
+if ($TelegramBotToken -eq '<TELEGRAM_BOT_TOKEN>') { $TelegramBotToken = '' }
+if ($TelegramChatID -eq '<TELEGRAM_CHAT_ID>') { $TelegramChatID = '' }
+
+# ============================================
+# EXCHANGE EMS
+# ============================================
+
+$script:ExchangeSessionLoaded = $false
+
+function Import-ExchangeManagementShell {
+    if ($script:ExchangeSessionLoaded) { return $true }
+
+    $snapins = @(Get-PSSnapin -Registered -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -match 'Microsoft\.Exchange\.Management\.PowerShell'
+    })
+    if ($snapins.Count -gt 0) {
+        Add-PSSnapin -Name $snapins[0].Name -ErrorAction Stop
+        $script:ExchangeSessionLoaded = $true
+        Write-ExchLog "Exchange: snap-in $($snapins[0].Name)"
+        return $true
+    }
+
+    $rex = Join-Path ${env:ExchangeInstallPath} 'bin\RemoteExchange.ps1'
+    if ([string]::IsNullOrWhiteSpace(${env:ExchangeInstallPath})) {
+        $candidates = @(
+            'C:\Program Files\Microsoft\Exchange Server\V15\bin\RemoteExchange.ps1',
+            'C:\Program Files\Microsoft\Exchange Server\V14\bin\RemoteExchange.ps1'
+        )
+        foreach ($c in $candidates) {
+            if (Test-Path -LiteralPath $c) { $rex = $c; break }
+        }
+    }
+    if (Test-Path -LiteralPath $rex) {
+        . $rex
+        Import-ExchangeCmdlet -DisableNameVerifying -ErrorAction Stop
+        $script:ExchangeSessionLoaded = $true
+        Write-ExchLog "Exchange: RemoteExchange $rex"
+        return $true
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ExchangeServerFqdn)) {
+        $uri = "http://$ExchangeServerFqdn/PowerShell/"
+        $session = New-PSSession -ConfigurationName Microsoft.Exchange -ConnectionUri $uri -Authentication Kerberos -ErrorAction Stop
+        Import-PSSession $session -DisableNameChecking -AllowClobber -ErrorAction Stop | Out-Null
+        $script:ExchangeSessionLoaded = $true
+        Write-ExchLog "Exchange: PSSession $uri"
+        return $true
+    }
+
+    throw 'Не удалось загрузить Exchange Management Shell (snap-in / RemoteExchange / укажите $ExchangeServerFqdn).'
+}
+
+# ============================================
+# ВНЕШНИЕ ДОМЕНЫ
+# ============================================
+
+function Get-InternalAcceptedDomainNames {
+    Import-ExchangeManagementShell
+    $names = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $domains = Get-AcceptedDomain -ErrorAction Stop
+    foreach ($d in $domains) {
+        if ($d.DomainType -eq 'Authoritative' -or $d.DomainType -eq 'InternalRelay') {
+            $null = $names.Add([string]$d.DomainName)
+        }
+    }
+    return $names
+}
+
+function Get-EmailDomainFromAddress {
+    param([string]$Address)
+    if ([string]::IsNullOrWhiteSpace($Address)) { return $null }
+    $a = $Address.Trim().ToLowerInvariant()
+    if ($a -match 'smtp:([^@\s]+@([^@\s;]+))') { return $matches[2] }
+    if ($a -match '([a-z0-9._%+-]+@([a-z0-9.-]+\.[a-z]{2,}))') { return $matches[2] }
+    return $null
+}
+
+function Get-AddressesFromExchangeProperty {
+    param($PropertyValue)
+    $list = [System.Collections.Generic.List[string]]::new()
+    if ($null -eq $PropertyValue) { return @() }
+    foreach ($item in @($PropertyValue)) {
+        $s = [string]$item
+        if ([string]::IsNullOrWhiteSpace($s)) { continue }
+        if ($s -match 'smtp:([^;\s]+@[^;\s]+)') {
+            $list.Add($matches[1].ToLowerInvariant()) | Out-Null
+        } elseif ($s -match '([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})') {
+            $list.Add($matches[1].ToLowerInvariant()) | Out-Null
+        }
+    }
+    return @($list)
+}
+
+function Test-IsExternalSmtpAddress {
+    param(
+        [string]$SmtpAddress,
+        [System.Collections.Generic.HashSet[string]]$InternalDomains,
+        [string[]]$WhitelistDomains
+    )
+
+    $domain = Get-EmailDomainFromAddress -Address $SmtpAddress
+    if ([string]::IsNullOrWhiteSpace($domain)) { return $false }
+
+    foreach ($w in $WhitelistDomains) {
+        if ([string]::IsNullOrWhiteSpace($w)) { continue }
+        if ($domain -eq $w.Trim().ToLowerInvariant()) { return $false }
+    }
+
+    return -not $InternalDomains.Contains($domain)
+}
+
+function Test-MailboxExcluded {
+    param([string]$PrimarySmtp)
+    foreach ($pat in $ExcludeMailboxPatterns) {
+        if ([string]::IsNullOrWhiteSpace($pat)) { continue }
+        if ($PrimarySmtp -like $pat) { return $true }
+    }
+    return $false
+}
+
+# ============================================
+# FINDINGS
+# ============================================
+
+function New-ForwardingFinding {
+    param(
+        [string]$FindingType,
+        [string]$Mailbox,
+        [string]$RuleName,
+        [string]$TargetAddress,
+        [string]$Severity,
+        [hashtable]$Extra = @{}
+    )
+
+    $rulePart = if ([string]::IsNullOrWhiteSpace($RuleName)) { '' } else { $RuleName }
+    $id = '{0}|{1}|{2}|{3}' -f $FindingType, $Mailbox.ToLowerInvariant(), $rulePart, $TargetAddress.ToLowerInvariant()
+    return [pscustomobject]@{
+        Id = $id
+        FindingType = $FindingType
+        Mailbox = $Mailbox
+        RuleName = $RuleName
+        TargetAddress = $TargetAddress
+        Severity = $Severity
+        Extra = $Extra
+    }
+}
+
+function Format-ForwardingFindingMessage {
+    param($Finding)
+
+    $hType = ConvertTo-TelegramHtml $Finding.FindingType
+    $hMb = ConvertTo-TelegramHtml $Finding.Mailbox
+    $hRule = ConvertTo-TelegramHtml $Finding.RuleName
+    $hTarget = ConvertTo-TelegramHtml $Finding.TargetAddress
+    $hSev = ConvertTo-TelegramHtml $Finding.Severity
+    $hostName = ConvertTo-TelegramHtml $env:COMPUTERNAME
+
+    $msg = "<b>📧 Exchange: пересылка на внешний адрес</b>`r`n"
+    $msg += "🖥️ Сервер: $hostName`r`n"
+    $msg += "📋 Тип: $hType`r`n"
+    $msg += "📬 Ящик: $hMb`r`n"
+    if (-not [string]::IsNullOrWhiteSpace($Finding.RuleName)) {
+        $msg += "📎 Правило: $hRule`r`n"
+    }
+    $msg += "➡️ Куда: $hTarget (внешний)`r`n"
+    $msg += "⚠️ Важность: $hSev`r`n"
+
+    if ($Finding.Extra.ContainsKey('Enabled')) {
+        $msg += "✅ Включено: $(ConvertTo-TelegramHtml ([string]$Finding.Extra['Enabled']))`r`n"
+    }
+    if ($Finding.Extra.ContainsKey('DeleteMessage')) {
+        $msg += "🗑️ DeleteMessage: $(ConvertTo-TelegramHtml ([string]$Finding.Extra['DeleteMessage']))`r`n"
+    }
+    if ($Finding.Extra.ContainsKey('MarkAsRead')) {
+        $msg += "👁️ MarkAsRead: $(ConvertTo-TelegramHtml ([string]$Finding.Extra['MarkAsRead']))`r`n"
+    }
+    if ($Finding.Extra.ContainsKey('DeliverToMailboxAndForward')) {
+        $msg += "📤 DeliverToMailboxAndForward: $(ConvertTo-TelegramHtml ([string]$Finding.Extra['DeliverToMailboxAndForward']))`r`n"
+    }
+
+    return $msg
+}
+
+function Get-ForwardingBaseline {
+    if (-not (Test-Path -LiteralPath $ForwardingBaselineFile)) {
+        return @{ FindingIds = @(); LastScanUtc = $null }
+    }
+    try {
+        $raw = Get-Content -LiteralPath $ForwardingBaselineFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        $ids = @()
+        if ($null -ne $raw.FindingIds) { $ids = @($raw.FindingIds) }
+        return @{ FindingIds = $ids; LastScanUtc = $raw.LastScanUtc }
+    } catch {
+        Write-ExchLog "Baseline: не прочитан ($($_.Exception.Message))"
+        return @{ FindingIds = @(); LastScanUtc = $null }
+    }
+}
+
+function Save-ForwardingBaseline {
+    param([string[]]$FindingIds)
+    $obj = @{
+        LastScanUtc = (Get-Date).ToUniversalTime().ToString('o')
+        FindingIds = @($FindingIds)
+    }
+    $json = $obj | ConvertTo-Json -Depth 4
+    Write-TextFileUtf8Bom -Path $ForwardingBaselineFile -Text $json
+}
+
+function Write-TextFileUtf8Bom {
+    param([string]$Path, [string]$Text)
+    [System.IO.File]::WriteAllText($Path, $Text, $script:Utf8BomEncoding)
+}
+
+# ============================================
+# SCAN: QUEUES
+# ============================================
+
+function Get-QueueAlertState {
+    if (-not (Test-Path -LiteralPath $QueueAlertStateFile)) { return @{} }
+    try {
+        $h = @{}
+        (Get-Content -LiteralPath $QueueAlertStateFile -Raw -Encoding UTF8 | ConvertFrom-Json).PSObject.Properties | ForEach-Object {
+            $h[$_.Name] = [datetime]$_.Value
+        }
+        return $h
+    } catch { return @{} }
+}
+
+function Save-QueueAlertState {
+    param([hashtable]$State)
+    $obj = @{}
+    foreach ($k in $State.Keys) { $obj[$k] = $State[$k].ToUniversalTime().ToString('o') }
+    Write-TextFileUtf8Bom -Path $QueueAlertStateFile -Text ($obj | ConvertTo-Json)
+}
+
+function Invoke-ExchangeQueueScan {
+    Import-ExchangeManagementShell
+    Write-ExchLog "Queues: порог MessageCount > $QueueMessageCountThreshold"
+
+    $queues = @(Get-Queue -ErrorAction Stop)
+    $hot = @($queues | Where-Object { $_.MessageCount -gt $QueueMessageCountThreshold })
+    $state = Get-QueueAlertState
+    $now = Get-Date
+
+    if ($hot.Count -eq 0) {
+        Write-ExchLog "Queues: OK (всего $($queues.Count), выше порога 0)"
+        Write-TextFileUtf8Bom -Path $QueuesHeartbeatFile -Text (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+        return
+    }
+
+    foreach ($q in $hot) {
+        $qKey = [string]$q.Identity
+        $lastAlert = $null
+        if ($state.ContainsKey($qKey)) { $lastAlert = $state[$qKey] }
+        $cooldownOk = ($null -eq $lastAlert) -or (((Get-Date).ToUniversalTime() - $lastAlert.ToUniversalTime()).TotalSeconds -ge $QueueAlertCooldownSeconds)
+        if (-not $cooldownOk) {
+            Write-ExchLog "Queues: $($q.Identity) count=$($q.MessageCount) — cooldown, пропуск алерта"
+            continue
+        }
+
+        $hId = ConvertTo-TelegramHtml $q.Identity
+        $msg = "<b>📬 Exchange: очередь транспорта</b>`r`n"
+        $msg += "🖥️ Сервер: $(ConvertTo-TelegramHtml $env:COMPUTERNAME)`r`n"
+        $msg += "📋 Очередь: $hId`r`n"
+        $msg += "📊 Сообщений: <b>$($q.MessageCount)</b> (порог $QueueMessageCountThreshold)`r`n"
+        $msg += "📌 Статус: $(ConvertTo-TelegramHtml ([string]$q.Status))`r`n"
+        $msg += "🕐 $(ConvertTo-TelegramHtml (Get-Date -Format 'dd.MM.yyyy HH:mm:ss'))"
+
+        if (Send-MonitorNotification -Message $msg -EmailSubject 'Exchange: transport queue') {
+            $state[$qKey] = $now
+            Write-ExchLog "Queues: алерт отправлен для $($q.Identity)"
+        }
+    }
+
+    Save-QueueAlertState -State $state
+    Write-TextFileUtf8Bom -Path $QueuesHeartbeatFile -Text (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+}
+
+# ============================================
+# SCAN: FORWARDING
+# ============================================
+
+function Get-MailboxListForScan {
+    Import-ExchangeManagementShell
+    if ($VipMailboxesOnly -and $VipMailboxes.Count -gt 0) {
+        return @($VipMailboxes | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ })
+    }
+
+    $all = @(Get-Mailbox -ResultSize Unlimited -ErrorAction Stop)
+    $list = [System.Collections.Generic.List[string]]::new()
+    foreach ($mb in $all) {
+        $smtp = [string]$mb.PrimarySmtpAddress
+        if ([string]::IsNullOrWhiteSpace($smtp)) { continue }
+        if (Test-MailboxExcluded -PrimarySmtp $smtp) { continue }
+        $list.Add($smtp.ToLowerInvariant()) | Out-Null
+        if ($MaxMailboxesPerRun -gt 0 -and $list.Count -ge $MaxMailboxesPerRun) { break }
+    }
+    return @($list)
+}
+
+function Scan-MailboxForwardingSettings {
+    param(
+        [System.Collections.Generic.HashSet[string]]$InternalDomains,
+        [System.Collections.Generic.List[object]]$Findings
+    )
+
+    if (-not $ScanMailboxForwarding) { return }
+
+    Write-ExchLog 'Forwarding: Get-Mailbox (ForwardingSmtpAddress / ForwardingAddress)'
+    $mbs = Get-Mailbox -ResultSize Unlimited -ErrorAction Stop | Where-Object {
+        $_.ForwardingSmtpAddress -or $_.ForwardingAddress
+    }
+
+    foreach ($mb in $mbs) {
+        $primary = [string]$mb.PrimarySmtpAddress
+        if (Test-MailboxExcluded -PrimarySmtp $primary) { continue }
+        if ($VipMailboxesOnly -and $VipMailboxes.Count -gt 0) {
+            if ($VipMailboxes -notcontains $primary.ToLowerInvariant()) { continue }
+        }
+
+        $targets = @()
+        if ($mb.ForwardingSmtpAddress) {
+            $targets += @($mb.ForwardingSmtpAddress)
+        }
+        if ($mb.ForwardingAddress) {
+            $targets += @((Get-AddressesFromExchangeProperty -PropertyValue $mb.ForwardingAddress))
+        }
+
+        foreach ($t in $targets) {
+            if (-not (Test-IsExternalSmtpAddress -SmtpAddress $t -InternalDomains $InternalDomains -WhitelistDomains $ExternalDomainWhitelist)) {
+                continue
+            }
+            $sev = 'Высокая'
+            $Findings.Add((New-ForwardingFinding -FindingType 'MailboxForwarding' -Mailbox $primary `
+                -RuleName '' -TargetAddress $t -Severity $sev -Extra @{
+                    DeliverToMailboxAndForward = [string]$mb.DeliverToMailboxAndForward
+                })) | Out-Null
+        }
+    }
+}
+
+function Scan-InboxRulesForMailbox {
+    param(
+        [string]$Mailbox,
+        [System.Collections.Generic.HashSet[string]]$InternalDomains,
+        [System.Collections.Generic.List[object]]$Findings
+    )
+
+    $rules = @(Get-InboxRule -Mailbox $Mailbox -ErrorAction SilentlyContinue)
+    foreach ($rule in $rules) {
+        if (-not $rule.Enabled) { continue }
+
+        $props = @(
+            @{ Name = 'ForwardTo'; Value = $rule.ForwardTo }
+            @{ Name = 'RedirectTo'; Value = $rule.RedirectTo }
+            @{ Name = 'ForwardAsAttachmentTo'; Value = $rule.ForwardAsAttachmentTo }
+        )
+
+        foreach ($p in $props) {
+            $addrs = Get-AddressesFromExchangeProperty -PropertyValue $p.Value
+            foreach ($addr in $addrs) {
+                if (-not (Test-IsExternalSmtpAddress -SmtpAddress $addr -InternalDomains $InternalDomains -WhitelistDomains $ExternalDomainWhitelist)) {
+                    continue
+                }
+                $sev = 'Высокая'
+                if ($rule.DeleteMessage -or $rule.MarkAsRead) { $sev = 'Критическая' }
+                $Findings.Add((New-ForwardingFinding -FindingType 'InboxRule' -Mailbox $Mailbox `
+                    -RuleName [string]$rule.Name -TargetAddress $addr -Severity $sev -Extra @{
+                        Enabled = $rule.Enabled
+                        DeleteMessage = $rule.DeleteMessage
+                        MarkAsRead = $rule.MarkAsRead
+                        Property = $p.Name
+                    })) | Out-Null
+            }
+        }
+    }
+}
+
+function Scan-TransportRulesExternalForward {
+    param(
+        [System.Collections.Generic.HashSet[string]]$InternalDomains,
+        [System.Collections.Generic.List[object]]$Findings
+    )
+
+    if (-not $ScanTransportRules) { return }
+
+    Write-ExchLog 'Forwarding: Get-TransportRule'
+    $rules = @(Get-TransportRule -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'Enabled' })
+    foreach ($rule in $rules) {
+        $props = @(
+            $rule.RedirectMessageTo
+            $rule.BlindCopyTo
+            $rule.CopyTo
+        )
+        foreach ($pv in $props) {
+            $addrs = Get-AddressesFromExchangeProperty -PropertyValue $pv
+            foreach ($addr in $addrs) {
+                if (-not (Test-IsExternalSmtpAddress -SmtpAddress $addr -InternalDomains $InternalDomains -WhitelistDomains $ExternalDomainWhitelist)) {
+                    continue
+                }
+                $Findings.Add((New-ForwardingFinding -FindingType 'TransportRule' -Mailbox '(transport)' `
+                    -RuleName [string]$rule.Name -TargetAddress $addr -Severity 'Высокая' -Extra @{})) | Out-Null
+            }
+        }
+    }
+}
+
+function Invoke-ExchangeInboxAndForwardingScan {
+    Write-ExchLog "Inbox/Forwarding scan v$ScriptVersion; каналы: $(Get-NotifyChainHuman)"
+    Import-ExchangeManagementShell
+    $internalDomains = Get-InternalAcceptedDomainNames
+    Write-ExchLog "Accepted domains (internal): $($internalDomains -join ', ')"
+
+    $findings = [System.Collections.Generic.List[object]]::new()
+
+    Scan-MailboxForwardingSettings -InternalDomains $internalDomains -Findings $findings
+
+    if ($ScanInboxRules) {
+        $mailboxes = @(Get-MailboxListForScan)
+        Write-ExchLog "Inbox rules: ящиков к скану: $($mailboxes.Count)"
+        $idx = 0
+        foreach ($mb in $mailboxes) {
+            $idx++
+            try {
+                Scan-InboxRulesForMailbox -Mailbox $mb -InternalDomains $internalDomains -Findings $findings
+            } catch {
+                Write-ExchLog "Inbox rules: ошибка $mb : $($_.Exception.Message)"
+            }
+            if ($idx % $InboxScanBatchSize -eq 0) {
+                Write-ExchLog "Inbox rules: обработано $idx / $($mailboxes.Count)"
+                Start-Sleep -Seconds $InboxScanBatchDelaySeconds
+            }
+        }
+    }
+
+    Scan-TransportRulesExternalForward -InternalDomains $internalDomains -Findings $findings
+
+    $allIds = @($findings | ForEach-Object { $_.Id })
+    $baseline = Get-ForwardingBaseline
+    $prevSet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($id in $baseline.FindingIds) { $null = $prevSet.Add($id) }
+
+    $newFindings = @($findings | Where-Object { -not $prevSet.Contains($_.Id) })
+    Write-ExchLog "Forwarding: всего $($findings.Count), новых $($newFindings.Count)"
+
+    $toAlert = if ($AlertOnlyOnNewForwardingFindings) { $newFindings } else { @($findings) }
+    foreach ($f in $toAlert) {
+        $body = Format-ForwardingFindingMessage -Finding $f
+        Send-MonitorNotification -Message $body -EmailSubject 'Exchange: external forward' | Out-Null
+    }
+
+    if ($findings.Count -eq 0 -and $NotifyWhenForwardingScanClean) {
+        $summary = "<b>✅ Exchange: скан пересылки</b>`r`nВнешняя пересылка (Inbox / mailbox / transport) не обнаружена.`r`n🖥️ $(ConvertTo-TelegramHtml $env:COMPUTERNAME)"
+        Send-MonitorNotification -Message $summary -EmailSubject 'Exchange: forward scan OK' | Out-Null
+    } elseif ($newFindings.Count -eq 0 -and $AlertOnlyOnNewForwardingFindings) {
+        Write-ExchLog 'Forwarding: изменений нет (только известные находки в baseline)'
+    }
+
+    Save-ForwardingBaseline -FindingIds $allIds
+    Write-TextFileUtf8Bom -Path $InboxHeartbeatFile -Text (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+    Write-ExchLog 'Inbox/Forwarding scan завершён'
+}
+
+# ============================================
+# WATCHDOG
+# ============================================
+
+function Get-HeartbeatAgeSeconds {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return [double]::PositiveInfinity }
+    try {
+        $t = Get-Content -LiteralPath $Path -TotalCount 1 -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($t)) { return [double]::PositiveInfinity }
+        $dt = [datetime]::ParseExact($t.Trim(), 'yyyy-MM-dd HH:mm:ss', $null)
+        return ((Get-Date) - $dt).TotalSeconds
+    } catch { return [double]::PositiveInfinity }
+}
+
+function Invoke-ExchangeWatchdog {
+    Write-WdLog "Watchdog Exchange-MailSecurity v$ScriptVersion"
+    $issues = [System.Collections.Generic.List[string]]::new()
+
+    $qAge = Get-HeartbeatAgeSeconds -Path $QueuesHeartbeatFile
+    if ($qAge -gt $QueuesHeartbeatStaleSeconds) {
+        $issues.Add("Очереди: нет успешного скана > $([int]$qAge) с (порог $QueuesHeartbeatStaleSeconds с)") | Out-Null
+    }
+
+    $iAge = Get-HeartbeatAgeSeconds -Path $InboxHeartbeatFile
+    if ($iAge -gt $InboxHeartbeatStaleSeconds) {
+        $issues.Add("Inbox/Forwarding: нет успешного скана > $([int]$iAge) с (порог $InboxHeartbeatStaleSeconds с)") | Out-Null
+    }
+
+    if ($issues.Count -eq 0) {
+        Write-WdLog 'Watchdog: heartbeat OK'
+        exit 0
+    }
+
+    $msg = "<b>⚠️ Exchange Mail Security: watchdog</b>`r`n"
+    $msg += "🖥️ $(ConvertTo-TelegramHtml $env:COMPUTERNAME)`r`n"
+    foreach ($iss in $issues) {
+        $msg += "• $(ConvertTo-TelegramHtml $iss)`r`n"
+    }
+
+    Send-MonitorNotification -Message $msg -EmailSubject 'Exchange monitor: watchdog' | Out-Null
+    Write-WdLog "Watchdog: отправлено оповещение ($($issues.Count) проблем)"
+    exit 1
+}
+
+# ============================================
+# MAIN
+# ============================================
+
+if (-not (Test-RunningElevated)) {
+    Write-ExchLog 'ПРЕДУПРЕЖДЕНИЕ: скрипт без прав администратора — EMS/задачи могут не работать.'
+}
+
+Write-ExchLog "=== Exchange-MailSecurity v$ScriptVersion Mode=$Mode ==="
+
+try {
+    switch ($Mode) {
+        'Queues' { Invoke-ExchangeQueueScan }
+        'Inbox' { Invoke-ExchangeInboxAndForwardingScan }
+        'Watchdog' { Invoke-ExchangeWatchdog }
+        default { throw "Неизвестный Mode: $Mode" }
+    }
+} catch {
+    Write-ExchLog "ОШИБКА: $($_.Exception.Message)"
+    if ($_.ScriptStackTrace) { Write-ExchLog $_.ScriptStackTrace }
+    exit 1
+}
+
+exit 0
