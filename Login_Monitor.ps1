@@ -71,7 +71,7 @@ $script:MonitorSingletonLockStream = $null
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.5.8"
+$ScriptVersion = "1.5.9"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -2113,7 +2113,7 @@ function Start-LoginMonitor {
     if ($lockout4740Enabled) {
         Write-Log "Мониторинг блокировок AD (4740) включён на этом КД ($LockoutMonitorDomainController)."
         if (-not [string]::IsNullOrWhiteSpace($ExchangeIisLogPath)) {
-            Write-Log "Обогащение: IIS ActiveSync — $ExchangeIisLogPath (окно ${ExchangeIisLogMinutesBeforeLockout} мин до 4740)"
+            Write-Log "Чтение логов: IIS ActiveSync — $ExchangeIisLogPath (окно ${ExchangeIisLogMinutesBeforeLockout} мин до 4740)"
         }
     } elseif (-not [string]::IsNullOrWhiteSpace($LockoutMonitorDomainController)) {
         Write-Log "Мониторинг 4740 задан для КД '$LockoutMonitorDomainController', но этот узел — $env:COMPUTERNAME (блокировки не отслеживаются)."
