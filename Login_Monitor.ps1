@@ -71,7 +71,7 @@ $script:MonitorSingletonLockStream = $null
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.5.6"
+$ScriptVersion = "1.5.7"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -1873,7 +1873,13 @@ function Format-RDGatewayEvent {
 
 function Send-DailyReport {
     try {
-        $quserOutput = @(& quser 2>$null)
+        $quserExe = Join-Path $env:SystemRoot 'System32\quser.exe'
+        $quserOutput = if (Test-Path -LiteralPath $quserExe) {
+            @(& $quserExe 2>$null)
+        } else {
+            Write-Log "quser.exe not found: $quserExe"
+            @()
+        }
         $usernames = [System.Collections.Generic.List[string]]::new()
         if ($quserOutput -and $quserOutput.Count -gt 1) {
             $sessionLines = @($quserOutput | Select-Object -Skip 1)
