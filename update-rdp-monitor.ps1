@@ -110,6 +110,25 @@ function Update-Repository {
     $null = Invoke-GitCommand -Arguments @('rev-parse', '--short', 'HEAD')
 }
 
+function Copy-FileToNetlogon {
+    param(
+        [Parameter(Mandatory = $true)][string]$SourcePath,
+        [Parameter(Mandatory = $true)][string]$DestPath
+    )
+    if ($SourcePath -like '*.ps1') {
+        $raw = [System.IO.File]::ReadAllBytes($SourcePath)
+        $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+        $text = $utf8NoBom.GetString($raw)
+        if ($text.Length -gt 0 -and [int][char]$text[0] -eq 0xFEFF) {
+            $text = $text.Substring(1)
+        }
+        $utf8Bom = New-Object System.Text.UTF8Encoding $true
+        [System.IO.File]::WriteAllText($DestPath, $text, $utf8Bom)
+        return
+    }
+    Copy-Item -LiteralPath $SourcePath -Destination $DestPath -Force
+}
+
 function Publish-DistributionFiles {
     if (-not (Test-Path -LiteralPath $NetlogonDest)) {
         if ($PSCmdlet.ShouldProcess($NetlogonDest, 'Create directory')) {
@@ -124,7 +143,7 @@ function Publish-DistributionFiles {
         }
         $dst = Join-Path $NetlogonDest $name
         if ($PSCmdlet.ShouldProcess($dst, "Copy from $src")) {
-            Copy-Item -LiteralPath $src -Destination $dst -Force
+            Copy-FileToNetlogon -SourcePath $src -DestPath $dst
             Write-UpdateLog "Copied: $name -> $NetlogonDest"
         }
     }

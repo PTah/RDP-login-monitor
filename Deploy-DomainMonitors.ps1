@@ -1,8 +1,8 @@
 <#
 .SYNOPSIS
-    Доставка скриптов доменных мониторов (Exchange / AD) с шары в ProgramData.
+    Deploy domain monitor scripts (Exchange / AD) from share to ProgramData.
 .PARAMETER Target
-    Exchange — Exchange-MailSecurity.ps1 + Notify-Common.ps1; Ad — зарезервировано.
+    Exchange - Exchange-MailSecurity.ps1 + Notify-Common.ps1; Ad - reserved.
 #>
 [CmdletBinding()]
 param(
@@ -54,7 +54,7 @@ function Resolve-SourceShareRoot {
     $here = $PSCommandPath
     if ([string]::IsNullOrWhiteSpace($here)) { $here = $MyInvocation.MyCommand.Path }
     if ([string]::IsNullOrWhiteSpace($here)) {
-        throw 'Укажите -SourceShareRoot или запускайте скрипт с UNC-шары.'
+        throw 'Specify -SourceShareRoot or run this script by full UNC path to the .ps1 file on the share.'
     }
     return [System.IO.Path]::GetFullPath((Split-Path -Parent $here))
 }
@@ -81,25 +81,25 @@ function Compare-SemVerLike {
 $shareRoot = Resolve-SourceShareRoot
 $filesToCopy = switch ($Target) {
     'Exchange' { $ExchangeFiles }
-    'Ad' { throw 'Target Ad пока не поддерживается.' }
+    'Ad' { throw 'Target Ad is not supported yet.' }
 }
 
 $sourceVersionFile = Join-Path $shareRoot $VersionFileName
 if (-not (Test-Path -LiteralPath $sourceVersionFile)) {
-    Write-DeployLog "ОШИБКА: нет $sourceVersionFile на шаре."
+    Write-DeployLog "ERROR: missing on share: $sourceVersionFile"
     exit 1
 }
 
 $shareVer = Read-VersionLineFromFile -Path $sourceVersionFile
 $localVer = Read-VersionLineFromFile -Path $VersionStampPath
-Write-DeployLog "Шара version=$shareVer локальная метка=$localVer"
+Write-DeployLog "Share version=$shareVer local stamp=$localVer"
 
 if (-not [string]::IsNullOrWhiteSpace($localVer)) {
     $cmp = Compare-SemVerLike -A $shareVer -B $localVer
     if ($cmp -eq 0) {
-        Write-DeployLog 'Версия совпадает — копирование не требуется.'
+        Write-DeployLog 'Version match - skip copy.'
         if (-not $SkipInstallTasks) {
-            Write-DeployLog 'Проверка InstallTasks...'
+            Write-DeployLog 'Running InstallTasks check...'
             if (-not $WhatIf) {
                 & $PsExe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $InstallRoot 'Install-DomainMonitors.ps1') -Target $Target
             }
@@ -107,13 +107,13 @@ if (-not [string]::IsNullOrWhiteSpace($localVer)) {
         exit 0
     }
     if ($cmp -lt 0 -and -not $AllowDowngrade) {
-        Write-DeployLog 'Версия на шаре старее локальной — пропуск (AllowDowngrade).'
+        Write-DeployLog 'Share version older than local - skip (use -AllowDowngrade to force).'
         exit 0
     }
 }
 
 if (-not (Test-Path -LiteralPath $InstallRoot)) {
-    if ($WhatIf) { Write-DeployLog "WhatIf: создать $InstallRoot"; exit 0 }
+    if ($WhatIf) { Write-DeployLog "WhatIf: create $InstallRoot"; exit 0 }
     New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
 }
 
@@ -121,7 +121,7 @@ foreach ($name in $filesToCopy) {
     $src = Join-Path $shareRoot $name
     $dst = Join-Path $InstallRoot $name
     if (-not (Test-Path -LiteralPath $src)) {
-        Write-DeployLog "ОШИБКА: на шаре нет $name"
+        Write-DeployLog "ERROR: missing on share: $name"
         exit 1
     }
     if ($WhatIf) {
@@ -129,7 +129,7 @@ foreach ($name in $filesToCopy) {
         continue
     }
     Copy-Item -LiteralPath $src -Destination $dst -Force
-    Write-DeployLog "Скопировано: $name"
+    Write-DeployLog "Copied: $name"
 }
 
 if (-not $WhatIf) {
@@ -138,11 +138,11 @@ if (-not $WhatIf) {
         $installer = Join-Path $InstallRoot 'Install-DomainMonitors.ps1'
         & $PsExe -NoProfile -ExecutionPolicy Bypass -File $installer -Target $Target
         if ($LASTEXITCODE -ne 0) {
-            Write-DeployLog "Install-DomainMonitors завершился с кодом $LASTEXITCODE"
+            Write-DeployLog "Install-DomainMonitors exit code: $LASTEXITCODE"
             exit $LASTEXITCODE
         }
     }
 }
 
-Write-DeployLog 'Deploy-DomainMonitors завершён.'
+Write-DeployLog 'Deploy-DomainMonitors finished.'
 exit 0

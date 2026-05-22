@@ -31,3 +31,5 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\soft\update-rdp-monit
 ```
 
 После pull обязательно проверьте **`version.txt`** на шаре — его номер определяет, подтянут ли обновления на клиентах и Exchange.
+
+Файлы **`*.ps1`** при копировании пересохраняются как **UTF-8 с BOM** (иначе PowerShell 5.1 с NETLOGON может не разобрать кириллицу в скриптах). Скрипты **`Deploy-DomainMonitors.ps1`** и **`Install-DomainMonitors.ps1`** используют **ASCII** в рабочих строках — их можно запускать и без перепубликации.

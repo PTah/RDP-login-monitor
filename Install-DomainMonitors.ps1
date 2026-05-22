@@ -1,8 +1,8 @@
 <#
 .SYNOPSIS
-    Регистрирует задачи планировщика для доменных мониторов (Exchange; AD — позже).
+    Register scheduled tasks for domain monitors (Exchange; AD later).
 .PARAMETER Target
-    Exchange — Exchange-MailSecurity.ps1; Ad — зарезервировано.
+    Exchange - Exchange-MailSecurity.ps1; Ad - reserved.
 #>
 [CmdletBinding()]
 param(
@@ -25,25 +25,25 @@ function Test-RunningElevated {
 }
 
 if (-not (Test-RunningElevated)) {
-    throw 'Запустите Install-DomainMonitors.ps1 от имени администратора.'
+    throw 'Run Install-DomainMonitors.ps1 as Administrator.'
 }
 
 switch ($Target) {
     'Exchange' {
         $scriptPath = Join-Path $InstallRoot 'Exchange-MailSecurity.ps1'
         if (-not (Test-Path -LiteralPath $scriptPath)) {
-            throw "Не найден: $scriptPath"
+            throw "Not found: $scriptPath"
         }
         $notifyPath = Join-Path $InstallRoot 'Notify-Common.ps1'
         if (-not (Test-Path -LiteralPath $notifyPath)) {
-            throw "Не найден: $notifyPath"
+            throw "Not found: $notifyPath"
         }
         & $PsExe -NoProfile -ExecutionPolicy Bypass -File $scriptPath -InstallTasks
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-        Write-Host "Exchange: задачи планировщика зарегистрированы."
+        Write-Host 'Exchange: scheduled tasks registered.'
     }
     'Ad' {
-        Write-Host 'AD-SecurityMonitor.ps1 пока не реализован — используйте Target Exchange.'
+        Write-Host 'AD-SecurityMonitor.ps1 is not implemented yet. Use -Target Exchange.'
         exit 1
     }
 }
