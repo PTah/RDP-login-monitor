@@ -5,7 +5,7 @@ PowerShell toolkit for monitoring Windows logons with Telegram and/or Email (SMT
 ## Recommended layout
 
 - Installation root: **`C:\ProgramData\RDP-login-monitor\`**.
-- Main script: **`Login_Monitor.ps1`** — Security log **`4624`/`4625`** (behavior depends on OS type: workstation vs server/domain controller), optional **Remote Connection Manager `1149`** when the log is available (often useful for RDP-enabled workstations), **RD Gateway** events **`302`/`303`** when the gateway role/log is present, on the **DC where the monitor runs** (hostname matches **`$LockoutMonitorDomainController`**) — **`4740`** (account lockout + IPs from IIS ActiveSync), **daily report** (active sessions via `quser`), **heartbeat**, **log rotation**, alerts via Telegram and/or Email.
+- Main script: **`Login_Monitor.ps1`** — Security log **`4624`/`4625`** (behavior depends on OS type: workstation vs server/domain controller), **aggregated `4625` burst alerts** (two tiers: IP+user and IP-only), optional **Remote Connection Manager `1149`** when the log is available (often useful for RDP-enabled workstations), **RD Gateway** events **`302`/`303`** when the gateway role/log is present, on the **DC where the monitor runs** (hostname matches **`$LockoutMonitorDomainController`**) — **`4740`** (account lockout + IPs from IIS ActiveSync), **daily report** (active sessions via `quser`), **heartbeat**, **log rotation**, alerts via Telegram and/or Email.
 - Scheduled tasks: run **`Login_Monitor.ps1 -InstallTasks`** to register:
   - `RDP-Login-Monitor` (main monitor),
   - `RDP-Login-Monitor-Watchdog` (process health check every 5 minutes).
@@ -19,6 +19,7 @@ PowerShell toolkit for monitoring Windows logons with Telegram and/or Email (SMT
 - **Log encoding**: `login_monitor.log` / `watchdog.log` are written as **UTF-8 with BOM** (BOM is applied to existing files if missing) so viewers like **FAR Manager** do not mis-detect encoding.
 - **`auditpol` on Russian Windows**: auditing checks use the **`Вход/выход`** category and **`Вход в систему` / `Выход из системы`** subcategories (expect **`Успех и сбой`**), avoiding errors such as `0x00000057` when English names like `Logon` are absent on a localized OS.
 - **Stability**: `auditpol` is invoked via full path `%SystemRoot%\System32\auditpol.exe` (no PATH dependency); stdout and stderr are merged via `ProcessStartInfo`.
+- **`4625` burst alerts**: when `$FailedLogonRateLimitEnabled` is true — tier 1: **5** failures in **60** s per **IP+user**; tier 2: **12** in **60** s per **IP** (spray). Below thresholds, individual `4625` alerts are sent; during a burst, aggregated alerts replace per-event noise. No automatic IP blocking. Tune at the top of `Login_Monitor.ps1`.
 
 ## 1) Preparation
 

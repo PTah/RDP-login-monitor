@@ -2,7 +2,8 @@
 .SYNOPSIS
     Мониторинг логинов/попыток входа с уведомлениями в Telegram
 .DESCRIPTION
-    Отслеживает события входа в систему (Security 4624/4625) и события RD Gateway (302/303),
+    Отслеживает события входа в систему (Security 4624/4625), агрегированные оповещения при всплеске 4625,
+    события RD Gateway (302/303),
     на заданном КД — блокировки учётных записей (Security 4740) с IP из логов IIS ActiveSync,
     отправляет уведомления в Telegram, делает ротацию логов, heartbeat в файл и ежедневный отчет.
 .NOTES
@@ -71,7 +72,7 @@ $script:MonitorSingletonLockStream = $null
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.5.9"
+$ScriptVersion = "1.5.10"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -161,6 +162,18 @@ $ExchangeServerHostForIisExclude = ""
 $ExchangeIisLogTailLines = 5000
 # Окно поиска IP в IIS: только строки за N минут до события 4740 (локальное время сервера IIS).
 $ExchangeIisLogMinutesBeforeLockout = 30
+
+# Агрегация неудачных входов Security 4625 (вариант C: два порога). Автоблокировка IP не выполняется.
+$FailedLogonRateLimitEnabled = $true
+$FailedLogonRateLimitSuppressIndividualWhileBurst = $true
+# Уровень 1: подбор одной учётной записи с одного источника (IP + пользователь).
+$FailedLogonRateLimitUserIpWindowSeconds = 60
+$FailedLogonRateLimitUserIpThreshold = 5
+$FailedLogonRateLimitUserIpCooldownSeconds = 300
+# Уровень 2: много неудачных попыток с одного IP (password spraying / перебор логинов).
+$FailedLogonRateLimitIpWindowSeconds = 60
+$FailedLogonRateLimitIpThreshold = 12
+$FailedLogonRateLimitIpCooldownSeconds = 300
 
 # Очередь оповещений: telegram, email (или tg, mail). Пусто = авто: настроенные каналы, порядок telegram → email.
 $NotifyOrder = "tg"
@@ -1184,6 +1197,9 @@ function Send-Heartbeat {
                 }
             } catch { }
         }
+        if ($FailedLogonRateLimitEnabled) {
+            $message += "`r`n🛡️ <b>Агрегация 4625:</b> уровень 1 — $FailedLogonRateLimitUserIpThreshold за $FailedLogonRateLimitUserIpWindowSeconds с (IP+пользователь); уровень 2 — $FailedLogonRateLimitIpThreshold за $FailedLogonRateLimitIpWindowSeconds с (только IP). Cooldown ${FailedLogonRateLimitUserIpCooldownSeconds}/${FailedLogonRateLimitIpCooldownSeconds} с. Автобан: нет."
+        }
         if (Test-Lockout4740MonitoringActive) {
             $message += "`r`n🔒 <b>Блокировки AD:</b> на этом КД отслеживается Security <b>4740</b> (блокировка учётной записи)."
             if (-not [string]::IsNullOrWhiteSpace($ExchangeIisLogPath)) {
@@ -1707,6 +1723,250 @@ function Format-LoginEvent {
     return $message
 }
 
+$script:FailedLogonBuckets = @{}
+
+function Get-FailedLogonSourceKeyPart {
+    param(
+        [string]$SourceIP,
+        [string]$ComputerName
+    )
+
+    $ip = if ($null -ne $SourceIP) { $SourceIP.Trim() } else { '' }
+    if (-not [string]::IsNullOrWhiteSpace($ip) -and $ip -ne '-' -and $ip -ne '::1' -and $ip -ne '127.0.0.1' -and $ip -notlike 'fe80:*') {
+        return "ip:$ip"
+    }
+
+    $wks = if ($null -ne $ComputerName) { $ComputerName.Trim() } else { '' }
+    if (-not [string]::IsNullOrWhiteSpace($wks) -and $wks -ne '-') {
+        return "wks:$wks"
+    }
+
+    return 'unknown'
+}
+
+function Get-FailedLogonNormalizedUsername {
+    param([string]$Username)
+
+    $u = if ($null -ne $Username) { $Username.Trim() } else { '' }
+    if ([string]::IsNullOrWhiteSpace($u) -or $u -eq '-') { return '(не указан)' }
+    return $u
+}
+
+function Get-FailedLogonSourceDisplayLabel {
+    param([string]$SourceKeyPart)
+
+    if ($SourceKeyPart -like 'ip:*') { return $SourceKeyPart.Substring(3) }
+    if ($SourceKeyPart -like 'wks:*') { return ('рабочая станция ' + $SourceKeyPart.Substring(4)) }
+    return 'неизвестный источник'
+}
+
+function Update-FailedLogonRateLimitBucket {
+    param(
+        [string]$BucketKey,
+        [int]$WindowSeconds,
+        [string]$Username,
+        [int]$LogonType,
+        [datetime]$TimeCreated
+    )
+
+    $cutoff = (Get-Date).AddSeconds(-$WindowSeconds)
+
+    if (-not $script:FailedLogonBuckets.ContainsKey($BucketKey)) {
+        $script:FailedLogonBuckets[$BucketKey] = [pscustomobject]@{
+            Attempts = [System.Collections.ArrayList]@()
+            LastBurstAlertUtc = $null
+        }
+    }
+
+    $bucket = $script:FailedLogonBuckets[$BucketKey]
+    $null = $bucket.Attempts.Add([pscustomobject]@{
+        Time = $TimeCreated
+        Username = (Get-FailedLogonNormalizedUsername -Username $Username)
+        LogonType = $LogonType
+    })
+
+    $fresh = [System.Collections.ArrayList]@()
+    foreach ($a in $bucket.Attempts) {
+        if ($a.Time -ge $cutoff) { $null = $fresh.Add($a) }
+    }
+    $bucket.Attempts = $fresh
+
+    if ($fresh.Count -eq 0) {
+        $bucket.LastBurstAlertUtc = $null
+    }
+
+    return $bucket
+}
+
+function Format-FailedLogonBurstMessage {
+    param(
+        [ValidateSet('UserIp', 'Ip')]
+        [string]$TierKind,
+        [string]$SourceKeyPart,
+        [string]$FocusUsername,
+        [string]$SecurityLogComputerName,
+        [System.Collections.ArrayList]$Attempts,
+        [int]$Threshold,
+        [int]$WindowSeconds
+    )
+
+    $sourceLabel = Get-FailedLogonSourceDisplayLabel -SourceKeyPart $SourceKeyPart
+    $hLog = ConvertTo-TelegramHtml $(if ([string]::IsNullOrWhiteSpace($SecurityLogComputerName)) { $env:COMPUTERNAME } else { $SecurityLogComputerName })
+    $hSource = ConvertTo-TelegramHtml $sourceLabel
+    $count = $Attempts.Count
+    $times = @($Attempts | ForEach-Object { $_.Time } | Sort-Object)
+    $first = $times[0]
+    $last = $times[-1]
+
+    $byUser = @{}
+    foreach ($a in $Attempts) {
+        if (-not $byUser.ContainsKey($a.Username)) { $byUser[$a.Username] = 0 }
+        $byUser[$a.Username]++
+    }
+    $userLines = @($byUser.GetEnumerator() | Sort-Object -Property Value -Descending | ForEach-Object {
+        '{0} ({1})' -f (ConvertTo-TelegramHtml $_.Key), $_.Value
+    })
+
+    $ltSet = @($Attempts | ForEach-Object { $_.LogonType } | Sort-Object -Unique)
+    $ltNames = @($ltSet | ForEach-Object { '{0} ({1})' -f (ConvertTo-TelegramHtml (Get-LogonTypeName -LogonType $_)), $_ })
+    $ltText = if ($ltNames.Count -gt 0) { ($ltNames -join ', ') } else { '-' }
+
+    if ($TierKind -eq 'UserIp') {
+        $title = '🚨 МАССОВЫЕ НЕУДАЧНЫЕ ВХОДЫ (4625) — учётная запись'
+        $tierLine = 'Уровень: <b>IP + пользователь</b> (подбор одного логина)'
+        $hUser = ConvertTo-TelegramHtml $FocusUsername
+        $focusLine = "👤 Учётная запись: $hUser`r`n"
+    } else {
+        $title = '🚨 МАССОВЫЕ НЕУДАЧНЫЕ ВХОДЫ (4625) — источник IP'
+        $tierLine = 'Уровень: <b>только IP</b> (несколько учётных записей / spraying)'
+        $focusLine = ''
+    }
+
+    $message = "<b>$title</b>`r`n"
+    $message += "$tierLine`r`n"
+    $message += "🏢 Сервер (журнал Security): $hLog`r`n"
+    $message += "🎯 Источник: $hSource`r`n"
+    $message += $focusLine
+    $message += "📊 За последние $WindowSeconds с: <b>$count</b> попыток (порог $Threshold)`r`n"
+    $message += "🕐 В окне: $(ConvertTo-TelegramHtml ($first.ToString('dd.MM.yyyy HH:mm:ss'))) — $(ConvertTo-TelegramHtml ($last.ToString('dd.MM.yyyy HH:mm:ss')))`r`n"
+    $message += "👤 В попытках: $($userLines -join '; ')`r`n"
+    $message += "🔑 Типы входа: $ltText`r`n"
+    $message += "<i>⚠️ Возможный брутфорс. Одиночные 4625 в окне подавлены. Автоблокировка IP не выполняется.</i>`r`n"
+    $message += "🔢 Event ID: 4625 (агрегат)"
+
+    return $message
+}
+
+function Get-FailedLogonBurstAlertIfNeeded {
+    param(
+        [ValidateSet('UserIp', 'Ip')]
+        [string]$TierKind,
+        [string]$BucketKey,
+        [string]$SourceKeyPart,
+        [string]$FocusUsername,
+        [string]$SecurityLogComputerName,
+        [int]$WindowSeconds,
+        [int]$Threshold,
+        [int]$CooldownSeconds
+    )
+
+    $bucket = $script:FailedLogonBuckets[$BucketKey]
+    if ($null -eq $bucket) {
+        return $null
+    }
+
+    $count = $bucket.Attempts.Count
+    if ($count -lt $Threshold) {
+        return $null
+    }
+
+    $cooldownOk = $true
+    if ($null -ne $bucket.LastBurstAlertUtc) {
+        $elapsed = ((Get-Date).ToUniversalTime() - $bucket.LastBurstAlertUtc.ToUniversalTime()).TotalSeconds
+        $cooldownOk = ($elapsed -ge $CooldownSeconds)
+    }
+
+    if (-not $cooldownOk) {
+        return $null
+    }
+
+    $bucket.LastBurstAlertUtc = (Get-Date).ToUniversalTime()
+    $msg = Format-FailedLogonBurstMessage -TierKind $TierKind -SourceKeyPart $SourceKeyPart `
+        -FocusUsername $FocusUsername -SecurityLogComputerName $SecurityLogComputerName `
+        -Attempts $bucket.Attempts -Threshold $Threshold -WindowSeconds $WindowSeconds
+
+    return [pscustomobject]@{
+        Tier = $TierKind
+        Message = $msg
+        Count = $count
+        BucketKey = $BucketKey
+    }
+}
+
+function Get-FailedLogonRateLimitDecision4625 {
+    param(
+        [string]$SourceIP,
+        [string]$ComputerName,
+        [string]$Username,
+        [int]$LogonType,
+        [datetime]$TimeCreated,
+        [string]$SecurityLogComputerName
+    )
+
+    if (-not $FailedLogonRateLimitEnabled) {
+        return [pscustomobject]@{
+            SendIndividual = $true
+            BurstAlerts = @()
+            UserIpCount = 0
+            IpCount = 0
+        }
+    }
+
+    $sourcePart = Get-FailedLogonSourceKeyPart -SourceIP $SourceIP -ComputerName $ComputerName
+    $normUser = Get-FailedLogonNormalizedUsername -Username $Username
+    $userIpKey = "tier1:$sourcePart|$normUser"
+    $ipKey = "tier2:$sourcePart"
+
+    $userBucket = Update-FailedLogonRateLimitBucket -BucketKey $userIpKey `
+        -WindowSeconds $FailedLogonRateLimitUserIpWindowSeconds `
+        -Username $Username -LogonType $LogonType -TimeCreated $TimeCreated
+
+    $ipBucket = Update-FailedLogonRateLimitBucket -BucketKey $ipKey `
+        -WindowSeconds $FailedLogonRateLimitIpWindowSeconds `
+        -Username $Username -LogonType $LogonType -TimeCreated $TimeCreated
+
+    $burstAlerts = [System.Collections.ArrayList]@()
+
+    $burstUser = Get-FailedLogonBurstAlertIfNeeded -TierKind 'UserIp' -BucketKey $userIpKey `
+        -SourceKeyPart $sourcePart -FocusUsername $normUser -SecurityLogComputerName $SecurityLogComputerName `
+        -WindowSeconds $FailedLogonRateLimitUserIpWindowSeconds `
+        -Threshold $FailedLogonRateLimitUserIpThreshold `
+        -CooldownSeconds $FailedLogonRateLimitUserIpCooldownSeconds
+    if ($null -ne $burstUser) { $null = $burstAlerts.Add($burstUser) }
+
+    $burstIp = Get-FailedLogonBurstAlertIfNeeded -TierKind 'Ip' -BucketKey $ipKey `
+        -SourceKeyPart $sourcePart -FocusUsername $normUser -SecurityLogComputerName $SecurityLogComputerName `
+        -WindowSeconds $FailedLogonRateLimitIpWindowSeconds `
+        -Threshold $FailedLogonRateLimitIpThreshold `
+        -CooldownSeconds $FailedLogonRateLimitIpCooldownSeconds
+    if ($null -ne $burstIp) { $null = $burstAlerts.Add($burstIp) }
+
+    $inBurst = ($userBucket.Attempts.Count -ge $FailedLogonRateLimitUserIpThreshold) `
+        -or ($ipBucket.Attempts.Count -ge $FailedLogonRateLimitIpThreshold)
+
+    $sendIndividual = $true
+    if ($FailedLogonRateLimitSuppressIndividualWhileBurst -and $inBurst) {
+        $sendIndividual = $false
+    }
+
+    return [pscustomobject]@{
+        SendIndividual = $sendIndividual
+        BurstAlerts = @($burstAlerts)
+        UserIpCount = $userBucket.Attempts.Count
+        IpCount = $ipBucket.Attempts.Count
+    }
+}
+
 function Test-RDGatewayLog {
     try {
         $logExists = Get-WinEvent -ListLog $RDGatewayLogName -ErrorAction SilentlyContinue
@@ -2108,6 +2368,9 @@ function Start-LoginMonitor {
     }
     Write-Log "========================================"
     Write-Log "Каналы уведомлений: $(Get-NotifyChainHuman)"
+    if ($FailedLogonRateLimitEnabled) {
+        Write-Log "Агрегация 4625: tier1 $FailedLogonRateLimitUserIpThreshold/$FailedLogonRateLimitUserIpWindowSeconds с (IP+user), tier2 $FailedLogonRateLimitIpThreshold/$FailedLogonRateLimitIpWindowSeconds с (IP); suppressIndividual=$FailedLogonRateLimitSuppressIndividualWhileBurst"
+    }
 
     $lockout4740Enabled = Test-Lockout4740MonitoringActive
     if ($lockout4740Enabled) {
@@ -2190,19 +2453,51 @@ function Start-LoginMonitor {
                     }
 
                     if (-not $shouldIgnore) {
-                        $formattedMessage = Format-LoginEvent -EventID $event.Id `
-                            -Username $eventInfo.Username `
-                            -ComputerName $eventInfo.ComputerName `
-                            -SourceIP $eventInfo.SourceIP `
-                            -ProcessName $eventInfo.ProcessName `
-                            -TimeCreated $eventInfo.TimeCreated `
-                            -LogonType $eventInfo.LogonType `
-                            -LogonTypeName $logonTypeName `
-                            -SecurityLogComputerName $event.MachineName
+                        if ($event.Id -eq 4625 -and $FailedLogonRateLimitEnabled) {
+                            $rl = Get-FailedLogonRateLimitDecision4625 -SourceIP $eventInfo.SourceIP `
+                                -ComputerName $eventInfo.ComputerName -Username $eventInfo.Username `
+                                -LogonType $eventInfo.LogonType -TimeCreated $eventInfo.TimeCreated `
+                                -SecurityLogComputerName $event.MachineName
 
-                        Write-Log "Notify: ID=$($event.Id) User=$($eventInfo.Username) LT=$($eventInfo.LogonType) IP=$($eventInfo.SourceIP)"
-                        Send-MonitorNotification -Message $formattedMessage `
-                            -EmailSubject "RDP Login Monitor: вход (ID $($event.Id))" | Out-Null
+                            if ($rl.SendIndividual) {
+                                $formattedMessage = Format-LoginEvent -EventID $event.Id `
+                                    -Username $eventInfo.Username `
+                                    -ComputerName $eventInfo.ComputerName `
+                                    -SourceIP $eventInfo.SourceIP `
+                                    -ProcessName $eventInfo.ProcessName `
+                                    -TimeCreated $eventInfo.TimeCreated `
+                                    -LogonType $eventInfo.LogonType `
+                                    -LogonTypeName $logonTypeName `
+                                    -SecurityLogComputerName $event.MachineName
+
+                                Write-Log "Notify: ID=4625 User=$($eventInfo.Username) LT=$($eventInfo.LogonType) IP=$($eventInfo.SourceIP) (tier1=$($rl.UserIpCount) tier2=$($rl.IpCount))"
+                                Send-MonitorNotification -Message $formattedMessage `
+                                    -EmailSubject "RDP Login Monitor: неудачный вход (4625)" | Out-Null
+                            } else {
+                                Write-Log "Notify suppressed 4625: User=$($eventInfo.Username) IP=$($eventInfo.SourceIP) tier1=$($rl.UserIpCount)/$FailedLogonRateLimitUserIpThreshold tier2=$($rl.IpCount)/$FailedLogonRateLimitIpThreshold"
+                            }
+
+                            foreach ($burst in $rl.BurstAlerts) {
+                                $tierLabel = if ($burst.Tier -eq 'UserIp') { 'IP+user' } else { 'IP' }
+                                Write-Log "Notify burst 4625 ($tierLabel): count=$($burst.Count) key=$($burst.BucketKey)"
+                                Send-MonitorNotification -Message $burst.Message `
+                                    -EmailSubject "RDP Login Monitor: брутфорс 4625 ($tierLabel)" | Out-Null
+                            }
+                        } else {
+                            $formattedMessage = Format-LoginEvent -EventID $event.Id `
+                                -Username $eventInfo.Username `
+                                -ComputerName $eventInfo.ComputerName `
+                                -SourceIP $eventInfo.SourceIP `
+                                -ProcessName $eventInfo.ProcessName `
+                                -TimeCreated $eventInfo.TimeCreated `
+                                -LogonType $eventInfo.LogonType `
+                                -LogonTypeName $logonTypeName `
+                                -SecurityLogComputerName $event.MachineName
+
+                            Write-Log "Notify: ID=$($event.Id) User=$($eventInfo.Username) LT=$($eventInfo.LogonType) IP=$($eventInfo.SourceIP)"
+                            Send-MonitorNotification -Message $formattedMessage `
+                                -EmailSubject "RDP Login Monitor: вход (ID $($event.Id))" | Out-Null
+                        }
                     }
                 }
                 $lastCheckTime = ($events | Measure-Object -Property TimeCreated -Maximum | Select-Object -ExpandProperty Maximum).AddSeconds(1)
