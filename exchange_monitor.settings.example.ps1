@@ -26,9 +26,24 @@ $ExternalDomainWhitelist = @(
 # Очереди
 $QueueMessageCountThreshold = 150
 
-# Скан ящиков: только VIP (для первого пилота)
+# --- Пилот VIP (рекомендуется для первого запуска) ---
 # $VipMailboxesOnly = $true
-# $VipMailboxes = @('ceo@kalinamall.ru', 'cfo@kalinamall.ru')
+# $VipMailboxes = @(
+#     'director@kalinamall.ru',
+#     'cfo@kalinamall.ru'
+# )
+# $VipMailboxPatterns = @(
+#     '*@kalinamall.ru'   # опционально: все ящики домена из Get-Mailbox
+# )
+
+# Первый ночной скан: не слать сотни алертов по уже существующим пересылкам
+# $SuppressAlertsOnFirstBaselineRun = $true   # по умолчанию в скрипте уже $true
+
+# Отключённые Inbox rules с внешней пересылкой (важность «Средняя»)
+# $ScanDisabledInboxRulesWithExternalForward = $true
+
+# Сводка в TG/Email после каждого скана
+# $SendInboxScanSummary = $true
 
 # Удалённый EMS (если скрипт не на Exchange)
 # $ExchangeServerFqdn = 'fifth.kalinamall.ru'

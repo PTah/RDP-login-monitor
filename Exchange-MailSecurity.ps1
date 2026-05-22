@@ -25,7 +25,7 @@ $ErrorActionPreference = 'Stop'
 # КОНФИГУРАЦИЯ
 # ============================================
 
-$ScriptVersion = '1.6.0'
+$ScriptVersion = '1.6.1'
 $script:InstallRoot = [System.IO.Path]::GetFullPath("$env:ProgramData\RDP-login-monitor")
 $script:CanonicalScriptName = 'Exchange-MailSecurity.ps1'
 $LogFile = Join-Path $script:InstallRoot 'Logs\exchange_mail_security.log'
@@ -60,9 +60,14 @@ $AlertOnlyOnNewForwardingFindings = $true
 $ScanMailboxForwarding = $true
 $ScanInboxRules = $true
 $ScanTransportRules = $true
+# VIP: только перечисленные ящики и/или шаблоны (пилот перед полным сканом).
 $VipMailboxesOnly = $false
-$VipMailboxes = @()   # user@domain.com
+$VipMailboxes = @()              # точные PrimarySmtpAddress: user@domain.com
+$VipMailboxPatterns = @()        # wildcard: *@kalinamall.ru, director*, finance*
 $ExcludeMailboxPatterns = @('HealthMailbox*', 'DiscoveryMailbox*', 'SystemMailbox*')
+$ScanDisabledInboxRulesWithExternalForward = $true   # отключённые правила с внешней пересылкой
+$SuppressAlertsOnFirstBaselineRun = $true            # первый скан: baseline без всплеска алертов
+$SendInboxScanSummary = $true                      # краткая сводка после скана
 $InboxScanBatchSize = 50
 $InboxScanBatchDelaySeconds = 3
 $MaxMailboxesPerRun = 0   # 0 = без лимита
@@ -170,15 +175,6 @@ function Register-ExchangeMonitorScheduledTasks {
     Write-ExchLog "InstallTasks: зарегистрированы $($script:ScheduledTaskQueues), $($script:ScheduledTaskInbox), $($script:ScheduledTaskWatchdog)"
 }
 
-if ($InstallTasks) {
-    if (-not (Test-RunningElevated)) {
-        Write-Host 'InstallTasks: нужны права администратора.'
-        exit 1
-    }
-    Register-ExchangeMonitorScheduledTasks
-    exit 0
-}
-
 if ($Watchdog) { $Mode = 'Watchdog' }
 
 # Уведомления
@@ -201,6 +197,31 @@ Initialize-NotifyCredentials -TelegramBotTokenProtectedB64 $TelegramBotTokenProt
     -MailSmtpPasswordProtectedB64 $MailSmtpPasswordProtectedB64 -MailSmtpPassword $mailPass
 if ($TelegramBotToken -eq '<TELEGRAM_BOT_TOKEN>') { $TelegramBotToken = '' }
 if ($TelegramChatID -eq '<TELEGRAM_CHAT_ID>') { $TelegramChatID = '' }
+
+function Send-ExchangeInstallNotification {
+    $scope = Get-ExchangeInboxScanScopeLabel
+    $vipNote = if ($VipMailboxesOnly) { "VIP: да ($scope)" } else { 'VIP: нет (полный скан)' }
+    $msg = "<b>✅ Exchange Mail Security установлен</b>`r`n"
+    $msg += "🖥️ $(ConvertTo-TelegramHtml $env:COMPUTERNAME) | v$ScriptVersion`r`n"
+    $msg += "📢 Каналы: $(ConvertTo-TelegramHtml (Get-NotifyChainHuman))`r`n"
+    $msg += "📬 Inbox/пересылка: $vipNote`r`n"
+    $msg += "📋 Очереди: порог $QueueMessageCountThreshold | Inbox 02:00 | Queues /10 мин`r`n"
+    $msg += "🛡️ Первый скан: $(if ($SuppressAlertsOnFirstBaselineRun) { 'baseline без всплеска алертов' } else { 'алерт по всем находкам' })"
+    Send-MonitorNotification -Message $msg -EmailSubject 'Exchange Mail Security: install' | Out-Null
+}
+
+if ($InstallTasks) {
+    if (-not (Test-RunningElevated)) {
+        Write-Host 'InstallTasks: нужны права администратора.'
+        exit 1
+    }
+    Register-ExchangeMonitorScheduledTasks
+    if ((Test-NotifyTelegramConfigured) -or (Test-NotifyEmailConfigured)) {
+        Send-ExchangeInstallNotification
+        Write-ExchLog 'InstallTasks: отправлено уведомление об установке'
+    }
+    exit 0
+}
 
 # ============================================
 # EXCHANGE EMS
@@ -319,6 +340,41 @@ function Test-MailboxExcluded {
     return $false
 }
 
+function Test-VipMailboxScopeConfigured {
+    if (-not $VipMailboxesOnly) { return $true }
+    $hasList = @($VipMailboxes | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -gt 0
+    $hasPat = @($VipMailboxPatterns | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -gt 0
+    return ($hasList -or $hasPat)
+}
+
+function Test-MailboxInVipScope {
+    param([string]$PrimarySmtp)
+
+    if (-not $VipMailboxesOnly) { return $true }
+    if (-not (Test-VipMailboxScopeConfigured)) { return $false }
+
+    $smtp = $PrimarySmtp.Trim().ToLowerInvariant()
+    foreach ($v in $VipMailboxes) {
+        if ([string]::IsNullOrWhiteSpace($v)) { continue }
+        if ($smtp -eq $v.Trim().ToLowerInvariant()) { return $true }
+    }
+    foreach ($pat in $VipMailboxPatterns) {
+        if ([string]::IsNullOrWhiteSpace($pat)) { continue }
+        if ($smtp -like $pat) { return $true }
+    }
+    return $false
+}
+
+function Get-ExchangeInboxScanScopeLabel {
+    if (-not $VipMailboxesOnly) {
+        if ($MaxMailboxesPerRun -gt 0) { return "все ящики (лимит $MaxMailboxesPerRun)" }
+        return 'все ящики'
+    }
+    $n = @($VipMailboxes | Where-Object { $_ }).Count
+    $p = @($VipMailboxPatterns | Where-Object { $_ }).Count
+    return "VIP: список=$n, шаблонов=$p"
+}
+
 # ============================================
 # FINDINGS
 # ============================================
@@ -334,7 +390,11 @@ function New-ForwardingFinding {
     )
 
     $rulePart = if ([string]::IsNullOrWhiteSpace($RuleName)) { '' } else { $RuleName }
-    $id = '{0}|{1}|{2}|{3}' -f $FindingType, $Mailbox.ToLowerInvariant(), $rulePart, $TargetAddress.ToLowerInvariant()
+    $enabledPart = 'na'
+    if ($Extra.ContainsKey('Enabled')) {
+        $enabledPart = if ($Extra['Enabled']) { 'on' } else { 'off' }
+    }
+    $id = '{0}|{1}|{2}|{3}|{4}' -f $FindingType, $Mailbox.ToLowerInvariant(), $rulePart, $TargetAddress.ToLowerInvariant(), $enabledPart
     return [pscustomobject]@{
         Id = $id
         FindingType = $FindingType
@@ -377,6 +437,9 @@ function Format-ForwardingFindingMessage {
     }
     if ($Finding.Extra.ContainsKey('DeliverToMailboxAndForward')) {
         $msg += "📤 DeliverToMailboxAndForward: $(ConvertTo-TelegramHtml ([string]$Finding.Extra['DeliverToMailboxAndForward']))`r`n"
+    }
+    if ($Finding.Extra.ContainsKey('Property')) {
+        $msg += "🔀 Поле правила: $(ConvertTo-TelegramHtml ([string]$Finding.Extra['Property']))`r`n"
     }
 
     return $msg
@@ -483,8 +546,27 @@ function Invoke-ExchangeQueueScan {
 
 function Get-MailboxListForScan {
     Import-ExchangeManagementShell
-    if ($VipMailboxesOnly -and $VipMailboxes.Count -gt 0) {
-        return @($VipMailboxes | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ })
+
+    if ($VipMailboxesOnly) {
+        if (-not (Test-VipMailboxScopeConfigured)) {
+            throw 'VipMailboxesOnly=$true, но VipMailboxes и VipMailboxPatterns пусты — задайте список в exchange_monitor.settings.ps1'
+        }
+        $set = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($v in $VipMailboxes) {
+            if (-not [string]::IsNullOrWhiteSpace($v)) { $null = $set.Add($v.Trim().ToLowerInvariant()) }
+        }
+        if ($VipMailboxPatterns.Count -gt 0) {
+            $all = @(Get-Mailbox -ResultSize Unlimited -ErrorAction Stop)
+            foreach ($mb in $all) {
+                $smtp = [string]$mb.PrimarySmtpAddress
+                if ([string]::IsNullOrWhiteSpace($smtp)) { continue }
+                if (Test-MailboxExcluded -PrimarySmtp $smtp) { continue }
+                if (Test-MailboxInVipScope -PrimarySmtp $smtp) {
+                    $null = $set.Add($smtp.ToLowerInvariant())
+                }
+            }
+        }
+        return @($set)
     }
 
     $all = @(Get-Mailbox -ResultSize Unlimited -ErrorAction Stop)
@@ -515,9 +597,7 @@ function Scan-MailboxForwardingSettings {
     foreach ($mb in $mbs) {
         $primary = [string]$mb.PrimarySmtpAddress
         if (Test-MailboxExcluded -PrimarySmtp $primary) { continue }
-        if ($VipMailboxesOnly -and $VipMailboxes.Count -gt 0) {
-            if ($VipMailboxes -notcontains $primary.ToLowerInvariant()) { continue }
-        }
+        if (-not (Test-MailboxInVipScope -PrimarySmtp $primary)) { continue }
 
         $targets = @()
         if ($mb.ForwardingSmtpAddress) {
@@ -540,6 +620,43 @@ function Scan-MailboxForwardingSettings {
     }
 }
 
+function Add-InboxRuleExternalForwardFindings {
+    param(
+        $Rule,
+        [string]$Mailbox,
+        [System.Collections.Generic.HashSet[string]]$InternalDomains,
+        [System.Collections.Generic.List[object]]$Findings
+    )
+
+    $props = @(
+        @{ Name = 'ForwardTo'; Value = $Rule.ForwardTo }
+        @{ Name = 'RedirectTo'; Value = $Rule.RedirectTo }
+        @{ Name = 'ForwardAsAttachmentTo'; Value = $Rule.ForwardAsAttachmentTo }
+    )
+
+    foreach ($p in $props) {
+        $addrs = Get-AddressesFromExchangeProperty -PropertyValue $p.Value
+        foreach ($addr in $addrs) {
+            if (-not (Test-IsExternalSmtpAddress -SmtpAddress $addr -InternalDomains $InternalDomains -WhitelistDomains $ExternalDomainWhitelist)) {
+                continue
+            }
+            $sev = 'Высокая'
+            if (-not $Rule.Enabled) {
+                $sev = 'Средняя (правило отключено)'
+            } elseif ($Rule.DeleteMessage -or $Rule.MarkAsRead) {
+                $sev = 'Критическая'
+            }
+            $Findings.Add((New-ForwardingFinding -FindingType 'InboxRule' -Mailbox $Mailbox `
+                -RuleName [string]$Rule.Name -TargetAddress $addr -Severity $sev -Extra @{
+                    Enabled = [bool]$Rule.Enabled
+                    DeleteMessage = $Rule.DeleteMessage
+                    MarkAsRead = $Rule.MarkAsRead
+                    Property = $p.Name
+                })) | Out-Null
+        }
+    }
+}
+
 function Scan-InboxRulesForMailbox {
     param(
         [string]$Mailbox,
@@ -549,30 +666,10 @@ function Scan-InboxRulesForMailbox {
 
     $rules = @(Get-InboxRule -Mailbox $Mailbox -ErrorAction SilentlyContinue)
     foreach ($rule in $rules) {
-        if (-not $rule.Enabled) { continue }
-
-        $props = @(
-            @{ Name = 'ForwardTo'; Value = $rule.ForwardTo }
-            @{ Name = 'RedirectTo'; Value = $rule.RedirectTo }
-            @{ Name = 'ForwardAsAttachmentTo'; Value = $rule.ForwardAsAttachmentTo }
-        )
-
-        foreach ($p in $props) {
-            $addrs = Get-AddressesFromExchangeProperty -PropertyValue $p.Value
-            foreach ($addr in $addrs) {
-                if (-not (Test-IsExternalSmtpAddress -SmtpAddress $addr -InternalDomains $InternalDomains -WhitelistDomains $ExternalDomainWhitelist)) {
-                    continue
-                }
-                $sev = 'Высокая'
-                if ($rule.DeleteMessage -or $rule.MarkAsRead) { $sev = 'Критическая' }
-                $Findings.Add((New-ForwardingFinding -FindingType 'InboxRule' -Mailbox $Mailbox `
-                    -RuleName [string]$rule.Name -TargetAddress $addr -Severity $sev -Extra @{
-                        Enabled = $rule.Enabled
-                        DeleteMessage = $rule.DeleteMessage
-                        MarkAsRead = $rule.MarkAsRead
-                        Property = $p.Name
-                    })) | Out-Null
-            }
+        if ($rule.Enabled) {
+            Add-InboxRuleExternalForwardFindings -Rule $rule -Mailbox $Mailbox -InternalDomains $InternalDomains -Findings $Findings
+        } elseif ($ScanDisabledInboxRulesWithExternalForward) {
+            Add-InboxRuleExternalForwardFindings -Rule $rule -Mailbox $Mailbox -InternalDomains $InternalDomains -Findings $Findings
         }
     }
 }
@@ -606,8 +703,32 @@ function Scan-TransportRulesExternalForward {
     }
 }
 
+function Send-ExchangeInboxScanSummary {
+    param(
+        [int]$TotalFindings,
+        [int]$NewFindings,
+        [int]$MailboxCount,
+        [bool]$FirstBaselineSeeded,
+        [string]$ScopeLabel
+    )
+
+    if (-not $SendInboxScanSummary) { return }
+
+    $hHost = ConvertTo-TelegramHtml $env:COMPUTERNAME
+    $msg = "<b>📊 Exchange: итог скана пересылки</b>`r`n"
+    $msg += "🖥️ $hHost | v$ScriptVersion`r`n"
+    $msg += "🔎 Охват: $(ConvertTo-TelegramHtml $ScopeLabel)`r`n"
+    $msg += "📬 Ящиков (Inbox rules): $MailboxCount`r`n"
+    $msg += "📋 Находок всего: $TotalFindings | новых: $NewFindings`r`n"
+    if ($FirstBaselineSeeded) {
+        $msg += "<i>Первый baseline: алерты по существующим пересылкам подавлены (SuppressAlertsOnFirstBaselineRun).</i>`r`n"
+    }
+    Send-MonitorNotification -Message $msg -EmailSubject 'Exchange: scan summary' | Out-Null
+}
+
 function Invoke-ExchangeInboxAndForwardingScan {
-    Write-ExchLog "Inbox/Forwarding scan v$ScriptVersion; каналы: $(Get-NotifyChainHuman)"
+    $scopeLabel = Get-ExchangeInboxScanScopeLabel
+    Write-ExchLog "Inbox/Forwarding scan v$ScriptVersion; охват: $scopeLabel; каналы: $(Get-NotifyChainHuman)"
     Import-ExchangeManagementShell
     $internalDomains = Get-InternalAcceptedDomainNames
     Write-ExchLog "Accepted domains (internal): $($internalDomains -join ', ')"
@@ -616,9 +737,11 @@ function Invoke-ExchangeInboxAndForwardingScan {
 
     Scan-MailboxForwardingSettings -InternalDomains $internalDomains -Findings $findings
 
+    $mailboxCount = 0
     if ($ScanInboxRules) {
         $mailboxes = @(Get-MailboxListForScan)
-        Write-ExchLog "Inbox rules: ящиков к скану: $($mailboxes.Count)"
+        $mailboxCount = $mailboxes.Count
+        Write-ExchLog "Inbox rules: ящиков к скану: $mailboxCount ($scopeLabel)"
         $idx = 0
         foreach ($mb in $mailboxes) {
             $idx++
@@ -644,7 +767,15 @@ function Invoke-ExchangeInboxAndForwardingScan {
     $newFindings = @($findings | Where-Object { -not $prevSet.Contains($_.Id) })
     Write-ExchLog "Forwarding: всего $($findings.Count), новых $($newFindings.Count)"
 
+    $isFirstBaseline = ($baseline.FindingIds.Count -eq 0) -and ($findings.Count -gt 0)
+    $firstBaselineSeeded = $false
+
     $toAlert = if ($AlertOnlyOnNewForwardingFindings) { $newFindings } else { @($findings) }
+    if ($SuppressAlertsOnFirstBaselineRun -and $isFirstBaseline) {
+        Write-ExchLog 'Forwarding: первый baseline — алерты по находкам подавлены (SuppressAlertsOnFirstBaselineRun)'
+        $firstBaselineSeeded = $true
+        $toAlert = @()
+    }
     foreach ($f in $toAlert) {
         $body = Format-ForwardingFindingMessage -Finding $f
         Send-MonitorNotification -Message $body -EmailSubject 'Exchange: external forward' | Out-Null
@@ -659,6 +790,8 @@ function Invoke-ExchangeInboxAndForwardingScan {
 
     Save-ForwardingBaseline -FindingIds $allIds
     Write-TextFileUtf8Bom -Path $InboxHeartbeatFile -Text (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+    Send-ExchangeInboxScanSummary -TotalFindings $findings.Count -NewFindings $newFindings.Count `
+        -MailboxCount $mailboxCount -FirstBaselineSeeded $firstBaselineSeeded -ScopeLabel $scopeLabel
     Write-ExchLog 'Inbox/Forwarding scan завершён'
 }
 

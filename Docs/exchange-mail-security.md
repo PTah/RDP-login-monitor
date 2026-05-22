@@ -18,7 +18,7 @@
 
 ### 1. Правила Inbox (`Get-InboxRule`)
 
-Для **включённых** правил (`Enabled = $true`) проверяются:
+Для **включённых** правил проверяются:
 
 - `ForwardTo`
 - `RedirectTo`
@@ -26,7 +26,9 @@
 
 Если целевой SMTP-адрес указывает на домен **не** из `Get-AcceptedDomain` (типы **Authoritative** и **InternalRelay**) и не в **whitelist** — фиксируется находка.
 
-**Повышенная важность (Критическая):** правило также включает `DeleteMessage` или `MarkAsRead` (типичный паттерн скрытой пересылки при компрометации).
+**Повышенная важность (Критическая):** включённое правило с `DeleteMessage` или `MarkAsRead`.
+
+**Отключённые правила** (`$ScanDisabledInboxRulesWithExternalForward = $true`): внешняя пересылка фиксируется с важностью **«Средняя (правило отключено)»**.
 
 ### 2. Пересылка на уровне ящика (`Get-Mailbox`)
 
@@ -49,7 +51,6 @@
 
 ### Что не отслеживается
 
-- **Отключённые** Inbox rules с внешней пересылкой
 - Делегирование, Send As, скрытые EWS-правила без Inbox rule
 - Пересылка только между **внутренними** accepted domains
 - Чтение почты злоумышленником **без** настройки forward
@@ -63,9 +64,25 @@
 ## Оповещения и baseline
 
 - Каналы: **Telegram** и/или **Email** (модуль **`Notify-Common.ps1`**).
-- Пересылка: по умолчанию **`$AlertOnlyOnNewForwardingFindings = $true`** — алерт только при **новой** находке относительно `Logs\exchange_forwarding_baseline.json`.
-- **Первый** полный скан: baseline пуст → алерт по **всем** найденным внешним пересылкам (легитимные партнёры добавьте в whitelist заранее).
-- **`$NotifyWhenForwardingScanClean = $false`** — не слать ежедневное «всё чисто» (можно включить).
+- Пересылка: **`$AlertOnlyOnNewForwardingFindings = $true`** — алерт при **новой** находке (`Logs\exchange_forwarding_baseline.json`).
+- **Первый скан:** **`$SuppressAlertsOnFirstBaselineRun = $true`** (по умолчанию) — существующие пересылки **только в baseline**, без всплеска алертов; одна **сводка** (`$SendInboxScanSummary`).
+- Далее — алерт только при **новых** или **изменённых** пересылках (в т.ч. включили ранее отключённое правило).
+- **`$NotifyWhenForwardingScanClean = $false`** — не слать «всё чисто» при нуле находок.
+
+## Режим VIP (пилот)
+
+В **`exchange_monitor.settings.ps1`**:
+
+```powershell
+$VipMailboxesOnly = $true
+$VipMailboxes = @('director@domain.ru', 'cfo@domain.ru')
+$VipMailboxPatterns = @('*@domain.ru')   # опционально
+```
+
+- **Список** — точные SMTP.
+- **Шаблоны** — дополнительно обход `Get-Mailbox` и отбор по `-like`.
+- Mailbox forwarding и Inbox rules — только в рамках VIP.
+- Для полного домена: **`$VipMailboxesOnly = $false`**.
 
 ## Файлы на шаре NETLOGON
 
@@ -180,7 +197,11 @@ schtasks /Query /TN "RDP-Exchange-MailSecurity-Watchdog" /V /FO LIST
 | `$ScanMailboxForwarding` | `$true` | Скан forwarding на ящике |
 | `$ScanTransportRules` | `$true` | Скан transport rules |
 | `$AlertOnlyOnNewForwardingFindings` | `$true` | Только новые находки |
-| `$VipMailboxesOnly` | `$false` | Ограничить список ящиков |
+| `$VipMailboxesOnly` | `$false` | Только VIP-ящики |
+| `$VipMailboxPatterns` | `@()` | Wildcard для VIP |
+| `$SuppressAlertsOnFirstBaselineRun` | `$true` | Первый скан без N алертов |
+| `$ScanDisabledInboxRulesWithExternalForward` | `$true` | Отключённые правила с внешним forward |
+| `$SendInboxScanSummary` | `$true` | Сводка после скана |
 | `$InboxScanBatchSize` | 50 | Пауза каждые N ящиков |
 | `$InboxScanBatchDelaySeconds` | 3 | Задержка между батчами |
 | `$ExcludeMailboxPatterns` | HealthMailbox*, … | Исключения |
@@ -216,7 +237,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "\\B26\NETLOGON\RDP-logi
 |---------|----------|
 | «Не удалось загрузить Exchange Management Shell» | Запуск на mailbox/Exchange server; проверить snap-in / `$ExchangeServerFqdn` |
 | Нет алертов | Проверить `exchange_monitor.settings.ps1`, Telegram/SMTP, лог `exchange_mail_security.log` |
-| Слишком много алертов в первый день | Заполнить `$ExternalDomainWhitelist`; дождаться baseline; или временно `$AlertOnlyOnNewForwardingFindings = $false` только для теста |
+| Слишком много алертов в первый день | По умолчанию подавлены (`$SuppressAlertsOnFirstBaselineRun`); иначе whitelist + baseline |
 | Inbox scan долгий | `$VipMailboxesOnly = $true`; увеличить `$InboxScanBatchDelaySeconds` |
 | Ошибки Get-InboxRule на ящике | В логе будет «ошибка mailbox» — штатно, скан продолжается |
 
