@@ -22,6 +22,7 @@
 - `Install-DomainMonitors.ps1`
 - `Deploy-DomainMonitors.ps1`
 - `exchange_monitor.settings.example.ps1`
+- `login_monitor.settings.example.ps1`
 
 ## Запуск
 

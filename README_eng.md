@@ -11,7 +11,8 @@ PowerShell toolkit for monitoring Windows logons with Telegram and/or Email (SMT
   - `RDP-Login-Monitor-Watchdog` (process health check every 5 minutes).
 - Domain delivery and upgrades: **`Deploy-LoginMonitor.ps1`** + **`version.txt`** on a share such as `NETLOGON`. After a successful deploy, the startup notification may include an update note (file **`deploy_last_update.txt`** next to logs).
 - Deployment docs: **[Docs/README.md](Docs/README.md)** (RDP monitor, Exchange, NETLOGON).
-- **`Encrypt-DpapiForRdpMonitor.ps1`** — optional helper to prepare DPAPI-protected Base64 for the bot token / chat id and SMTP password (`$MailSmtpPasswordProtectedB64`).
+- **`Encrypt-DpapiForRdpMonitor.ps1`** — optional helper to prepare DPAPI-protected Base64 for the bot token / chat id and SMTP password (`$MailSmtpPasswordProtectedB64` in the settings file).
+- **RDP monitor local settings:** **`login_monitor.settings.ps1`** in the install directory (template **`login_monitor.settings.example.ps1`**). When **`Login_Monitor.ps1`** is auto-updated from the share, the settings file is **not overwritten** (same pattern as **`exchange_monitor.settings.ps1`** for Exchange).
 
 ## Notable behavior
 
@@ -28,8 +29,9 @@ PowerShell toolkit for monitoring Windows logons with Telegram and/or Email (SMT
    - `C:\ProgramData\RDP-login-monitor\`
 2. Copy at least:
    - `Login_Monitor.ps1`
-   - (for domain rollout on a share) `Deploy-LoginMonitor.ps1` and `version.txt`.
-3. Edit `Login_Monitor.ps1` and configure notification channels:
+   - `login_monitor.settings.example.ps1` → rename to **`login_monitor.settings.ps1`** and configure (see step 3)
+   - (for domain rollout on a share) `Deploy-LoginMonitor.ps1`, `version.txt`, and `login_monitor.settings.example.ps1`
+3. Configure **`C:\ProgramData\RDP-login-monitor\login_monitor.settings.ps1`** (do not put secrets in `Login_Monitor.ps1` — they are overwritten on deploy):
    - **Telegram:** `$TelegramBotToken` / `$TelegramChatID` or `...ProtectedB64`
    - **Email (SMTP):** `$MailSmtpHost`, `$MailFrom`, `$MailTo`, `$MailSmtpPort` (default 587), optionally `$MailSmtpUser` / `$MailSmtpPassword` (or `$MailSmtpPasswordProtectedB64` via DPAPI), `$MailSmtpStartTls` / `$MailSmtpSsl`
    - **Order:** `$NotifyOrder` — empty = auto (Telegram → Email, configured channels only); otherwise `telegram,email`, `email`, etc. (`tg`, `mail` are accepted)
@@ -37,7 +39,7 @@ PowerShell toolkit for monitoring Windows logons with Telegram and/or Email (SMT
 5. Logs and auxiliary files:
    - `C:\ProgramData\RDP-login-monitor\Logs\`
 6. (Optional) Suppress some Security alerts via **`ignore.lst`** — see **section 7** below.
-7. (Optional) AD account lockout monitoring on a DC — **`$LockoutMonitorDomainController`** (short hostname of the machine **where the monitor is installed and running**), **`$NetBiosDomainName`**, **`$ExchangeIisLogPath`**, **`$ExchangeIisLogMinutesBeforeLockout`** (default 30), **`$ExchangeIisLogTailLines`** (default 5000), **`$ExchangeServerHostForIisExclude`**. Alerts include the user from event **4740** and client IPs from IIS within the time window before lockout. In **`ignore.lst`** use prefix **`4740:`** or **`all:`** — see **`ignore.lst.example`**.
+7. (Optional) AD account lockout monitoring on a DC — in **`login_monitor.settings.ps1`**: **`$LockoutMonitorDomainController`** (short hostname of the machine **where the monitor is installed and running**), **`$NetBiosDomainName`**, **`$ExchangeIisLogPath`**, **`$ExchangeIisLogMinutesBeforeLockout`** (default 30), **`$ExchangeIisLogTailLines`** (default 5000), **`$ExchangeServerHostForIisExclude`**. Alerts include the user from event **4740** and client IPs from IIS within the time window before lockout. In **`ignore.lst`** use prefix **`4740:`** or **`all:`** — see **`ignore.lst.example`**.
 8. Heartbeat: if **`Logs\last_heartbeat.txt`** is not updated for longer than **`$HeartbeatStaleAlertMultiplier` × `$HeartbeatInterval`** (default 2×1 h) — alert via Telegram/Email.
 
 ## 2) Manual run
@@ -90,6 +92,7 @@ For domain deployment from a share you do not configure the scheduler on clients
 - **`Install-DeployScheduledTask.ps1`** — helper to run **`Deploy-LoginMonitor.ps1`** from a share on a schedule (see **[DEPLOY.md](DEPLOY.md)**).
 - **`Watchdog_RDP_Monitor.ps1`** and **`Install-ScheduledTasks.ps1`** — **alternate** layout with a separate watchdog script and default paths under **`D:\Soft`**. For new installs, prefer the built-in **`-Watchdog`** in **`Login_Monitor.ps1`** and tasks **`RDP-Login-Monitor`** / **`RDP-Login-Monitor-Watchdog`**.
 - **`ignore.lst.example`** in the repo is a template for **`ignore.lst`** to suppress selected Security notifications (see section 7).
+- **`login_monitor.settings.example.ps1`** — template for **`login_monitor.settings.ps1`** (Telegram, SMTP, 4740, local IP exclusions). Deploy may create `login_monitor.settings.ps1` from the example on first install.
 
 ## 7) Suppressing Security alerts: `ignore.lst`
 
@@ -138,7 +141,7 @@ Explicit **User** / **Workstation** / **Ip** kinds only compare their respective
 ### Examples and deployment
 
 - See **`ignore.lst.example`** in the repo; copy it to the server as **`ignore.lst`** and edit.
-- **`Deploy-LoginMonitor.ps1`** does **not** copy this file — rules are usually host-specific; create **`ignore.lst`** manually or via your configuration tooling.
+- **`Deploy-LoginMonitor.ps1`** does **not** copy or overwrite **`ignore.lst`** or **`login_monitor.settings.ps1`**; if settings are missing, Deploy creates them once from **`login_monitor.settings.example.ps1`** on the share.
 
 ## Keywords (for discovery)
 

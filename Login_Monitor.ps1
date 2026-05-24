@@ -21,16 +21,18 @@
       Add-Type -AssemblyName System.Security
       $p=[Text.Encoding]::UTF8.GetBytes('<токен>')
       [Convert]::ToBase64String([Security.Cryptography.ProtectedData]::Protect($p,$null,'LocalMachine'))
-    Полученную строку вставьте в $TelegramBotTokenProtectedB64 (и аналогично для chat id).
+    Полученную строку вставьте в $TelegramBotTokenProtectedB64 в login_monitor.settings.ps1 (и аналогично для chat id).
+    Локальные настройки (секреты, КД, SMTP): C:\ProgramData\RDP-login-monitor\login_monitor.settings.ps1
+    (образец login_monitor.settings.example.ps1). Файл настроек не перезаписывается при автообновлении скрипта.
 #>
 
 [CmdletBinding()]
 param(
-    [string]$TelegramBotToken = "8239219522:AAEyOZX3cwNfgGOMDkf-mgjTIuoaOh5gF7I",
-    [string]$TelegramChatID = "2843230",
-    [string]$TelegramBotTokenProtectedB64 = "",
-    [string]$TelegramChatIDProtectedB64 = "",
-    [string]$MailSmtpPasswordProtectedB64 = "",
+    [string]$TelegramBotToken = '',
+    [string]$TelegramChatID = '',
+    [string]$TelegramBotTokenProtectedB64 = '',
+    [string]$TelegramChatIDProtectedB64 = '',
+    [string]$MailSmtpPasswordProtectedB64 = '',
     [switch]$Watchdog,
     [switch]$InstallTasks,
     [switch]$SkipScheduledTaskMaintenance
@@ -72,7 +74,7 @@ $script:MonitorSingletonLockStream = $null
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.5.10"
+$ScriptVersion = "1.5.11"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -146,21 +148,17 @@ $ExcludedComputerPatterns = @(
 )
 
 # Узкое исключение "шумовых" сетевых логонов (LogonType=3) от конкретных источников.
-# Пример: Proxmox Mail Gateway / LDAP sync, которые периодически создают 4624 с LogonProcessName=Advapi.
-$IgnoreAdvapiNetworkLogonSourceIps = @(
-    "192.168.160.57"
-)
+# IP-список — в login_monitor.settings.ps1 ($IgnoreAdvapiNetworkLogonSourceIps).
+$IgnoreAdvapiNetworkLogonSourceIps = @()
 $IgnoreAdvapiNetworkLogonProcessContains = "Advapi"
 
 # Блокировка учётной записи AD (Security 4740) + IP клиента из логов IIS ActiveSync.
-# Мониторинг включается только если скрипт запущен на узле, имя которого совпадает с $LockoutMonitorDomainController.
-# Конфигурация домена B26 / DC3 — внутренний дистрибутив (git.kalinamall.ru). Не пушить этот файл в публичный GitHub.
-$LockoutMonitorDomainController = "K6A-DC3"
-$NetBiosDomainName = "B26"
-$ExchangeIisLogPath = "\\fifth.kalinamall.ru\c$\inetpub\logs\LogFiles\W3SVC1"
-$ExchangeServerHostForIisExclude = ""
+# Параметры КД/IIS — в login_monitor.settings.ps1.
+$LockoutMonitorDomainController = ''
+$NetBiosDomainName = ''
+$ExchangeIisLogPath = ''
+$ExchangeServerHostForIisExclude = ''
 $ExchangeIisLogTailLines = 5000
-# Окно поиска IP в IIS: только строки за N минут до события 4740 (локальное время сервера IIS).
 $ExchangeIisLogMinutesBeforeLockout = 30
 
 # Агрегация неудачных входов Security 4625 (вариант C: два порога). Автоблокировка IP не выполняется.
@@ -176,15 +174,23 @@ $FailedLogonRateLimitIpThreshold = 12
 $FailedLogonRateLimitIpCooldownSeconds = 300
 
 # Очередь оповещений: telegram, email (или tg, mail). Пусто = авто: настроенные каналы, порядок telegram → email.
-$NotifyOrder = "tg"
-$MailSmtpHost = ""
+# Переопределение — в login_monitor.settings.ps1.
+$NotifyOrder = 'tg'
+$MailSmtpHost = ''
 $MailSmtpPort = 587
-$MailSmtpUser = ""
-$MailSmtpPassword = ""
-$MailFrom = ""
-$MailTo = ""
+$MailSmtpUser = ''
+$MailSmtpPassword = ''
+$MailFrom = ''
+$MailTo = ''
 $MailSmtpStartTls = $true
 $MailSmtpSsl = $false
+
+$script:LoginMonitorSettingsFile = Join-Path $script:InstallRoot 'login_monitor.settings.ps1'
+$script:LoginMonitorSettingsLoaded = $false
+if (Test-Path -LiteralPath $script:LoginMonitorSettingsFile) {
+    . $script:LoginMonitorSettingsFile
+    $script:LoginMonitorSettingsLoaded = $true
+}
 
 # ============================================
 # ИНИЦИАЛИЗАЦИЯ
@@ -793,6 +799,11 @@ if (-not (Test-Administrator)) {
     exit 1
 }
 Write-Log "Скрипт запущен с правами администратора, версия $ScriptVersion"
+if ($script:LoginMonitorSettingsLoaded) {
+    Write-Log "Настройки: login_monitor.settings.ps1 загружен."
+} else {
+    Write-Log "Предупреждение: login_monitor.settings.ps1 не найден — Telegram/SMTP/4740 не настроены (скопируйте login_monitor.settings.example.ps1)."
+}
 
 Invoke-RdpMonitorProcessMigrationAndRelaunch
 Lock-RdpMonitorSingleInstance

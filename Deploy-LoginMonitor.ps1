@@ -175,6 +175,16 @@ try {
 
     Write-DeployLog "Deploy: корень дистрибутива: $shareRoot"
 
+    $settingsLocal = Join-Path $InstallRoot 'login_monitor.settings.ps1'
+    $settingsExampleShare = Join-Path $shareRoot 'login_monitor.settings.example.ps1'
+    if (-not (Test-Path -LiteralPath $settingsLocal) -and (Test-Path -LiteralPath $settingsExampleShare)) {
+        if (-not (Test-Path -LiteralPath $InstallRoot)) {
+            New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
+        }
+        Copy-Item -LiteralPath $settingsExampleShare -Destination $settingsLocal -Force
+        Write-DeployLog "Создан login_monitor.settings.ps1 из example (при следующих обновлениях не перезаписывается)."
+    }
+
     if (-not (Test-Path -LiteralPath $sourceScript)) {
         Write-DeployLog "ОШИБКА: на шаре нет файла: $sourceScript"
         exit 0

@@ -14,7 +14,8 @@
 
 | Файл | Назначение |
 |------|------------|
-| `Login_Monitor.ps1` | Основной скрипт (токен/chat id plain или DPAPI в параметрах). |
+| `Login_Monitor.ps1` | Основной скрипт (логика мониторинга; без локальных секретов). |
+| `login_monitor.settings.example.ps1` | Образец настроек на шаре (Telegram, SMTP, 4740). |
 | `version.txt` | **Одна строка** — номер версии пакета на шаре (см. раздел «Версии» ниже). |
 | `Deploy-LoginMonitor.ps1` | Установщик: сравнивает версию, копирует монитор, вызывает `-InstallTasks`, при необходимости запускает процесс монитора. |
 
@@ -36,13 +37,31 @@
 
 Лог: **`C:\ProgramData\RDP-login-monitor\Logs\deploy.log`**.
 
+## Локальные настройки: `login_monitor.settings.ps1`
+
+На каждом компьютере: **`C:\ProgramData\RDP-login-monitor\login_monitor.settings.ps1`**.
+
+- Секреты и параметры сайта (Telegram, SMTP, **4740**, `$IgnoreAdvapiNetworkLogonSourceIps`) — **только** в этом файле.
+- Образец в репозитории и на шаре: **`login_monitor.settings.example.ps1`**.
+- **`Deploy-LoginMonitor.ps1`** **не перезаписывает** `login_monitor.settings.ps1` при обновлении скрипта.
+- Если файла нет, Deploy **один раз** копирует example → settings (дальше правки только локально).
+
+```powershell
+$root = 'C:\ProgramData\RDP-login-monitor'
+Copy-Item '\\B26\NETLOGON\RDP-login-monitor\login_monitor.settings.example.ps1' `
+    (Join-Path $root 'login_monitor.settings.ps1')
+notepad (Join-Path $root 'login_monitor.settings.ps1')
+```
+
+DPAPI: **`Encrypt-DpapiForRdpMonitor.ps1`** — строки Base64 в settings.
+
 ## Опционально: `ignore.lst`
 
 Файл **`C:\ProgramData\RDP-login-monitor\ignore.lst`** — подавление отдельных алертов **4624/4625/4740**. Синтаксис — в **[README.md](../README.md)** (раздел 7) и **`ignore.lst.example`**. Deploy с шары **`ignore.lst` не копирует**.
 
 ## Опционально на КД: блокировки AD (4740)
 
-Включается только если монитор запущен на КД с именем **`$LockoutMonitorDomainController`**. Параметры задаются **локально** на этом КД после деплоя (`$NetBiosDomainName`, `$ExchangeIisLogPath`, …).
+Включается только если монитор запущен на КД с именем **`$LockoutMonitorDomainController`**. Параметры задаются в **`login_monitor.settings.ps1`** на этом КД (`$NetBiosDomainName`, `$ExchangeIisLogPath`, …).
 
 ## Heartbeat и watchdog
 
@@ -109,9 +128,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "\\B26\NETLOGON\RDP-logi
 
 ## Безопасность
 
-- Ограничьте ACL на шару (в скрипте могут быть секреты).
-- DPAPI: **`Encrypt-DpapiForRdpMonitor.ps1`**
-- Внутренний git: не пушить секреты в публичный GitHub
+- Ограничьте ACL на шару (в example/settings могут быть секреты для домена B26).
+- DPAPI: **`Encrypt-DpapiForRdpMonitor.ps1`** (значения в **`login_monitor.settings.ps1`**)
+- Внутренний git (git.kalinamall.ru): доверенный; секреты допустимы в **`login_monitor.settings.example.ps1`**
 
 ## UNC и ExecutionPolicy
 
