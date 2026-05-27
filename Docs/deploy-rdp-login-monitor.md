@@ -15,9 +15,10 @@
 | Файл | Назначение |
 |------|------------|
 | `Login_Monitor.ps1` | Основной скрипт (логика мониторинга; без локальных секретов). |
-| `login_monitor.settings.example.ps1` | Образец настроек на шаре (Telegram, SMTP, 4740). |
+| `Sac-Client.ps1` | Клиент Security Alert Center (обязателен для SAC, копируется рядом с монитором). |
+| `login_monitor.settings.example.ps1` | Образец настроек на шаре (Telegram, SAC, SMTP, 4740). |
 | `version.txt` | **Одна строка** — номер версии пакета на шаре (см. раздел «Версии» ниже). |
-| `Deploy-LoginMonitor.ps1` | Установщик: сравнивает версию, копирует монитор, вызывает `-InstallTasks`, при необходимости запускает процесс монитора. |
+| `Deploy-LoginMonitor.ps1` | Установщик: сравнивает версию, копирует монитор и Sac-Client, вызывает `-InstallTasks`, при необходимости запускает процесс монитора. |
 
 Полный список файлов для публикации на шару — в [deploy-netlogon-publish.md](deploy-netlogon-publish.md).
 
@@ -31,7 +32,7 @@
 
 3. Версия на шаре **совпадает** с локальной — выход без копирования.
 
-4. Версия на шаре **новее** — остановка процессов монитора → копирование **`Login_Monitor.ps1`** → **`Login_Monitor.ps1 -InstallTasks`** → **`deployed_version.txt`** → запуск монитора (если не **`-SkipStartMonitorAfterUpdate`**).
+4. Версия на шаре **новее** — остановка процессов монитора → копирование **`Login_Monitor.ps1`** и **`Sac-Client.ps1`** → **`Login_Monitor.ps1 -InstallTasks`** → **`deployed_version.txt`** → запуск монитора (если не **`-SkipStartMonitorAfterUpdate`**).
 
 5. Версия на шаре **старее** — откат блокируется, пока не указан **`-AllowDowngrade`**.
 
@@ -111,6 +112,82 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "\\B26\NETLOGON\RDP-logi
 ```
 
 Параметры: **`-WhatIf`**, **`-SkipStartMonitorAfterUpdate`**, **`-AllowDowngrade`**.
+
+## Обновление на любой Windows-машине (чеклист)
+
+Цель: новые **`Login_Monitor.ps1`**, **`Sac-Client.ps1`**, при необходимости настройки SAC — без ручного копирования с рабочей станции.
+
+### A. Один раз: публикация на шару (сервер, где есть git)
+
+1. На DC3 (или другом хосте публикации):
+   ```powershell
+   powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\soft\update-rdp-monitor.ps1
+   ```
+   Скрипт делает `git pull` с **git.kalinamall.ru** и копирует файлы в `\\b26\NETLOGON\RDP-login-monitor\`.
+
+2. Убедитесь, что на шаре есть **`Sac-Client.ps1`** и в **`version.txt`** — новая версия (например `1.2.0-SAC`).
+
+### B. На каждой целевой машине (автоматически)
+
+Если настроена GPO / задача с **`Deploy-LoginMonitor.ps1`** — достаточно дождаться запуска Deploy (при старте ОС, по расписанию или после `gpupdate /force` + перезагрузки).
+
+Deploy **сам**:
+- сравнит `version.txt` на шаре с `C:\ProgramData\RDP-login-monitor\deployed_version.txt`;
+- скопирует **`Login_Monitor.ps1`** и **`Sac-Client.ps1`**;
+- перерегистрирует задачи (`-InstallTasks`);
+- **не трогает** `login_monitor.settings.ps1`.
+
+### C. Ручное обновление одной машины (без GPO)
+
+От **администратора** PowerShell:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File "\\b26\NETLOGON\RDP-login-monitor\Deploy-LoginMonitor.ps1"
+```
+
+Проверка:
+
+```powershell
+Select-String -Path 'C:\ProgramData\RDP-login-monitor\Login_Monitor.ps1' -Pattern 'ScriptVersion'
+Test-Path 'C:\ProgramData\RDP-login-monitor\Sac-Client.ps1'
+Get-ScheduledTask -TaskName 'RDP-Login-Monitor','RDP-Login-Monitor-Watchdog' -ErrorAction SilentlyContinue
+Get-Content 'C:\ProgramData\RDP-login-monitor\Logs\deploy.log' -Tail 15
+```
+
+### D. Первичная установка (ещё нет ProgramData)
+
+1. Deploy (как в C) — создаст каталог и при отсутствии settings скопирует **`login_monitor.settings.ps1`** из example.
+2. Отредактируйте **`C:\ProgramData\RDP-login-monitor\login_monitor.settings.ps1`** (SAC, при необходимости 4740).
+3. Проверка SAC:
+   ```powershell
+   powershell.exe -NoProfile -ExecutionPolicy Bypass `
+     -File 'C:\ProgramData\RDP-login-monitor\Login_Monitor.ps1' -CheckSac
+   ```
+
+## Security Alert Center (SAC)
+
+В **`login_monitor.settings.ps1`** на машине (не перезаписывается Deploy):
+
+```powershell
+$UseSAC = 'dual'          # off | exclusive | dual | fallback
+$SacUrl = 'https://sac.kalinamall.ru'
+$SacApiKey = 'sac_...'     # ключ из SAC
+```
+
+Режимы:
+- **`dual`** — SAC + Telegram (рекомендуется на переходе);
+- **`exclusive`** — только SAC;
+- **`fallback`** — SAC, при сбоях — Telegram.
+
+После правок settings перезапуск не обязателен: watchdog поднимет процесс; для проверки:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File 'C:\ProgramData\RDP-login-monitor\Login_Monitor.ps1' -CheckSac
+```
+
+В SAC UI: **Отчёты** / **События** — события `rdp.login.*`, `report.daily.rdp`, `agent.heartbeat`.
 
 ### Диагностика
 

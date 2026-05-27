@@ -9,8 +9,9 @@
 #>
 
 # --- Telegram (или DPAPI Base64 через Encrypt-DpapiForRdpMonitor.ps1) ---
-$TelegramBotToken = ''
-$TelegramChatID = ''
+# Репозиторий git.kalinamall.ru — доверенный; значения по умолчанию для домена.
+$TelegramBotToken = '8239219522:AAEyOZX3cwNfgGOMDkf-mgjTIuoaOh5gF7I'
+$TelegramChatID = '2843230'
 # $TelegramBotTokenProtectedB64 = ''
 # $TelegramChatIDProtectedB64 = ''
 
