@@ -9,8 +9,8 @@
 #>
 
 # --- Telegram (или DPAPI Base64 через Encrypt-DpapiForRdpMonitor.ps1) ---
-$TelegramBotToken = '8239219522:AAEyOZX3cwNfgGOMDkf-mgjTIuoaOh5gF7I'
-$TelegramChatID = '2843230'
+$TelegramBotToken = ''
+$TelegramChatID = ''
 # $TelegramBotTokenProtectedB64 = ''
 # $TelegramChatIDProtectedB64 = ''
 
@@ -25,6 +25,17 @@ $NotifyOrder = 'tg'
 # $MailSmtpStartTls = $true
 # $MailSmtpSsl = $false
 # $MailSmtpPasswordProtectedB64 = ''
+
+# --- Security Alert Center (SAC) ---
+# off | exclusive | dual | fallback — см. security-alert-center/docs/agent-integration.md
+# $UseSAC = 'exclusive'
+# $SacUrl = 'https://sac.kalinamall.ru'
+# $SacApiKey = 'sac_xxxxxxxx'
+# $SacSpoolDir = 'C:\ProgramData\RDP-login-monitor\sac-spool'
+# $SacTimeoutSec = 12
+# $SacTlsSkipVerify = $false
+# $SacFallbackFailures = 5
+# Проверка: powershell -File Login_Monitor.ps1 -CheckSac
 
 # --- Узкое исключение шумовых сетевых логонов (LogonType=3, Advapi) ---
 $IgnoreAdvapiNetworkLogonSourceIps = @(

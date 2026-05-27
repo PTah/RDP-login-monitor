@@ -238,6 +238,15 @@ try {
     Copy-Item -LiteralPath $sourceScript -Destination $LocalScript -Force
     Write-DeployLog "Файл скопирован: $LocalScript"
 
+    $sourceSac = Join-Path $shareRoot 'Sac-Client.ps1'
+    $localSac = Join-Path $InstallRoot 'Sac-Client.ps1'
+    if (Test-Path -LiteralPath $sourceSac) {
+        Copy-Item -LiteralPath $sourceSac -Destination $localSac -Force
+        Write-DeployLog "Файл скопирован: $localSac"
+    } else {
+        Write-DeployLog "Предупреждение: на шаре нет Sac-Client.ps1 — SAC будет недоступен до следующего деплоя."
+    }
+
     $installArgs = @(
         '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $LocalScript, '-InstallTasks'
     )

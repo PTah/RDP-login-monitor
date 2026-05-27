@@ -15,6 +15,7 @@
 ## Копируемые файлы
 
 - `Login_Monitor.ps1`
+- `Sac-Client.ps1`
 - `version.txt`
 - `Deploy-LoginMonitor.ps1`
 - `Exchange-MailSecurity.ps1`

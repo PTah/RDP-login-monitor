@@ -35,7 +35,8 @@ param(
     [string]$MailSmtpPasswordProtectedB64 = '',
     [switch]$Watchdog,
     [switch]$InstallTasks,
-    [switch]$SkipScheduledTaskMaintenance
+    [switch]$SkipScheduledTaskMaintenance,
+    [switch]$CheckSac
 )
 
 Set-StrictMode -Version Latest
@@ -74,7 +75,7 @@ $script:MonitorSingletonLockStream = $null
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.5.11"
+$ScriptVersion = "1.2.0-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -184,6 +185,16 @@ $MailFrom = ''
 $MailTo = ''
 $MailSmtpStartTls = $true
 $MailSmtpSsl = $false
+
+# Security Alert Center (см. security-alert-center/docs/agent-integration.md)
+$UseSAC = 'off'
+$SacUrl = ''
+$SacApiKey = ''
+$SacSpoolDir = ''
+$SacAgentIdFile = ''
+$SacTimeoutSec = 12
+$SacTlsSkipVerify = $false
+$SacFallbackFailures = 5
 
 $script:LoginMonitorSettingsFile = Join-Path $script:InstallRoot 'login_monitor.settings.ps1'
 $script:LoginMonitorSettingsLoaded = $false
@@ -764,11 +775,51 @@ function Test-MailSmtpConnection {
     return $true
 }
 
+$script:SacClientLoaded = $false
+foreach ($sacPath in @(
+        (Join-Path $PSScriptRoot 'Sac-Client.ps1'),
+        (Join-Path $script:InstallRoot 'Sac-Client.ps1')
+    )) {
+    if (Test-Path -LiteralPath $sacPath) {
+        . $sacPath
+        $script:SacClientLoaded = $true
+        break
+    }
+}
+
+function Get-PlainSummaryFromTelegramHtml {
+    param([string]$Message)
+    $plain = ($Message -replace '<[^>]+>', ' ' -replace '\s+', ' ').Trim()
+    if ($plain.Length -gt 500) { $plain = $plain.Substring(0, 500) }
+    return $plain
+}
+
 function Send-MonitorNotification {
     param(
         [string]$Message,
-        [string]$EmailSubject = "RDP Login Monitor"
+        [string]$EmailSubject = "RDP Login Monitor",
+        [string]$SacEventType = '',
+        [string]$SacSeverity = 'info',
+        [string]$SacTitle = '',
+        [string]$SacSummary = '',
+        [hashtable]$SacDetails = $null
     )
+
+    $title = if (-not [string]::IsNullOrWhiteSpace($SacTitle)) { $SacTitle } else { $EmailSubject }
+    $summary = if (-not [string]::IsNullOrWhiteSpace($SacSummary)) {
+        $SacSummary
+    } else {
+        Get-PlainSummaryFromTelegramHtml -Message $Message
+    }
+    $etype = if (-not [string]::IsNullOrWhiteSpace($SacEventType)) { $SacEventType } else { 'agent.notification' }
+
+    if ($script:SacClientLoaded -and (Get-Command Send-NotifyOrSac -ErrorAction SilentlyContinue)) {
+        $sacMode = Get-SacNormalizedMode
+        if ($sacMode -ne 'off') {
+            return Send-NotifyOrSac -EventType $etype -Severity $SacSeverity -Title $title -Summary $summary `
+                -TelegramMessage $Message -EmailSubject $EmailSubject -Details $SacDetails
+        }
+    }
 
     $channels = @(Get-NotifyOrderChannels)
     if ($channels.Count -eq 0) {
@@ -803,6 +854,15 @@ if ($script:LoginMonitorSettingsLoaded) {
     Write-Log "Настройки: login_monitor.settings.ps1 загружен."
 } else {
     Write-Log "Предупреждение: login_monitor.settings.ps1 не найден — Telegram/SMTP/4740 не настроены (скопируйте login_monitor.settings.example.ps1)."
+}
+
+if ($CheckSac) {
+    if (-not $script:SacClientLoaded) {
+        Write-Log "ОШИБКА: Sac-Client.ps1 не найден рядом с Login_Monitor.ps1"
+        exit 1
+    }
+    $code = Test-SacConnection
+    exit $code
 }
 
 Invoke-RdpMonitorProcessMigrationAndRelaunch
@@ -1219,11 +1279,22 @@ function Send-Heartbeat {
                 $message += " IP из IIS не заданы (<code>ExchangeIisLogPath</code> пуст)."
             }
         }
-        Send-MonitorNotification -Message $message -EmailSubject "RDP Login Monitor: запуск" | Out-Null
+        Send-MonitorNotification -Message $message -EmailSubject "RDP Login Monitor: запуск" `
+            -SacEventType 'agent.lifecycle' -SacSeverity 'info' `
+            -SacTitle 'RDP login monitor started' `
+            -SacSummary "Мониторинг запущен на $env:COMPUTERNAME, версия $ScriptVersion" `
+            -SacDetails @{ lifecycle = 'started' } | Out-Null
         Write-Log "Отправлено уведомление о запуске скрипта (каналы: $notifyChain)"
     } else {
         Write-TextFileUtf8Bom -Path $HeartbeatFile -Text $timestamp
         $script:HeartbeatStaleAlertActive = $false
+        if ($script:SacClientLoaded -and (Get-SacNormalizedMode) -ne 'off') {
+            Send-MonitorNotification -Message '' -EmailSubject 'RDP Login Monitor: heartbeat' `
+                -SacEventType 'agent.heartbeat' -SacSeverity 'info' `
+                -SacTitle 'RDP monitor heartbeat' `
+                -SacSummary "Heartbeat $env:COMPUTERNAME $timestamp" `
+                -SacDetails @{ host = $env:COMPUTERNAME } | Out-Null
+        }
     }
 }
 
@@ -1269,7 +1340,10 @@ function Test-AndSendHeartbeatStaleAlert {
     $msg += "📄 Последний heartbeat: $hLast`r`n"
     $msg += "<i>Проверьте процесс Login_Monitor.ps1 и задачи планировщика RDP-Login-Monitor / Watchdog.</i>"
 
-    if (Send-MonitorNotification -Message $msg -EmailSubject 'RDP Login Monitor: нет heartbeat') {
+    if (Send-MonitorNotification -Message $msg -EmailSubject 'RDP Login Monitor: нет heartbeat' `
+            -SacEventType 'agent.health' -SacSeverity 'warning' `
+            -SacTitle 'RDP monitor heartbeat stale' `
+            -SacSummary "Heartbeat не обновлялся на $env:COMPUTERNAME") {
         $script:HeartbeatStaleAlertActive = $true
         Write-Log "Отправлено оповещение: heartbeat не обновлялся дольше $thresholdSec с"
     }
@@ -1286,7 +1360,11 @@ function Send-StopNotification {
     $message += "🕐 Время остановки: $timestamp`r`n"
     $message += "📋 Причина: $hReason"
 
-    Send-MonitorNotification -Message $message -EmailSubject "RDP Login Monitor: остановка" | Out-Null
+    Send-MonitorNotification -Message $message -EmailSubject "RDP Login Monitor: остановка" `
+        -SacEventType 'agent.lifecycle' -SacSeverity 'info' `
+        -SacTitle 'RDP login monitor stopped' `
+        -SacSummary "Мониторинг остановлен: $Reason" `
+        -SacDetails @{ lifecycle = 'stopped'; reason = $Reason } | Out-Null
     Write-Log "Уведомление об остановке отправлено: $Reason"
 }
 
@@ -2181,7 +2259,20 @@ function Send-DailyReport {
         } else {
             $message += "`r`n<i>Список пользователей недоступен (quser пуст или недостаточно прав).</i>"
         }
-        Send-MonitorNotification -Message $message -EmailSubject "RDP Login Monitor: ежедневный отчёт" | Out-Null
+        $rdpReportDetails = @{
+            stats           = @{
+                active_sessions_rdp = $count
+                unique_users        = @($uniqueUsers)
+            }
+            report_body     = (Get-PlainSummaryFromTelegramHtml -Message $message)
+            report_html     = "<div class=""agent-report"">$message</div>"
+            report_format   = 'telegram_html'
+        }
+        Send-MonitorNotification -Message $message -EmailSubject "RDP Login Monitor: ежедневный отчёт" `
+            -SacEventType 'report.daily.rdp' -SacSeverity 'info' `
+            -SacTitle 'RDP daily report' `
+            -SacSummary "RDP 24ч: сессий $count, логинов $($uniqueUsers.Count)" `
+            -SacDetails $rdpReportDetails | Out-Null
         Write-TextFileUtf8Bom -Path $LastReportFile -Text ((Get-Date).ToString("yyyy-MM-dd HH:mm:ss"))
         Write-Log "Ежедневный отчет отправлен"
         return $true
@@ -2483,7 +2574,17 @@ function Start-LoginMonitor {
 
                                 Write-Log "Notify: ID=4625 User=$($eventInfo.Username) LT=$($eventInfo.LogonType) IP=$($eventInfo.SourceIP) (tier1=$($rl.UserIpCount) tier2=$($rl.IpCount))"
                                 Send-MonitorNotification -Message $formattedMessage `
-                                    -EmailSubject "RDP Login Monitor: неудачный вход (4625)" | Out-Null
+                                    -EmailSubject "RDP Login Monitor: неудачный вход (4625)" `
+                                    -SacEventType 'rdp.login.failed' -SacSeverity 'warning' `
+                                    -SacTitle 'RDP login failed' `
+                                    -SacSummary "4625 $($eventInfo.Username) from $($eventInfo.SourceIP)" `
+                                    -SacDetails @{
+                                        user = $eventInfo.Username
+                                        ip_address = $eventInfo.SourceIP
+                                        logon_type = $eventInfo.LogonType
+                                        event_id_windows = 4625
+                                        workstation_name = $eventInfo.ComputerName
+                                    } | Out-Null
                             } else {
                                 Write-Log "Notify suppressed 4625: User=$($eventInfo.Username) IP=$($eventInfo.SourceIP) tier1=$($rl.UserIpCount)/$FailedLogonRateLimitUserIpThreshold tier2=$($rl.IpCount)/$FailedLogonRateLimitIpThreshold"
                             }
@@ -2492,7 +2593,11 @@ function Start-LoginMonitor {
                                 $tierLabel = if ($burst.Tier -eq 'UserIp') { 'IP+user' } else { 'IP' }
                                 Write-Log "Notify burst 4625 ($tierLabel): count=$($burst.Count) key=$($burst.BucketKey)"
                                 Send-MonitorNotification -Message $burst.Message `
-                                    -EmailSubject "RDP Login Monitor: брутфорс 4625 ($tierLabel)" | Out-Null
+                                    -EmailSubject "RDP Login Monitor: брутфорс 4625 ($tierLabel)" `
+                                    -SacEventType 'rdp.bruteforce.burst' -SacSeverity 'high' `
+                                    -SacTitle "RDP bruteforce burst ($tierLabel)" `
+                                    -SacSummary "4625 burst tier=$tierLabel count=$($burst.Count)" `
+                                    -SacDetails @{ tier = $tierLabel; count = $burst.Count; bucket_key = $burst.BucketKey } | Out-Null
                             }
                         } else {
                             $formattedMessage = Format-LoginEvent -EventID $event.Id `
@@ -2506,8 +2611,19 @@ function Start-LoginMonitor {
                                 -SecurityLogComputerName $event.MachineName
 
                             Write-Log "Notify: ID=$($event.Id) User=$($eventInfo.Username) LT=$($eventInfo.LogonType) IP=$($eventInfo.SourceIP)"
+                            $sacType = if ($event.Id -eq 4624) { 'rdp.login.success' } else { 'agent.notification' }
                             Send-MonitorNotification -Message $formattedMessage `
-                                -EmailSubject "RDP Login Monitor: вход (ID $($event.Id))" | Out-Null
+                                -EmailSubject "RDP Login Monitor: вход (ID $($event.Id))" `
+                                -SacEventType $sacType -SacSeverity 'info' `
+                                -SacTitle "RDP login event $($event.Id)" `
+                                -SacSummary "Event $($event.Id) $($eventInfo.Username) from $($eventInfo.SourceIP)" `
+                                -SacDetails @{
+                                    user = $eventInfo.Username
+                                    ip_address = $eventInfo.SourceIP
+                                    logon_type = $eventInfo.LogonType
+                                    event_id_windows = [int]$event.Id
+                                    workstation_name = $eventInfo.ComputerName
+                                } | Out-Null
                         }
                     }
                 }
@@ -2534,8 +2650,19 @@ function Start-LoginMonitor {
                             -ErrorCode $ei.ErrorCode `
                             -TimeCreated $ei.TimeCreated
                         Write-Log "Notify RDG: ID=$($event.Id) User=$($ei.Username)"
+                        $rdgType = if ($event.Id -eq 302) { 'rdg.connection.success' } else { 'rdg.connection.failed' }
+                        $rdgSev = if ($event.Id -eq 302) { 'info' } else { 'warning' }
                         Send-MonitorNotification -Message $msg `
-                            -EmailSubject "RDP Login Monitor: RD Gateway ($($event.Id))" | Out-Null
+                            -EmailSubject "RDP Login Monitor: RD Gateway ($($event.Id))" `
+                            -SacEventType $rdgType -SacSeverity $rdgSev `
+                            -SacTitle "RD Gateway event $($event.Id)" `
+                            -SacSummary "RDG $($event.Id) $($ei.Username)" `
+                            -SacDetails @{
+                                user = $ei.Username
+                                external_ip = $ei.ExternalIP
+                                internal_ip = $ei.InternalIP
+                                event_id_windows = [int]$event.Id
+                            } | Out-Null
                     }
                     $lastGatewayCheckTime = ($gatewayEvents | Measure-Object -Property TimeCreated -Maximum | Select-Object -ExpandProperty Maximum).AddSeconds(1)
                 }
@@ -2560,7 +2687,15 @@ function Start-LoginMonitor {
                             -TimeCreated $rcmInfo.TimeCreated -SecurityLogComputerName $event.MachineName
                         Write-Log "Notify RCM 1149: User=$($rcmInfo.Username) IP=$($rcmInfo.ClientIP)"
                         Send-MonitorNotification -Message $msg `
-                            -EmailSubject "RDP Login Monitor: RDP 1149" | Out-Null
+                            -EmailSubject "RDP Login Monitor: RDP 1149" `
+                            -SacEventType 'rdp.login.success' -SacSeverity 'info' `
+                            -SacTitle 'RDP connection (RCM 1149)' `
+                            -SacSummary "RCM 1149 $($rcmInfo.Username) $($rcmInfo.ClientIP)" `
+                            -SacDetails @{
+                                user = $rcmInfo.Username
+                                ip_address = $rcmInfo.ClientIP
+                                event_id_windows = 1149
+                            } | Out-Null
                     }
                     $lastRcmCheckTime = ($rcmEvents | Measure-Object -Property TimeCreated -Maximum | Select-Object -ExpandProperty Maximum).AddSeconds(1)
                 }
@@ -2592,7 +2727,16 @@ function Start-LoginMonitor {
                             -TimeCreated $lo.TimeCreated -IisClientIps $iisIps
                         Write-Log "Notify 4740: User=$($lo.Username) IIS_IPs=$($iisIps -join ', ')"
                         Send-MonitorNotification -Message $msg `
-                            -EmailSubject "RDP Login Monitor: блокировка УЗ $($lo.Username)" | Out-Null
+                            -EmailSubject "RDP Login Monitor: блокировка УЗ $($lo.Username)" `
+                            -SacEventType 'auth.account.locked' -SacSeverity 'high' `
+                            -SacTitle "Account locked $($lo.Username)" `
+                            -SacSummary "4740 $($lo.Username)" `
+                            -SacDetails @{
+                                user = $lo.Username
+                                domain = $lo.Domain
+                                event_id_windows = 4740
+                                iis_client_ips = @($iisIps)
+                            } | Out-Null
                     }
                     $lastLockout4740CheckTime = ($lockoutEvents | Measure-Object -Property TimeCreated -Maximum | Select-Object -ExpandProperty Maximum).AddSeconds(1)
                 }
@@ -2609,6 +2753,9 @@ function Start-LoginMonitor {
             if ($now -ge $nextReportCheck) {
                 $nextReportCheck = Check-AndSendDailyReport
             }
+            if ($script:SacClientLoaded) {
+                Invoke-SacFlushSpool -MaxFiles 5 | Out-Null
+            }
         } catch {
             if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
             Write-Log "Ошибка цикла мониторинга: $($_.Exception.Message)"
@@ -2619,10 +2766,24 @@ function Start-LoginMonitor {
 
 $script:StopNotificationSent = $false
 try {
+    $sacMode = 'off'
+    if ($script:SacClientLoaded) { $sacMode = Get-SacNormalizedMode }
+    if ($sacMode -ne 'off') {
+        if (-not (Test-SacConfigured)) {
+            Write-Log "ОШИБКА: UseSAC=$sacMode, но SacUrl/SacApiKey не заданы в login_monitor.settings.ps1"
+            exit 1
+        }
+        if (-not (Test-SacHealth)) {
+            Write-Log "ОШИБКА: SAC /health недоступен (SacUrl=$SacUrl)"
+            exit 1
+        }
+        Write-Log "SAC: режим $sacMode, health OK, ingest=$(Get-SacIngestUrl)"
+    }
+
     $notifyChannels = @(Get-NotifyOrderChannels)
-    if ($notifyChannels.Count -eq 0) {
+    if ($notifyChannels.Count -eq 0 -and $sacMode -eq 'off') {
         Write-Log "ВНИМАНИЕ: не настроен ни один канал оповещений (Telegram и/или SMTP в конфигурации скрипта)."
-    } else {
+    } elseif ($notifyChannels.Count -gt 0) {
         foreach ($notifyCh in $notifyChannels) {
             switch ($notifyCh) {
                 'telegram' { Test-TelegramConnection | Out-Null }
