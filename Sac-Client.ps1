@@ -225,7 +225,7 @@ function Invoke-SacPostPayload {
             'Idempotency-Key' = $eventId
         }
         $resp = Invoke-WebRequest -Uri $ingest -Method Post -Headers $headers -Body $JsonBody -UseBasicParsing -TimeoutSec $timeout
-        if ($resp.StatusCode -eq 202) {
+        if ($resp.StatusCode -in 201, 409, 202) {
             Remove-SacSpoolFile -EventId $eventId
             Reset-SacFailCount
             Write-SacLog "SAC: accepted event_id=$eventId type=$eventType"
@@ -393,7 +393,7 @@ function Test-SacConnection {
         return 1
     }
     if (Send-SacEvent -EventType 'agent.test' -Severity 'info' -Title 'SAC test' -Summary 'rdp-login-monitor CheckSac') {
-        Write-Host 'SAC ingest agent.test: OK (expected HTTP 202)'
+        Write-Host 'SAC ingest agent.test: OK (expected HTTP 201)'
         return 0
     }
     Write-Error 'SAC ingest agent.test: FAIL'
