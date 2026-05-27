@@ -3,9 +3,9 @@
     Локальные настройки Login_Monitor.ps1
 .DESCRIPTION
     Скопируйте в C:\ProgramData\RDP-login-monitor\login_monitor.settings.ps1
-    и при необходимости отредактируйте. Файл login_monitor.settings.ps1 не перезаписывается
-    при автообновлении Login_Monitor.ps1 с шары (Deploy-LoginMonitor.ps1).
-    При первой установке Deploy может создать login_monitor.settings.ps1 из этого example автоматически.
+    и при необходимости отредактируйте. Deploy-LoginMonitor.ps1 не перезаписывает settings,
+    если SAC уже настроен (UseSAC не off и задан SacApiKey). При первой установке или апгрейде
+    с версии без SAC (нет Sac-Client.ps1 / пустой ключ) example копируется поверх с резервной .bak.
 #>
 
 # --- Telegram (или DPAPI Base64 через Encrypt-DpapiForRdpMonitor.ps1) ---

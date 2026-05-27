@@ -184,6 +184,70 @@ function Set-RdpMonitorRestartRequestFromDeploy {
     [System.IO.File]::WriteAllText($restartFile, $content + "`r`n", $Utf8Bom)
 }
 
+function Get-RdpMonitorSettingsRaw {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    try {
+        return Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+    } catch {
+        return $null
+    }
+}
+
+function Test-RdpMonitorSettingsNeedsSacBootstrap {
+    param(
+        [string]$SettingsPath,
+        [string]$SacClientPath
+    )
+    if (-not (Test-Path -LiteralPath $SacClientPath)) { return $true }
+
+    $c = Get-RdpMonitorSettingsRaw -Path $SettingsPath
+    if ([string]::IsNullOrWhiteSpace($c)) { return $true }
+
+    if ($c -notmatch '(?m)^\s*\$UseSAC\s*=') { return $true }
+    if ($c -match '(?m)^\s*\$UseSAC\s*=\s*[''"]off[''"]') {
+        if ($c -notmatch '(?m)^\s*\$SacApiKey\s*=\s*[''"]sac_[^''"]+[''"]') { return $true }
+    }
+    if ($c -match '(?m)^\s*\$SacApiKey\s*=\s*[''"]\s*[''"]') { return $true }
+    if ($c -notmatch '(?m)^\s*\$SacApiKey\s*=\s*[''"]sac_[^''"]+[''"]') { return $true }
+
+    return $false
+}
+
+function Sync-RdpMonitorSettingsFromShare {
+    param(
+        [string]$ExampleOnShare,
+        [string]$LocalSettings
+    )
+    if (-not (Test-Path -LiteralPath $ExampleOnShare)) {
+        Write-DeployLog "Предупреждение: на шаре нет login_monitor.settings.example.ps1 — настройки SAC/Telegram не применены."
+        return
+    }
+
+    $localSac = Join-Path $InstallRoot 'Sac-Client.ps1'
+    $needsCreate = -not (Test-Path -LiteralPath $LocalSettings)
+    $needsBootstrap = $needsCreate -or (Test-RdpMonitorSettingsNeedsSacBootstrap -SettingsPath $LocalSettings -SacClientPath $localSac)
+
+    if (-not $needsBootstrap) {
+        Write-DeployLog "login_monitor.settings.ps1: SAC уже настроен, файл не перезаписываем."
+        return
+    }
+
+    if (-not (Test-Path -LiteralPath $InstallRoot)) {
+        New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
+    }
+
+    if ($needsCreate) {
+        Write-DeployLog "Создан login_monitor.settings.ps1 из example (Telegram + SAC dual)."
+    } else {
+        $bak = "$LocalSettings.bak.$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+        Copy-Item -LiteralPath $LocalSettings -Destination $bak -Force
+        Write-DeployLog "Апгрейд с версии без SAC: резервная копия $bak, применяем example с шары."
+    }
+
+    Copy-Item -LiteralPath $ExampleOnShare -Destination $LocalSettings -Force
+}
+
 function Stop-RdpLoginMonitorMainProcesses {
     param([int]$GracefulWaitSec = 35)
 
@@ -234,13 +298,6 @@ try {
 
     $settingsLocal = Join-Path $InstallRoot 'login_monitor.settings.ps1'
     $settingsExampleShare = Join-Path $shareRoot 'login_monitor.settings.example.ps1'
-    if (-not (Test-Path -LiteralPath $settingsLocal) -and (Test-Path -LiteralPath $settingsExampleShare)) {
-        if (-not (Test-Path -LiteralPath $InstallRoot)) {
-            New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
-        }
-        Copy-Item -LiteralPath $settingsExampleShare -Destination $settingsLocal -Force
-        Write-DeployLog "Создан login_monitor.settings.ps1 из example (при следующих обновлениях не перезаписывается)."
-    }
 
     if (-not (Test-Path -LiteralPath $sourceScript)) {
         Write-DeployLog "ОШИБКА: на шаре нет файла: $sourceScript"
@@ -260,11 +317,19 @@ try {
     $localVerRaw = Get-LocalDeployedVersion
     Write-DeployLog "Версия на шаре: $shareVerRaw; локально установлено: $(if ($localVerRaw) { $localVerRaw } else { '(нет)' })."
 
+    $localSacPath = Join-Path $InstallRoot 'Sac-Client.ps1'
+    $sourceSacOnShare = Join-Path $shareRoot 'Sac-Client.ps1'
+    $needsSacBootstrap = (Test-RdpMonitorSettingsNeedsSacBootstrap -SettingsPath $settingsLocal -SacClientPath $localSacPath) `
+        -or ((-not (Test-Path -LiteralPath $localSacPath)) -and (Test-Path -LiteralPath $sourceSacOnShare))
+
     $cmp = Compare-VersionStrings -Left $shareVerRaw -Right $localVerRaw
     if ($null -ne $cmp) {
         if ($cmp -eq 0) {
-            Write-DeployLog "Актуально, копирование не требуется."
-            exit 0
+            if (-not $needsSacBootstrap) {
+                Write-DeployLog "Актуально, копирование не требуется."
+                exit 0
+            }
+            Write-DeployLog "Версия совпадает ($shareVerRaw), но нужна донастройка SAC — продолжаем деплой."
         }
         if ($cmp -lt 0 -and -not $AllowDowngrade) {
             Write-DeployLog "На шаре версия старше локальной — пропуск (используйте -AllowDowngrade для отката)."
@@ -281,6 +346,9 @@ try {
     }
 
     if ($WhatIf) {
+        if ($needsSacBootstrap) {
+            Write-DeployLog "[WhatIf] Применить login_monitor.settings.ps1 из example (SAC/Telegram)."
+        }
         Write-DeployLog "[WhatIf] Скопировать $sourceScript -> $LocalScript; InstallTasks; версия $shareVerRaw"
         exit 0
     }
@@ -303,6 +371,8 @@ try {
     } else {
         Write-DeployLog "Предупреждение: на шаре нет Sac-Client.ps1 — SAC будет недоступен до следующего деплоя."
     }
+
+    Sync-RdpMonitorSettingsFromShare -ExampleOnShare $settingsExampleShare -LocalSettings $settingsLocal
 
     $installArgs = @(
         '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $LocalScript, '-InstallTasks'
