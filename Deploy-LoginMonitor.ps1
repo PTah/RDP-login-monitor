@@ -165,8 +165,27 @@ function Test-RdpMonitorMainProcessRunning {
     return $false
 }
 
+function Set-RdpMonitorRestartRequestFromDeploy {
+    param(
+        [ValidateSet('settings', 'recycle')]
+        [string]$Mode = 'recycle',
+        [string]$Reason = 'deploy'
+    )
+
+    if (-not (Test-Path -LiteralPath $InstallRoot)) {
+        New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
+    }
+    $restartFile = Join-Path $InstallRoot 'restart.request'
+    $content = @(
+        "mode=$Mode"
+        "reason=$Reason"
+        "requested_at=$((Get-Date).ToString('o'))"
+    ) -join "`r`n"
+    [System.IO.File]::WriteAllText($restartFile, $content + "`r`n", $Utf8Bom)
+}
+
 function Stop-RdpLoginMonitorMainProcesses {
-    param([int]$GracefulWaitSec = 90)
+    param([int]$GracefulWaitSec = 35)
 
     $canonical = [System.IO.Path]::GetFullPath($LocalScript)
     if (-not (Test-RdpMonitorMainProcessRunning -CanonicalScript $canonical)) {
@@ -174,22 +193,16 @@ function Stop-RdpLoginMonitorMainProcesses {
         return
     }
 
-    if (Test-Path -LiteralPath $LocalScript) {
-        Write-DeployLog "Graceful recycle: Login_Monitor.ps1 -RequestRestart -Recycle (без Stop-Process)."
-        $recycleArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $LocalScript, '-RequestRestart', '-Recycle')
-        $p = Start-Process -FilePath $PsExe -ArgumentList $recycleArgs -Wait -PassThru -WindowStyle Hidden
-        if ($p.ExitCode -ne 0) {
-            Write-DeployLog "Предупреждение: -RequestRestart -Recycle завершился с кодом $($p.ExitCode)."
-        }
-    }
+    Write-DeployLog "Graceful recycle: запись restart.request (mode=recycle), без дочернего PowerShell."
+    Set-RdpMonitorRestartRequestFromDeploy -Mode 'recycle' -Reason 'deploy'
 
     $deadline = (Get-Date).AddSeconds($GracefulWaitSec)
     while ((Get-Date) -lt $deadline) {
         if (-not (Test-RdpMonitorMainProcessRunning -CanonicalScript $canonical)) {
-            Write-DeployLog "Монитор завершился gracefully (ожидание $($GracefulWaitSec) с)."
+            Write-DeployLog "Монитор завершился gracefully (до $($GracefulWaitSec) с)."
             return
         }
-        Start-Sleep -Seconds 2
+        Start-Sleep -Seconds 1
     }
 
     Write-DeployLog "Таймаут graceful recycle — принудительная остановка оставшихся процессов монитора."

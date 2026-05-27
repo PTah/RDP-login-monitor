@@ -173,7 +173,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass `
   -File "C:\ProgramData\RDP-login-monitor\Login_Monitor.ps1" -RequestRestart -Recycle
 ```
 
-**`Deploy-LoginMonitor.ps1`** при обновлении вызывает `-RequestRestart -Recycle` и ждёт до 90 с; **`Stop-Process -Force`** только если таймаут.
+**`Deploy-LoginMonitor.ps1`** записывает **`restart.request`** напрямую (без дочернего PowerShell) и ждёт до **35 с**; **`Stop-Process -Force`** только если таймаут.
 
 Сигнал: файл **`C:\ProgramData\RDP-login-monitor\restart.request`** (создаётся автоматически, не редактировать вручную).
 

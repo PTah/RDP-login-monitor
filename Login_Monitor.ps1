@@ -80,7 +80,7 @@ $script:MonitorLoopInitialized = $false
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.2.2-SAC"
+$ScriptVersion = "1.2.3-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -622,6 +622,14 @@ if ($InstallTasks) {
     exit 0
 }
 
+# Только запись restart.request — без проверки администратора (Deploy/GPO может вызывать из SYSTEM).
+if ($RequestRestart) {
+    $restartMode = if ($Recycle) { 'recycle' } else { 'settings' }
+    Set-RdpMonitorRestartRequest -Mode $restartMode -Reason 'RequestRestart'
+    Write-Log "Запрошен graceful restart (mode=$restartMode, файл restart.request). Активный монитор обработает запрос без Stop-Process."
+    exit 0
+}
+
 # --- Учётные данные Telegram (открытый текст или DPAPI Base64) ---
 if (-not [string]::IsNullOrWhiteSpace($TelegramBotTokenProtectedB64)) {
     try {
@@ -921,13 +929,6 @@ if ($CheckSac) {
     }
     $code = Test-SacConnection
     exit $code
-}
-
-if ($RequestRestart) {
-    $restartMode = if ($Recycle) { 'recycle' } else { 'settings' }
-    Set-RdpMonitorRestartRequest -Mode $restartMode -Reason 'RequestRestart'
-    Write-Log "Запрошен graceful restart (mode=$restartMode, файл restart.request). Активный монитор обработает запрос без Stop-Process."
-    exit 0
 }
 
 Invoke-RdpMonitorProcessMigrationAndRelaunch
