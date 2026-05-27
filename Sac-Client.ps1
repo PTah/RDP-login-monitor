@@ -4,6 +4,7 @@
 .DESCRIPTION
     Dot-source после login_monitor.settings.ps1 и функции Write-Log.
     Ожидает: $UseSAC, $SacUrl, $SacApiKey, $ScriptVersion, $script:InstallRoot.
+    Release: 1.2.7-SAC (ingest HTTP 201/409/202).
 #>
 
 function Write-SacLog {
