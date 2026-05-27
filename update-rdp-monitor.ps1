@@ -2,8 +2,8 @@
 .SYNOPSIS
     Obnovlyaet klon RDP-login-monitor s git.kalinamall.ru i kopiruet dist na NETLOGON.
 .DESCRIPTION
-    Dlya servera publikatsii (napr. DC3). Ne trebuet imenovaniya remote: pri otsutstvii
-    dobavlyaetsya origin ili vypolnyaetsya git pull po URL.
+    Dlya servera publikatsii (napr. DC3). Remote: git.kalinamall.ru (kalinamall).
+    Posle force-push: fetch + reset --hard, bez merge.
     Kopiruyutsya: polnyj spisok v Docs/deploy-netlogon-publish.md.
 .EXAMPLE
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\soft\update-rdp-monitor.ps1
@@ -87,30 +87,59 @@ function Ensure-GitRepository {
 
 function Get-ConfiguredGitRemoteName {
     $names = @(Invoke-GitCommand -Arguments @('remote') | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
-    if ($names.Count -gt 0) {
-        if ('origin' -in $names) { return 'origin' }
-        return $names[0]
+    if ($names.Count -eq 0) { return $null }
+    if ('kalinamall' -in $names) { return 'kalinamall' }
+    foreach ($n in $names) {
+        $url = (& git -C $RepoPath remote get-url $n 2>$null)
+        if ($url -match 'git\.kalinamall\.ru') { return $n }
     }
-    return $null
+    if ('origin' -in $names) { return 'origin' }
+    return $names[0]
 }
 
-function Ensure-GitOriginRemote {
+function Ensure-GitKalinamallRemote {
     $name = Get-ConfiguredGitRemoteName
     if ($null -ne $name) {
-        Write-UpdateLog "Using remote: $name"
-        return $name
+        $url = (& git -C $RepoPath remote get-url $name 2>$null)
+        if ($url -match 'git\.kalinamall\.ru') {
+            Write-UpdateLog "Using remote: $name ($url)"
+            return $name
+        }
+        Write-UpdateLog "Remote $name is not kalinamall ($url); adding kalinamall -> $GitUrl"
+    } else {
+        Write-UpdateLog "No remotes; adding kalinamall -> $GitUrl"
     }
-    Write-UpdateLog "No remotes; adding origin -> $GitUrl"
-    Invoke-GitCommand -Arguments @('remote', 'add', 'origin', $GitUrl)
-    return 'origin'
+    if ('kalinamall' -in @(& git -C $RepoPath remote 2>$null)) {
+        Invoke-GitCommand -Arguments @('remote', 'set-url', 'kalinamall', $GitUrl)
+        return 'kalinamall'
+    }
+    Invoke-GitCommand -Arguments @('remote', 'add', 'kalinamall', $GitUrl)
+    return 'kalinamall'
 }
 
 function Update-Repository {
     Ensure-GitRepository
-    $remote = Ensure-GitOriginRemote
-    Invoke-GitCommand -Arguments @('fetch', $remote, $GitBranch)
-    Invoke-GitCommand -Arguments @('pull', $remote, $GitBranch)
-    $null = Invoke-GitCommand -Arguments @('rev-parse', '--short', 'HEAD')
+    $remote = Ensure-GitKalinamallRemote
+    Invoke-GitCommand -Arguments @('fetch', '--prune', $remote, $GitBranch)
+    $upstream = "${remote}/${GitBranch}"
+    $dirty = Invoke-GitCommand -Arguments @('status', '--porcelain')
+    if (@($dirty).Count -gt 0) {
+        Write-UpdateLog "WARN: working tree has local changes; reset may discard them"
+    }
+    $mergeHead = Join-Path $RepoPath '.git\MERGE_HEAD'
+    if (Test-Path -LiteralPath $mergeHead) {
+        Write-UpdateLog "WARN: incomplete merge detected — aborting before sync"
+        Invoke-GitCommand -Arguments @('merge', '--abort')
+    }
+    try {
+        Invoke-GitCommand -Arguments @('pull', '--ff-only', $remote, $GitBranch)
+        Write-UpdateLog 'git: fast-forward OK'
+    } catch {
+        Write-UpdateLog "WARN: fast-forward failed ($($_.Exception.Message)) — reset --hard $upstream (typical after force-push)"
+        Invoke-GitCommand -Arguments @('reset', '--hard', $upstream)
+    }
+    $head = (Invoke-GitCommand -Arguments @('rev-parse', '--short', 'HEAD'))[-1]
+    Write-UpdateLog "HEAD: $head"
 }
 
 function Copy-FileToNetlogon {
