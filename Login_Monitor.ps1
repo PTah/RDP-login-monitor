@@ -36,7 +36,9 @@ param(
     [switch]$Watchdog,
     [switch]$InstallTasks,
     [switch]$SkipScheduledTaskMaintenance,
-    [switch]$CheckSac
+    [switch]$CheckSac,
+    [switch]$RequestRestart,
+    [switch]$Recycle
 )
 
 Set-StrictMode -Version Latest
@@ -69,13 +71,16 @@ $script:ScheduledTaskNameMain = "RDP-Login-Monitor"
 $script:ScheduledTaskNameWatchdog = "RDP-Login-Monitor-Watchdog"
 # Один экземпляр: эксклюзивная блокировка файла в InstallRoot (SYSTEM и интерактивный админ — одинаково; Global mutex давал «Отказано в доступе» между контекстами).
 $script:MonitorSingletonLockStream = $null
+$script:MonitorRestartRequestFile = Join-Path $script:InstallRoot 'restart.request'
+$script:MonitorRecycleRequested = $false
+$script:MonitorLoopInitialized = $false
 
 # Версия: пишется в лог и в Telegram. При доменном развёртывании через шару см. DEPLOY.md —
 # триггер обновления на клиентах даёт файл version.txt на шаре (его номер можно поднять и без смены
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.2.0-SAC"
+$ScriptVersion = "1.2.1-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -383,6 +388,59 @@ function Release-RdpMonitorSingletonLock {
 
 function Get-RdpMonitorPowerShellExe {
     return "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+}
+
+function Set-RdpMonitorRestartRequest {
+    param(
+        [ValidateSet('settings', 'recycle')]
+        [string]$Mode = 'settings',
+        [string]$Reason = 'manual'
+    )
+
+    if (-not (Test-Path -LiteralPath $script:InstallRoot)) {
+        New-Item -ItemType Directory -Path $script:InstallRoot -Force | Out-Null
+    }
+    $lines = @(
+        "mode=$Mode"
+        "reason=$Reason"
+        "requested_at=$((Get-Date).ToString('o'))"
+    )
+    Write-TextFileUtf8Bom -Path $script:MonitorRestartRequestFile -Text (($lines -join "`r`n") + "`r`n")
+}
+
+function Get-RdpMonitorRestartRequest {
+    if (-not (Test-Path -LiteralPath $script:MonitorRestartRequestFile)) {
+        return $null
+    }
+    $mode = 'settings'
+    $reason = ''
+    try {
+        foreach ($ln in (Get-Content -LiteralPath $script:MonitorRestartRequestFile -ErrorAction Stop)) {
+            if ($ln -match '^\s*mode\s*=\s*(.+)\s*$') { $mode = $Matches[1].Trim().ToLowerInvariant() }
+            if ($ln -match '^\s*reason\s*=\s*(.+)\s*$') { $reason = $Matches[1].Trim() }
+        }
+    } catch { }
+    try {
+        Remove-Item -LiteralPath $script:MonitorRestartRequestFile -Force -ErrorAction SilentlyContinue
+    } catch { }
+    if ($mode -ne 'recycle') { $mode = 'settings' }
+    return [pscustomobject]@{ Mode = $mode; Reason = $reason }
+}
+
+function Invoke-RdpMonitorReloadSettings {
+    if (-not (Test-Path -LiteralPath $script:LoginMonitorSettingsFile)) {
+        Write-Log "Graceful restart: login_monitor.settings.ps1 не найден, настройки не перечитаны."
+        return $false
+    }
+    try {
+        . $script:LoginMonitorSettingsFile
+        $script:LoginMonitorSettingsLoaded = $true
+        Write-Log "Graceful restart: login_monitor.settings.ps1 перечитан (каналы: $(Get-NotifyChainHuman))."
+        return $true
+    } catch {
+        Write-Log "Graceful restart: ошибка чтения settings: $($_.Exception.Message)"
+        return $false
+    }
 }
 
 function Test-RdpMonitorScheduledTaskMatches {
@@ -863,6 +921,13 @@ if ($CheckSac) {
     }
     $code = Test-SacConnection
     exit $code
+}
+
+if ($RequestRestart) {
+    $restartMode = if ($Recycle) { 'recycle' } else { 'settings' }
+    Set-RdpMonitorRestartRequest -Mode $restartMode -Reason 'RequestRestart'
+    Write-Log "Запрошен graceful restart (mode=$restartMode, файл restart.request). Активный монитор обработает запрос без Stop-Process."
+    exit 0
 }
 
 Invoke-RdpMonitorProcessMigrationAndRelaunch
@@ -2487,28 +2552,47 @@ function Start-LoginMonitor {
     $script:MonitorStartedAt = Get-Date
     $script:HeartbeatStaleAlertActive = $false
 
-    Cleanup-OldLogs
-    Send-Heartbeat -IsStartup
-    Enable-SecurityAudit
+    do {
+        $script:MonitorRecycleRequested = $false
 
-    $rdGatewayAvailable = $false
-    if ($EnableRDGatewayMonitoring) { $rdGatewayAvailable = Test-RDGatewayLog }
+        if (-not $script:MonitorLoopInitialized) {
+            Cleanup-OldLogs
+            Send-Heartbeat -IsStartup
+            Enable-SecurityAudit
+            $script:MonitorLoopInitialized = $true
+        }
 
-    $rcmMonitoringEnabled = ($osKind.IsWorkstation -and (Test-RcmLogAvailable))
-    if ($osKind.IsWorkstation -and -not $rcmMonitoringEnabled) {
-        Write-Log "Рабочая станция: журнал Remote Connection Manager недоступен — уведомления только по Security 4624/4625 (LogonType 10). Проверьте, что включён удалённый рабочий стол."
-    }
+        $rdGatewayAvailable = $false
+        if ($EnableRDGatewayMonitoring) { $rdGatewayAvailable = Test-RDGatewayLog }
 
-    $nextHeartbeatTime = (Get-Date).AddSeconds($HeartbeatInterval)
-    $nextRotationCheck = Check-AndRotateLog
-    $nextReportCheck = Check-AndSendDailyReport
-    $lastCheckTime = (Get-Date).AddSeconds(-10)
-    $lastGatewayCheckTime = (Get-Date).AddSeconds(-10)
-    $lastRcmCheckTime = (Get-Date).AddSeconds(-10)
-    $lastLockout4740CheckTime = (Get-Date).AddSeconds(-10)
-    $monitorEvents = @(4624, 4625, 4648)
+        $rcmMonitoringEnabled = ($osKind.IsWorkstation -and (Test-RcmLogAvailable))
+        if ($osKind.IsWorkstation -and -not $rcmMonitoringEnabled) {
+            Write-Log "Рабочая станция: журнал Remote Connection Manager недоступен — уведомления только по Security 4624/4625 (LogonType 10). Проверьте, что включён удалённый рабочий стол."
+        }
 
-    while ($true) {
+        $nextHeartbeatTime = (Get-Date).AddSeconds($HeartbeatInterval)
+        $nextRotationCheck = Check-AndRotateLog
+        $nextReportCheck = Check-AndSendDailyReport
+        $lastCheckTime = (Get-Date).AddSeconds(-10)
+        $lastGatewayCheckTime = (Get-Date).AddSeconds(-10)
+        $lastRcmCheckTime = (Get-Date).AddSeconds(-10)
+        $lastLockout4740CheckTime = (Get-Date).AddSeconds(-10)
+        $monitorEvents = @(4624, 4625, 4648)
+
+        while ($true) {
+            $restartReq = Get-RdpMonitorRestartRequest
+            if ($null -ne $restartReq) {
+                $script:StopNotificationSent = $true
+                if ($restartReq.Mode -eq 'recycle') {
+                    Write-Log "Graceful recycle: запрос '$($restartReq.Reason)' — выход для запуска нового процесса (обновлённый скрипт с диска)."
+                    $script:MonitorRecycleRequested = $true
+                    break
+                }
+                Write-Log "Graceful restart (settings): запрос '$($restartReq.Reason)' — перечитываю настройки в этом же процессе PowerShell."
+                Invoke-RdpMonitorReloadSettings | Out-Null
+                break
+            }
+
         try {
             # ignore.lst: сверка mtime и лог при изменении файла.
             [void](Get-RdpMonitorIgnoreListEntries)
@@ -2761,7 +2845,12 @@ function Start-LoginMonitor {
             Write-Log "Ошибка цикла мониторинга: $($_.Exception.Message)"
         }
         Start-Sleep -Seconds $MonitorInterval
-    }
+        }
+
+        if ($script:MonitorRecycleRequested) {
+            return
+        }
+    } while ($true)
 }
 
 $script:StopNotificationSent = $false
@@ -2792,6 +2881,16 @@ try {
         }
     }
     Start-LoginMonitor -MonitorInterval 5 -MonitorInteractiveOnly
+
+    if ($script:MonitorRecycleRequested) {
+        $script:StopNotificationSent = $true
+        $canonicalScript = Join-Path $script:InstallRoot $script:CanonicalScriptName
+        Write-Log "Graceful recycle: запуск нового процесса монитора ($canonicalScript)."
+        Start-Process -FilePath (Get-RdpMonitorPowerShellExe) -ArgumentList @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $canonicalScript
+        ) -WindowStyle Hidden | Out-Null
+        exit 0
+    }
 } catch {
     if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) {
         Write-Log "Выполнение прервано (Ctrl+C / Stop-Pipeline)."

@@ -147,8 +147,52 @@ function Test-CommandLineIsWatchdog {
     return ($CommandLine -match '(?i)(^|\s)-Watchdog(\s|$)')
 }
 
+function Test-RdpMonitorMainProcessRunning {
+    param([string]$CanonicalScript)
+    try {
+        $procs = Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe' OR Name = 'pwsh.exe'" -ErrorAction Stop
+        foreach ($proc in $procs) {
+            $cl = [string]$proc.CommandLine
+            if ($cl -notmatch 'Login_Monitor\.ps1') { continue }
+            if (Test-CommandLineIsWatchdog -CommandLine $cl) { continue }
+            $sp = Get-ScriptPathFromCommandLine -CommandLine $cl
+            if ($null -eq $sp) { continue }
+            if ([System.IO.Path]::GetFullPath($sp) -ne $CanonicalScript) { continue }
+            if ([int]$proc.ProcessId -eq $PID) { continue }
+            return $true
+        }
+    } catch { }
+    return $false
+}
+
 function Stop-RdpLoginMonitorMainProcesses {
+    param([int]$GracefulWaitSec = 90)
+
     $canonical = [System.IO.Path]::GetFullPath($LocalScript)
+    if (-not (Test-RdpMonitorMainProcessRunning -CanonicalScript $canonical)) {
+        Write-DeployLog "Монитор не запущен — остановка не требуется."
+        return
+    }
+
+    if (Test-Path -LiteralPath $LocalScript) {
+        Write-DeployLog "Graceful recycle: Login_Monitor.ps1 -RequestRestart -Recycle (без Stop-Process)."
+        $recycleArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $LocalScript, '-RequestRestart', '-Recycle')
+        $p = Start-Process -FilePath $PsExe -ArgumentList $recycleArgs -Wait -PassThru -WindowStyle Hidden
+        if ($p.ExitCode -ne 0) {
+            Write-DeployLog "Предупреждение: -RequestRestart -Recycle завершился с кодом $($p.ExitCode)."
+        }
+    }
+
+    $deadline = (Get-Date).AddSeconds($GracefulWaitSec)
+    while ((Get-Date) -lt $deadline) {
+        if (-not (Test-RdpMonitorMainProcessRunning -CanonicalScript $canonical)) {
+            Write-DeployLog "Монитор завершился gracefully (ожидание $($GracefulWaitSec) с)."
+            return
+        }
+        Start-Sleep -Seconds 2
+    }
+
+    Write-DeployLog "Таймаут graceful recycle — принудительная остановка оставшихся процессов монитора."
     try {
         $procs = Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe' OR Name = 'pwsh.exe'" -ErrorAction Stop
         foreach ($proc in $procs) {
@@ -159,11 +203,11 @@ function Stop-RdpLoginMonitorMainProcesses {
             if ($null -eq $sp) { continue }
             if ([System.IO.Path]::GetFullPath($sp) -ne $canonical) { continue }
             if ([int]$proc.ProcessId -eq $PID) { continue }
-            Write-DeployLog "Останавливаю процесс монитора PID $($proc.ProcessId) перед обновлением файла."
+            Write-DeployLog "Stop-Process -Force PID $($proc.ProcessId) (fallback)."
             Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
         }
     } catch {
-        Write-DeployLog "Предупреждение при остановке монитора: $($_.Exception.Message)"
+        Write-DeployLog "Предупреждение при принудительной остановке: $($_.Exception.Message)"
     }
 }
 

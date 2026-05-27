@@ -29,9 +29,9 @@ $NotifyOrder = 'tg'
 
 # --- Security Alert Center (SAC) ---
 # off | exclusive | dual | fallback — см. security-alert-center/docs/agent-integration.md
-# $UseSAC = 'exclusive'
-# $SacUrl = 'https://sac.kalinamall.ru'
-# $SacApiKey = 'sac_xxxxxxxx'
+$UseSAC = 'dual'
+$SacUrl = 'https://sac.kalinamall.ru'
+$SacApiKey = 'sac_UkOsAT3UWiQS54KK5OJPBDCSucysQDrKFju28wmYiz8'
 # $SacSpoolDir = 'C:\ProgramData\RDP-login-monitor\sac-spool'
 # $SacTimeoutSec = 12
 # $SacTlsSkipVerify = $false

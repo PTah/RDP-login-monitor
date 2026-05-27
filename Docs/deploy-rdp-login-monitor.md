@@ -155,6 +155,28 @@ Get-ScheduledTask -TaskName 'RDP-Login-Monitor','RDP-Login-Monitor-Watchdog' -Er
 Get-Content 'C:\ProgramData\RDP-login-monitor\Logs\deploy.log' -Tail 15
 ```
 
+### Graceful restart (без убийства PowerShell)
+
+После правки **`login_monitor.settings.ps1`** (SAC, Telegram):
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File "C:\ProgramData\RDP-login-monitor\Login_Monitor.ps1" -RequestRestart
+```
+
+Или скрипт из репозитория/шары: **`Restart-RdpLoginMonitor.ps1`**.
+
+Чтобы подхватить **новый `Login_Monitor.ps1` с диска** (после Deploy), нужен **recycle** — новый скрытый процесс, старый завершается сам:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File "C:\ProgramData\RDP-login-monitor\Login_Monitor.ps1" -RequestRestart -Recycle
+```
+
+**`Deploy-LoginMonitor.ps1`** при обновлении вызывает `-RequestRestart -Recycle` и ждёт до 90 с; **`Stop-Process -Force`** только если таймаут.
+
+Сигнал: файл **`C:\ProgramData\RDP-login-monitor\restart.request`** (создаётся автоматически, не редактировать вручную).
+
 ### D. Первичная установка (ещё нет ProgramData)
 
 1. Deploy (как в C) — создаст каталог и при отсутствии settings скопирует **`login_monitor.settings.ps1`** из example.

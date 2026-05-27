@@ -18,6 +18,7 @@
 - `Sac-Client.ps1`
 - `version.txt`
 - `Deploy-LoginMonitor.ps1`
+- `Restart-RdpLoginMonitor.ps1`
 - `Exchange-MailSecurity.ps1`
 - `Notify-Common.ps1`
 - `Install-DomainMonitors.ps1`
