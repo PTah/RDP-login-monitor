@@ -294,6 +294,11 @@ function Send-SacLocalChannels {
     return $anyOk
 }
 
+function Test-SacHeartbeatOnlyEventType {
+    param([string]$EventType)
+    return ($EventType -eq 'agent.heartbeat')
+}
+
 function Send-NotifyOrSac {
     param(
         [Parameter(Mandatory = $true)][string]$EventType,
@@ -310,6 +315,15 @@ function Send-NotifyOrSac {
     }
 
     $mode = Get-SacNormalizedMode
+
+    # Периодический heartbeat — только SAC (UI), без Telegram/email в любом режиме.
+    if (Test-SacHeartbeatOnlyEventType -EventType $EventType) {
+        if ($mode -eq 'off') {
+            return $false
+        }
+        return (Send-SacEvent -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $Details)
+    }
+
     switch ($mode) {
         'off' {
             return (Send-SacLocalChannels -TelegramMessage $TelegramMessage -EmailSubject $EmailSubject)
