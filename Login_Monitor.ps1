@@ -80,7 +80,7 @@ $script:MonitorLoopInitialized = $false
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.2.3-SAC"
+$ScriptVersion = "1.2.4-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -2863,16 +2863,31 @@ try {
             Write-Log "ОШИБКА: UseSAC=$sacMode, но SacUrl/SacApiKey не заданы в login_monitor.settings.ps1"
             exit 1
         }
-        if (-not (Test-SacHealth)) {
-            Write-Log "ОШИБКА: SAC /health недоступен (SacUrl=$SacUrl)"
-            exit 1
+        if (Test-SacHealth) {
+            Write-Log "SAC: режим $sacMode, health OK, ingest=$(Get-SacIngestUrl)"
+        } else {
+            switch ($sacMode) {
+                'exclusive' {
+                    Write-Log "WARN: SAC /health недоступен ($SacUrl) — мониторинг RDP продолжается; события уйдут в spool до восстановления SAC."
+                }
+                'dual' {
+                    Write-Log "WARN: SAC /health недоступен ($SacUrl) — мониторинг продолжается; уведомления через локальные каналы (Telegram/email)."
+                }
+                'fallback' {
+                    Write-Log "WARN: SAC /health недоступен ($SacUrl) — мониторинг продолжается; при сбоях SAC — локальные каналы."
+                }
+                default {
+                    Write-Log "WARN: SAC /health недоступен ($SacUrl) — мониторинг продолжается."
+                }
+            }
         }
-        Write-Log "SAC: режим $sacMode, health OK, ingest=$(Get-SacIngestUrl)"
     }
 
     $notifyChannels = @(Get-NotifyOrderChannels)
     if ($notifyChannels.Count -eq 0 -and $sacMode -eq 'off') {
         Write-Log "ВНИМАНИЕ: не настроен ни один канал оповещений (Telegram и/или SMTP в конфигурации скрипта)."
+    } elseif ($notifyChannels.Count -eq 0 -and $sacMode -eq 'exclusive') {
+        Write-Log "ВНИМАНИЕ: UseSAC=exclusive и нет Telegram/SMTP — при недоступном SAC оповещения только после восстановления ingest."
     } elseif ($notifyChannels.Count -gt 0) {
         foreach ($notifyCh in $notifyChannels) {
             switch ($notifyCh) {
