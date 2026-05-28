@@ -80,7 +80,7 @@ $script:MonitorLoopInitialized = $false
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.2.14-SAC"
+$ScriptVersion = "1.2.15-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -1240,11 +1240,18 @@ function Format-Rcm1149Event {
     return $message
 }
 
+function Get-MonitorServerLabel {
+    if ($null -ne $ServerDisplayName -and -not [string]::IsNullOrWhiteSpace([string]$ServerDisplayName)) {
+        return [string]$ServerDisplayName.Trim()
+    }
+    return [string]$env:COMPUTERNAME
+}
+
 function Send-Heartbeat {
     param([switch]$IsStartup = $false)
 
     $timestamp = Get-Date -Format "dd.MM.yyyy HH:mm:ss"
-    $hHost = (ConvertTo-TelegramHtml $env:COMPUTERNAME)
+    $hHost = (ConvertTo-TelegramHtml (Get-MonitorServerLabel))
 
     function Get-DeployUpdateMarker {
         $info = [pscustomobject]@{
@@ -1348,7 +1355,7 @@ function Send-Heartbeat {
         Send-MonitorNotification -Message $message -EmailSubject "RDP Login Monitor: запуск" `
             -SacEventType 'agent.lifecycle' -SacSeverity 'info' `
             -SacTitle 'RDP login monitor started' `
-            -SacSummary "Мониторинг запущен на $env:COMPUTERNAME, версия $ScriptVersion" `
+            -SacSummary "Мониторинг запущен на $(Get-MonitorServerLabel), версия $ScriptVersion" `
             -SacDetails @{ lifecycle = 'started' } | Out-Null
         Write-Log "Отправлено уведомление о запуске скрипта (каналы: $notifyChain)"
     } else {
@@ -1358,7 +1365,7 @@ function Send-Heartbeat {
             Send-MonitorNotification -Message '' -EmailSubject 'RDP Login Monitor: heartbeat' `
                 -SacEventType 'agent.heartbeat' -SacSeverity 'info' `
                 -SacTitle 'RDP monitor heartbeat' `
-                -SacSummary "Heartbeat $env:COMPUTERNAME $timestamp" `
+                -SacSummary "Heartbeat $(Get-MonitorServerLabel) $timestamp" `
                 -SacDetails @{ host = $env:COMPUTERNAME } | Out-Null
         }
     }
@@ -1396,7 +1403,7 @@ function Test-AndSendHeartbeatStaleAlert {
     }
     if ($script:HeartbeatStaleAlertActive) { return }
 
-    $hHost = ConvertTo-TelegramHtml $env:COMPUTERNAME
+    $hHost = ConvertTo-TelegramHtml (Get-MonitorServerLabel)
     $hThreshold = ConvertTo-TelegramHtml ([int]$thresholdSec)
     $lastTxt = if ($null -eq $lastHb) { 'нет данных' } else { $lastHb.ToString('dd.MM.yyyy HH:mm:ss') }
     $hLast = ConvertTo-TelegramHtml $lastTxt
@@ -1409,7 +1416,7 @@ function Test-AndSendHeartbeatStaleAlert {
     if (Send-MonitorNotification -Message $msg -EmailSubject 'RDP Login Monitor: нет heartbeat' `
             -SacEventType 'agent.health' -SacSeverity 'warning' `
             -SacTitle 'RDP monitor heartbeat stale' `
-            -SacSummary "Heartbeat не обновлялся на $env:COMPUTERNAME") {
+            -SacSummary "Heartbeat не обновлялся на $(Get-MonitorServerLabel)") {
         $script:HeartbeatStaleAlertActive = $true
         Write-Log "Отправлено оповещение: heartbeat не обновлялся дольше $thresholdSec с"
     }
@@ -1419,7 +1426,7 @@ function Send-StopNotification {
     param([string]$Reason)
 
     $timestamp = Get-Date -Format "dd.MM.yyyy HH:mm:ss"
-    $hHost = (ConvertTo-TelegramHtml $env:COMPUTERNAME)
+    $hHost = (ConvertTo-TelegramHtml (Get-MonitorServerLabel))
     $hReason = (ConvertTo-TelegramHtml $Reason)
     $message = "<b>⚠️ МОНИТОРИНГ ЛОГИНОВ ОСТАНОВЛЕН</b>`r`n"
     $message += "🖥️ Сервер: $hHost`r`n"
@@ -2313,7 +2320,7 @@ function Send-DailyReport {
         # PS 5.1: без @() один логин даёт скаляр String (нет .Count); пустой список даёт $null.
         $uniqueUsers = @($usernames | Sort-Object -Unique)
         $message = "<b>📊 ЕЖЕДНЕВНЫЙ ОТЧЕТ</b>`r`n"
-        $message += "🖥️ Сервер: $(ConvertTo-TelegramHtml $env:COMPUTERNAME)`r`n"
+        $message += "🖥️ Сервер: $(ConvertTo-TelegramHtml (Get-MonitorServerLabel))`r`n"
         $message += "🕐 Время отчета: $(Get-Date -Format 'dd.MM.yyyy HH:mm:ss')`r`n"
         $message += "👥 Активных сессий (quser): $count`r`n"
         if ($uniqueUsers.Count -gt 0) {

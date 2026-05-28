@@ -4,7 +4,7 @@
 .DESCRIPTION
     Dot-source после login_monitor.settings.ps1 и функции Write-Log.
     Ожидает: $UseSAC, $SacUrl, $SacApiKey, $ScriptVersion, $script:InstallRoot.
-    Release: 1.2.14-SAC (POST via HttpWebRequest raw UTF-8 bytes; no IWR -Body).
+    Release: 1.2.15-SAC (host.display_name from $ServerDisplayName).
 #>
 
 function Test-SacIngestAcceptedStatus {
@@ -247,6 +247,21 @@ function Get-SacHttpErrorBody {
     }
 }
 
+function Get-SacHostBlock {
+    $hostname = [string]$env:COMPUTERNAME
+    $hostBlock = [ordered]@{
+        hostname  = $hostname
+        os_family = 'windows'
+    }
+    if (Get-Variable -Name ServerDisplayName -ErrorAction SilentlyContinue) {
+        $label = $ServerDisplayName
+        if (-not [string]::IsNullOrWhiteSpace([string]$label)) {
+            $hostBlock.display_name = [string]$label.Trim()
+        }
+    }
+    return $hostBlock
+}
+
 function New-SacEventPayload {
     param(
         [Parameter(Mandatory = $true)][string]$EventType,
@@ -268,10 +283,7 @@ function New-SacEventPayload {
             product_version    = if ($ScriptVersion) { [string]$ScriptVersion } else { 'unknown' }
             agent_instance_id  = Get-SacAgentInstanceId
         }
-        host           = [ordered]@{
-            hostname  = $env:COMPUTERNAME
-            os_family = 'windows'
-        }
+        host           = (Get-SacHostBlock)
         category       = (Get-SacCategoryForType -EventType $EventType)
         type           = $EventType
         severity       = $Severity

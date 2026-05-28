@@ -27,6 +27,9 @@ $NotifyOrder = 'tg'
 # $MailSmtpSsl = $false
 # $MailSmtpPasswordProtectedB64 = ''
 
+# --- Подпись сервера в Telegram и SAC (host.display_name); пусто = $env:COMPUTERNAME ---
+# $ServerDisplayName = 'UNMS Kalina'
+
 # --- Security Alert Center (SAC) ---
 # off | exclusive | dual | fallback — см. security-alert-center/docs/agent-integration.md
 $UseSAC = 'dual'
