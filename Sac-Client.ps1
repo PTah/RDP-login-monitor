@@ -4,7 +4,7 @@
 .DESCRIPTION
     Dot-source после login_monitor.settings.ps1 и функции Write-Log.
     Ожидает: $UseSAC, $SacUrl, $SacApiKey, $ScriptVersion, $script:InstallRoot.
-    Release: 1.2.10-SAC (treat HTTP 201/409/202 as success when Invoke-WebRequest throws).
+    Release: 1.2.11-SAC (JSON via JavaScriptSerializer for Cyrillic; better 422 logging).
 #>
 
 function Test-SacIngestAcceptedStatus {
@@ -102,8 +102,51 @@ function Get-SacAgentInstanceId {
     return $newId
 }
 
+function Get-SacOccurredAtIso {
+    return [DateTimeOffset]::Now.ToString('yyyy-MM-ddTHH:mm:ss.fffK')
+}
+
+function Convert-AnyToJsonSerializable {
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [string] -or $Value -is [bool] -or $Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal]) {
+        return $Value
+    }
+    if ($Value -is [hashtable] -or $Value -is [System.Collections.IDictionary]) {
+        $out = @{}
+        foreach ($key in $Value.Keys) {
+            $out[[string]$key] = Convert-AnyToJsonSerializable $Value[$key]
+        }
+        return $out
+    }
+    if ($Value -is [System.Collections.IEnumerable]) {
+        $list = New-Object System.Collections.Generic.List[object]
+        foreach ($item in $Value) {
+            $list.Add((Convert-AnyToJsonSerializable $item)) | Out-Null
+        }
+        return $list
+    }
+    return [string]$Value
+}
+
+function ConvertTo-SacJsonText {
+    param([Parameter(Mandatory = $true)]$Payload)
+    $serializable = Convert-AnyToJsonSerializable $Payload
+    try {
+        Add-Type -AssemblyName System.Web.Extensions -ErrorAction Stop
+        $ser = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+        $ser.MaxJsonLength = 16777216
+        $ser.RecursionLimit = 32
+        return $ser.Serialize($serializable)
+    } catch {
+        Write-SacLog "WARN: JavaScriptSerializer unavailable, fallback ConvertTo-Json ($($_.Exception.Message))"
+        return ($serializable | ConvertTo-Json -Depth 12 -Compress)
+    }
+}
+
 function Get-SacCategoryForType {
     param([string]$EventType)
+    if ($EventType -match '^agent\.') { return 'agent' }
     if ($EventType -match '^(ssh\.|auth\.|rdp\.)') { return 'auth' }
     if ($EventType -match '^privilege\.') { return 'privilege' }
     if ($EventType -match '^session\.') { return 'session' }
@@ -125,10 +168,14 @@ function Limit-SacString {
 }
 
 function Get-SacHttpErrorBody {
-    param($Exception)
+    param($ErrorRecord)
+    if ($null -ne $ErrorRecord -and $null -ne $ErrorRecord.ErrorDetails -and -not [string]::IsNullOrWhiteSpace($ErrorRecord.ErrorDetails.Message)) {
+        return [string]$ErrorRecord.ErrorDetails.Message
+    }
+    $ex = if ($null -ne $ErrorRecord) { $ErrorRecord.Exception } else { $null }
     try {
-        if ($null -eq $Exception -or $null -eq $Exception.Response) { return '' }
-        $stream = $Exception.Response.GetResponseStream()
+        if ($null -eq $ex -or $null -eq $ex.Response) { return '' }
+        $stream = $ex.Response.GetResponseStream()
         if ($null -eq $stream) { return '' }
         $reader = New-Object System.IO.StreamReader($stream)
         $body = $reader.ReadToEnd()
@@ -154,7 +201,7 @@ function New-SacEventPayload {
     $payload = [ordered]@{
         schema_version = '1.0'
         event_id       = [guid]::NewGuid().ToString()
-        occurred_at    = (Get-Date).ToString('o')
+        occurred_at    = (Get-SacOccurredAtIso)
         source         = [ordered]@{
             product            = 'rdp-login-monitor'
             product_version    = if ($ScriptVersion) { [string]$ScriptVersion } else { 'unknown' }
@@ -313,7 +360,7 @@ function Invoke-SacPostPayload {
         }
     } catch {
         $code = 0
-        $body = Get-SacHttpErrorBody -Exception $_.Exception
+        $body = Get-SacHttpErrorBody -ErrorRecord $_
         if ($_.Exception.Response) {
             $code = [int]$_.Exception.Response.StatusCode
         }
@@ -364,7 +411,7 @@ function Send-SacEvent {
     }
 
     $payload = New-SacEventPayload -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $Details
-    $json = $payload | ConvertTo-Json -Depth 8 -Compress
+    $json = ConvertTo-SacJsonText -Payload $payload
     return (Invoke-SacPostPayload -JsonBody $json)
 }
 
