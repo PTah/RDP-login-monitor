@@ -4,7 +4,7 @@
 .DESCRIPTION
     Dot-source после login_monitor.settings.ps1 и функции Write-Log.
     Ожидает: $UseSAC, $SacUrl, $SacApiKey, $ScriptVersion, $script:InstallRoot.
-    Release: 1.2.13-SAC (fix BOM strip: never StartsWith([char]0xFEFF) on PS strings).
+    Release: 1.2.14-SAC (POST via HttpWebRequest raw UTF-8 bytes; no IWR -Body).
 #>
 
 function Test-SacIngestAcceptedStatus {
@@ -380,6 +380,98 @@ function Move-SacSpoolToRejected {
     Move-Item -LiteralPath $src -Destination $dst -Force -ErrorAction SilentlyContinue
 }
 
+function Get-SacPostBodyBytes {
+    param([string]$JsonText)
+    $bytes = Get-SacUtf8Bytes -Text $JsonText
+    if ($bytes -is [System.Array] -and $bytes -isnot [byte[]]) {
+        $flat = New-Object System.Collections.Generic.List[byte]
+        foreach ($chunk in $bytes) {
+            if ($null -eq $chunk) { continue }
+            if ($chunk -is [byte[]]) {
+                foreach ($b in $chunk) { $flat.Add($b) | Out-Null }
+            } elseif ($chunk -is [byte]) {
+                $flat.Add([byte]$chunk) | Out-Null
+            }
+        }
+        $bytes = $flat.ToArray()
+    }
+    if ($bytes -isnot [byte[]]) {
+        Write-SacLog "WARN: SAC POST aborted: body is not byte[] (type=$($bytes.GetType().FullName))"
+        return $null
+    }
+    if ($bytes.Length -ge 4 -and $bytes[0] -eq 0x6E -and $bytes[1] -eq 0x75 -and $bytes[2] -eq 0x6C -and $bytes[3] -eq 0x6C) {
+        Write-SacLog 'WARN: SAC POST aborted: body starts with ASCII null (0x6E756C6C)'
+        return $null
+    }
+    if ($bytes.Length -lt 2 -or $bytes[0] -ne 0x7B) {
+        $take = [Math]::Min(16, $bytes.Length)
+        $hex = if ($take -gt 0) {
+            (($bytes[0..($take - 1)] | ForEach-Object { '{0:X2}' -f $_ }) -join ' ')
+        } else { '(empty)' }
+        Write-SacLog "WARN: SAC POST aborted: body must start with 0x7B '{{' (hex: $hex)"
+        return $null
+    }
+    try {
+        $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+        Add-Type -AssemblyName System.Web.Extensions -ErrorAction Stop
+        $ser = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+        $null = $ser.DeserializeObject($text)
+    } catch {
+        Write-SacLog "WARN: SAC POST aborted: local JSON parse failed ($($_.Exception.Message))"
+        return $null
+    }
+    return $bytes
+}
+
+function Invoke-SacHttpPost {
+    param(
+        [string]$Uri,
+        [byte[]]$BodyBytes,
+        [string]$EventId,
+        [int]$TimeoutSec
+    )
+    Invoke-SacTlsPrep
+    $req = [System.Net.HttpWebRequest]::Create($Uri)
+    $req.Method = 'POST'
+    $req.Timeout = $TimeoutSec * 1000
+    $req.ReadWriteTimeout = $TimeoutSec * 1000
+    $req.ContentType = 'application/json'
+    $req.ContentLength = $BodyBytes.Length
+    $req.Headers[[System.Net.HttpRequestHeader]::Authorization] = "Bearer $SacApiKey"
+    $req.Headers.Add('Idempotency-Key', $EventId)
+
+    $stream = $req.GetRequestStream()
+    try {
+        $stream.Write($BodyBytes, 0, $BodyBytes.Length)
+    } finally {
+        $stream.Close()
+    }
+
+    try {
+        $resp = $req.GetResponse()
+        $code = [int]$resp.StatusCode
+        $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
+        $content = $reader.ReadToEnd()
+        $reader.Close()
+        $resp.Close()
+        return @{ StatusCode = $code; Content = $content }
+    } catch [System.Net.WebException] {
+        $code = 0
+        $content = ''
+        $exResp = $_.Exception.Response
+        if ($null -ne $exResp) {
+            $code = [int]$exResp.StatusCode
+            try {
+                $reader = New-Object System.IO.StreamReader($exResp.GetResponseStream())
+                $content = $reader.ReadToEnd()
+                $reader.Close()
+            } catch { }
+            $exResp.Close()
+        }
+        return @{ StatusCode = $code; Content = $content; Error = $_.Exception.Message }
+    }
+}
+
 function Write-SacPostBodyDiagnostic {
     param(
         [byte[]]$BodyBytes,
@@ -424,54 +516,36 @@ function Invoke-SacPostPayload {
     }
     $timeout = if ($SacTimeoutSec) { [int]$SacTimeoutSec } else { 12 }
     $spoolOnFailure = $true
+    $bodyBytes = $null
 
-    try {
-        Invoke-SacTlsPrep
-        $headers = @{
-            Authorization     = "Bearer $SacApiKey"
-            'Content-Type'    = 'application/json; charset=utf-8'
-            'Idempotency-Key' = $eventId
-        }
-        $bodyBytes = Get-SacUtf8Bytes -Text $jsonText
-        $resp = Invoke-WebRequest -Uri $ingest -Method Post -Headers $headers -Body $bodyBytes -UseBasicParsing -TimeoutSec $timeout
-        if (Test-SacIngestAcceptedStatus -StatusCode $resp.StatusCode) {
-            Complete-SacIngestSuccess -EventId $eventId -EventType $eventType -StatusCode $resp.StatusCode
-            return $true
-        }
-        $body = if ($resp.Content) { $resp.Content } else { '' }
-        if ($resp.StatusCode -eq 422) {
-            $spoolOnFailure = $false
-            Write-SacLog "WARN: SAC POST HTTP 422 validation (not spooled) type=$eventType event_id=$eventId"
-            Write-SacPostBodyDiagnostic -BodyBytes $bodyBytes -EventId $eventId
-        }
-        if ($body.Length -gt 0) {
-            $snippet = $body.Substring(0, [Math]::Min(800, $body.Length))
-            Write-SacLog "WARN: SAC POST HTTP $($resp.StatusCode): $snippet"
-        } else {
-            Write-SacLog "WARN: SAC POST HTTP $($resp.StatusCode) (empty body)"
-        }
-    } catch {
-        $code = 0
-        $body = Get-SacHttpErrorBody -ErrorRecord $_
-        if ($_.Exception.Response) {
-            $code = [int]$_.Exception.Response.StatusCode
-        }
-        if (Test-SacIngestAcceptedStatus -StatusCode $code) {
-            Complete-SacIngestSuccess -EventId $eventId -EventType $eventType -StatusCode $code
-            return $true
-        }
-        if ($code -eq 422) {
-            $spoolOnFailure = $false
-            Write-SacLog "WARN: SAC POST HTTP 422 validation (not spooled) type=$eventType event_id=$eventId"
-            Write-SacPostBodyDiagnostic -BodyBytes $bodyBytes -EventId $eventId
-        }
-        $err = $_.Exception.Message
-        if ($body.Length -gt 0) {
-            $snippet = $body.Substring(0, [Math]::Min(800, $body.Length))
-            Write-SacLog "WARN: SAC POST HTTP ${code}: $err | $snippet"
-        } else {
-            Write-SacLog "WARN: SAC POST HTTP ${code}: $err"
-        }
+    $bodyBytes = Get-SacPostBodyBytes -JsonText $jsonText
+    if ($null -eq $bodyBytes) {
+        Move-SacSpoolToRejected -EventId $eventId
+        return $false
+    }
+
+    $post = Invoke-SacHttpPost -Uri $ingest -BodyBytes $bodyBytes -EventId $eventId -TimeoutSec $timeout
+    $code = [int]$post.StatusCode
+    $body = if ($post.Content) { [string]$post.Content } else { '' }
+
+    if (Test-SacIngestAcceptedStatus -StatusCode $code) {
+        Complete-SacIngestSuccess -EventId $eventId -EventType $eventType -StatusCode $code
+        return $true
+    }
+
+    if ($code -eq 422) {
+        $spoolOnFailure = $false
+        Write-SacLog "WARN: SAC POST HTTP 422 validation (not spooled) type=$eventType event_id=$eventId len=$($bodyBytes.Length)"
+        Write-SacPostBodyDiagnostic -BodyBytes $bodyBytes -EventId $eventId
+    } elseif ($code -gt 0) {
+        Write-SacLog "WARN: SAC POST HTTP $code type=$eventType event_id=$eventId len=$($bodyBytes.Length)"
+    } elseif (-not [string]::IsNullOrWhiteSpace($post.Error)) {
+        Write-SacLog "WARN: SAC POST failed type=$eventType event_id=${eventId}: $($post.Error)"
+    }
+
+    if ($body.Length -gt 0) {
+        $snippet = $body.Substring(0, [Math]::Min(800, $body.Length))
+        Write-SacLog "WARN: SAC POST response: $snippet"
     }
 
     if (-not $spoolOnFailure) {
@@ -510,7 +584,7 @@ function Send-SacEvent {
     $json = $(ConvertTo-SacJsonText -Payload $payload)
     $json = Repair-SacJsonText -Text (Get-SacSingleString -Value $json -Label 'event json')
     if ([string]::IsNullOrWhiteSpace($json) -or $json[0] -ne '{') {
-        Write-SacLog "WARN: SAC invalid JSON for type=$EventType (empty or does not start with {{)"
+        Write-SacLog "WARN: SAC invalid JSON for type=$EventType (empty or does not start with '{' )"
         return $false
     }
     return (Invoke-SacPostPayload -JsonBody $json)
