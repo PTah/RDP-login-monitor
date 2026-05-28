@@ -3,7 +3,7 @@
     Obnovlyaet klon RDP-login-monitor s git.kalinamall.ru i kopiruet dist na NETLOGON.
 .DESCRIPTION
     Dlya servera publikatsii (napr. DC3). Remote: git.kalinamall.ru (kalinamall).
-    Posle force-push: fetch + reset --hard, bez merge.
+    Posle fetch: vsegda reset --hard na kalinamall/main (bez merge), zatem clean -fd.
     Kopiruyutsya: polnyj spisok v Docs/deploy-netlogon-publish.md.
 .EXAMPLE
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\soft\update-rdp-monitor.ps1
@@ -16,7 +16,8 @@ param(
     [string]$NetlogonDest = '\\b26\NETLOGON\RDP-login-monitor',
     [string]$GitUrl = 'https://git.kalinamall.ru/PapaTramp/RDP-login-monitor.git',
     [string]$GitBranch = 'main',
-    [string]$LogFile = 'C:\soft\Logs\update-rdp-monitor.log'
+    [string]$LogFile = 'C:\soft\Logs\update-rdp-monitor.log',
+    [switch]$SkipGitClean
 )
 
 $ErrorActionPreference = 'Stop'
@@ -55,21 +56,42 @@ function Invoke-GitCommand {
     $ErrorActionPreference = 'Continue'
     try {
         Push-Location -LiteralPath $WorkingDirectory
-        $out = & git @Arguments 2>&1
+        # stderr git (progress) ne dolzhen lomat skript v PowerShell 5.1
+        $raw = & git @Arguments 2>&1
         $code = $LASTEXITCODE
     } finally {
         Pop-Location
         $ErrorActionPreference = $prevEap
     }
-    foreach ($line in @($out)) {
-        if ($null -ne $line -and "$line".Length -gt 0) {
+    $lines = @()
+    foreach ($item in @($raw)) {
+        if ($null -eq $item) { continue }
+        if ($item -is [System.Management.Automation.ErrorRecord]) {
+            $lines += $item.ToString()
+        } else {
+            $lines += [string]$item
+        }
+    }
+    foreach ($line in $lines) {
+        if ($line.Length -gt 0) {
             Write-UpdateLog "git: $line"
         }
     }
     if ($code -ne 0) {
         throw ("git {0} failed (exit {1})" -f ($Arguments -join ' '), $code)
     }
-    return @($out)
+    return $lines
+}
+
+function Get-GitShortHead {
+    $lines = Invoke-GitCommand -Arguments @('rev-parse', '--short', 'HEAD')
+    foreach ($line in $lines) {
+        $t = $line.Trim()
+        if ($t -match '^[0-9a-f]{7,40}$') {
+            return $t
+        }
+    }
+    return ($lines -join ' ').Trim()
 }
 
 function Ensure-GitAvailable {
@@ -122,24 +144,29 @@ function Update-Repository {
     $remote = Ensure-GitKalinamallRemote
     Invoke-GitCommand -Arguments @('fetch', '--prune', $remote, $GitBranch)
     $upstream = "${remote}/${GitBranch}"
-    $dirty = Invoke-GitCommand -Arguments @('status', '--porcelain')
-    if (@($dirty).Count -gt 0) {
-        Write-UpdateLog "WARN: working tree has local changes; reset may discard them"
+
+    $dirty = @(Invoke-GitCommand -Arguments @('status', '--porcelain') | Where-Object { "$_".Trim().Length -gt 0 })
+    if ($dirty.Count -gt 0) {
+        Write-UpdateLog "WARN: discarding $($dirty.Count) local change(s) on publish clone (reset --hard + clean)"
+        foreach ($d in $dirty) {
+            Write-UpdateLog "  $d"
+        }
     }
+
     $mergeHead = Join-Path $RepoPath '.git\MERGE_HEAD'
     if (Test-Path -LiteralPath $mergeHead) {
-        Write-UpdateLog "WARN: incomplete merge detected — aborting before sync"
+        Write-UpdateLog 'WARN: incomplete merge — aborting before sync'
         Invoke-GitCommand -Arguments @('merge', '--abort')
     }
-    try {
-        Invoke-GitCommand -Arguments @('pull', '--ff-only', $remote, $GitBranch)
-        Write-UpdateLog 'git: fast-forward OK'
-    } catch {
-        Write-UpdateLog "WARN: fast-forward failed ($($_.Exception.Message)) — reset --hard $upstream (typical after force-push)"
-        Invoke-GitCommand -Arguments @('reset', '--hard', $upstream)
+
+    Invoke-GitCommand -Arguments @('reset', '--hard', $upstream)
+    if (-not $SkipGitClean) {
+        Invoke-GitCommand -Arguments @('clean', '-fd')
     }
-    $head = (Invoke-GitCommand -Arguments @('rev-parse', '--short', 'HEAD'))[-1]
-    Write-UpdateLog "HEAD: $head"
+
+    $remoteHead = (Invoke-GitCommand -Arguments @('rev-parse', '--short', $upstream) | Where-Object { $_ -match '^[0-9a-f]{7,40}$' } | Select-Object -First 1)
+    $head = Get-GitShortHead
+    Write-UpdateLog "HEAD: $head (target $upstream = $remoteHead)"
 }
 
 function Copy-FileToNetlogon {
@@ -168,6 +195,13 @@ function Publish-DistributionFiles {
             Write-UpdateLog "Created: $NetlogonDest"
         }
     }
+    $repoVer = Join-Path $RepoPath 'version.txt'
+    if (-not (Test-Path -LiteralPath $repoVer)) {
+        throw "Missing version.txt in repo: $repoVer"
+    }
+    $expectedVer = (Get-Content -LiteralPath $repoVer -Raw).Trim()
+    Write-UpdateLog "Repo version.txt: $expectedVer"
+
     foreach ($name in $DistFiles) {
         $src = Join-Path $RepoPath $name
         if (-not (Test-Path -LiteralPath $src)) {
@@ -183,6 +217,10 @@ function Publish-DistributionFiles {
     if (Test-Path -LiteralPath $verFile) {
         $ver = (Get-Content -LiteralPath $verFile -Raw).Trim()
         Write-UpdateLog "NETLOGON version: $ver"
+        if ($ver -ne $expectedVer) {
+            Write-UpdateLog "ERROR: NETLOGON version mismatch (expected $expectedVer)"
+            throw "NETLOGON version.txt is $ver, expected $expectedVer"
+        }
     }
 }
 
