@@ -157,6 +157,9 @@ $ExcludedComputerPatterns = @(
 # IP-список — в login_monitor.settings.ps1 ($IgnoreAdvapiNetworkLogonSourceIps).
 $IgnoreAdvapiNetworkLogonSourceIps = @()
 $IgnoreAdvapiNetworkLogonProcessContains = "Advapi"
+# Для Exchange/почтовых хостов: игнорировать 4624 c LogonType=3 и пустым/скрытым IP ("-").
+# Имя с дефисами оставлено намеренно для совместимости с локальным settings.
+${Ignore4624-LT3-EmptyIP-Event} = $false
 
 # Блокировка учётной записи AD (Security 4740) + IP клиента из логов IIS ActiveSync.
 # Параметры КД/IIS — в login_monitor.settings.ps1.
@@ -1760,6 +1763,13 @@ function Should-IgnoreEvent {
     if ($Username -match '(?i)(\\)?UMFD-\d+') { return $true }
     if ($Username -like "*$") { return $true }
 
+    # Опциональный фильтр для Exchange-шума: 4624 + LT=3 + пустой/скрытый IP.
+    if (${Ignore4624-LT3-EmptyIP-Event} -and $EventID -eq 4624 -and $LogonType -eq 3) {
+        if ([string]::IsNullOrWhiteSpace($SourceIP) -or $SourceIP -eq '-') {
+            return $true
+        }
+    }
+
     # Узкий фильтр: сетевой логон (3) + Advapi + конкретный IP источника
     if ($EventID -eq 4624 -and $LogonType -eq 3) {
         foreach ($ip in $IgnoreAdvapiNetworkLogonSourceIps) {
@@ -2543,6 +2553,7 @@ function Start-LoginMonitor {
     }
     Write-Log "========================================"
     Write-Log "Каналы уведомлений: $(Get-NotifyChainHuman)"
+    Write-Log "Фильтр Exchange 4624 LT3 EmptyIP: ${Ignore4624-LT3-EmptyIP-Event}"
     if ($FailedLogonRateLimitEnabled) {
         Write-Log "Агрегация 4625: tier1 $FailedLogonRateLimitUserIpThreshold/$FailedLogonRateLimitUserIpWindowSeconds с (IP+user), tier2 $FailedLogonRateLimitIpThreshold/$FailedLogonRateLimitIpWindowSeconds с (IP); suppressIndividual=$FailedLogonRateLimitSuppressIndividualWhileBurst"
     }

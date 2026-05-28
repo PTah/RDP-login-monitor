@@ -45,6 +45,9 @@ $SacApiKey = 'sac_UkOsAT3UWiQS54KK5OJPBDCSucysQDrKFju28wmYiz8'
 $IgnoreAdvapiNetworkLogonSourceIps = @(
     '192.168.160.57'
 )
+# --- Exchange noise filter: 4624 + LogonType=3 + IP='-' (часто Outlook/почтовые клиенты) ---
+# Включайте на почтовом сервере, если нужен только полезный интерактивный сигнал.
+${Ignore4624-LT3-EmptyIP-Event} = $false
 
 # --- Блокировка учётной записи AD (4740) + IP из IIS ActiveSync ---
 # Мониторинг включается только на КД с именем $LockoutMonitorDomainController.
