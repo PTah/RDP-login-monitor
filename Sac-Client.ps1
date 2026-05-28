@@ -4,7 +4,7 @@
 .DESCRIPTION
     Dot-source после login_monitor.settings.ps1 и функции Write-Log.
     Ожидает: $UseSAC, $SacUrl, $SacApiKey, $ScriptVersion, $script:InstallRoot.
-    Release: 1.2.15-SAC (host.display_name from $ServerDisplayName).
+    Release: same as Login_Monitor.ps1 $ScriptVersion / version.txt (host.display_name via $ServerDisplayName).
 #>
 
 function Test-SacIngestAcceptedStatus {
@@ -254,12 +254,47 @@ function Get-SacHostBlock {
         os_family = 'windows'
     }
     if (Get-Variable -Name ServerDisplayName -ErrorAction SilentlyContinue) {
-        $label = $ServerDisplayName
+        $label = (Get-Variable -Name ServerDisplayName -ValueOnly)
         if (-not [string]::IsNullOrWhiteSpace([string]$label)) {
             $hostBlock.display_name = [string]$label.Trim()
         }
     }
+    $ipv4 = Get-SacHostIPv4
+    if (-not [string]::IsNullOrWhiteSpace($ipv4)) {
+        $hostBlock.ipv4 = $ipv4
+    }
     return $hostBlock
+}
+
+function Get-SacHostIPv4 {
+    # Явный override в login_monitor.settings.ps1 (опционально).
+    if (Get-Variable -Name ServerIPv4 -ErrorAction SilentlyContinue) {
+        $manual = [string](Get-Variable -Name ServerIPv4 -ValueOnly)
+        if (-not [string]::IsNullOrWhiteSpace($manual)) {
+            $m = $manual.Trim()
+            if ($m -match '^(?:\d{1,3}\.){3}\d{1,3}$') { return $m }
+            Write-SacLog "WARN: ServerIPv4='$m' не похож на IPv4, игнорирую override"
+        }
+    }
+
+    try {
+        $ips = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {
+            $_.IPAddress -and
+            $_.IPAddress -notmatch '^(127\.|169\.254\.)' -and
+            $_.PrefixOrigin -ne 'WellKnown'
+        } | Select-Object -ExpandProperty IPAddress)
+        if ($ips.Count -gt 0) { return [string]$ips[0] }
+    } catch {}
+
+    try {
+        $sock = New-Object System.Net.Sockets.Socket ([System.Net.Sockets.AddressFamily]::InterNetwork), ([System.Net.Sockets.SocketType]::Dgram), ([System.Net.Sockets.ProtocolType]::Udp)
+        $sock.Connect('1.1.1.1', 53)
+        $ip = [string]$sock.LocalEndPoint.Address
+        $sock.Dispose()
+        if ($ip -match '^(?:\d{1,3}\.){3}\d{1,3}$' -and $ip -notmatch '^(127\.|169\.254\.)') { return $ip }
+    } catch {}
+
+    return ''
 }
 
 function New-SacEventPayload {

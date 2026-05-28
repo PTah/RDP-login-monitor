@@ -80,7 +80,7 @@ $script:MonitorLoopInitialized = $false
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.2.16-SAC"
+$ScriptVersion = "1.2.17-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -1244,8 +1244,12 @@ function Format-Rcm1149Event {
 }
 
 function Get-MonitorServerLabel {
-    if ($null -ne $ServerDisplayName -and -not [string]::IsNullOrWhiteSpace([string]$ServerDisplayName)) {
-        return [string]$ServerDisplayName.Trim()
+    $label = $null
+    if (Get-Variable -Name ServerDisplayName -ErrorAction SilentlyContinue) {
+        $label = (Get-Variable -Name ServerDisplayName -ValueOnly)
+    }
+    if ($null -ne $label -and -not [string]::IsNullOrWhiteSpace([string]$label)) {
+        return [string]$label.Trim()
     }
     return [string]$env:COMPUTERNAME
 }

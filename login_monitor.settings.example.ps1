@@ -29,6 +29,8 @@ $NotifyOrder = 'tg'
 
 # --- Подпись сервера в Telegram и SAC (host.display_name); пусто = $env:COMPUTERNAME ---
 # $ServerDisplayName = 'UNMS Kalina'
+# --- Явный IPv4 хоста для SAC (опционально; иначе автоопределение) ---
+# $ServerIPv4 = '192.168.160.57'
 
 # --- Security Alert Center (SAC) ---
 # off | exclusive | dual | fallback — см. security-alert-center/docs/agent-integration.md
