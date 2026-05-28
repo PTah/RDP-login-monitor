@@ -4,8 +4,28 @@
 .DESCRIPTION
     Dot-source после login_monitor.settings.ps1 и функции Write-Log.
     Ожидает: $UseSAC, $SacUrl, $SacApiKey, $ScriptVersion, $script:InstallRoot.
-    Release: 1.2.9-SAC (UTF-8 ingest, title/summary limits, no spool on HTTP 422).
+    Release: 1.2.10-SAC (treat HTTP 201/409/202 as success when Invoke-WebRequest throws).
 #>
+
+function Test-SacIngestAcceptedStatus {
+    param([int]$StatusCode)
+    return ($StatusCode -in 201, 409, 202)
+}
+
+function Complete-SacIngestSuccess {
+    param(
+        [string]$EventId,
+        [string]$EventType,
+        [int]$StatusCode
+    )
+    Remove-SacSpoolFile -EventId $EventId
+    Reset-SacFailCount
+    if ($StatusCode -eq 409) {
+        Write-SacLog "SAC: duplicate OK (HTTP 409) event_id=$EventId type=$EventType"
+    } else {
+        Write-SacLog "SAC: accepted event_id=$EventId type=$EventType (HTTP $StatusCode)"
+    }
+}
 
 function Get-SacUtf8Bytes {
     param([Parameter(Mandatory = $true)][string]$Text)
@@ -276,10 +296,8 @@ function Invoke-SacPostPayload {
         }
         $bodyBytes = Get-SacUtf8Bytes -Text $JsonBody
         $resp = Invoke-WebRequest -Uri $ingest -Method Post -Headers $headers -Body $bodyBytes -UseBasicParsing -TimeoutSec $timeout
-        if ($resp.StatusCode -in 201, 409, 202) {
-            Remove-SacSpoolFile -EventId $eventId
-            Reset-SacFailCount
-            Write-SacLog "SAC: accepted event_id=$eventId type=$eventType"
+        if (Test-SacIngestAcceptedStatus -StatusCode $resp.StatusCode) {
+            Complete-SacIngestSuccess -EventId $eventId -EventType $eventType -StatusCode $resp.StatusCode
             return $true
         }
         $body = if ($resp.Content) { $resp.Content } else { '' }
@@ -298,6 +316,10 @@ function Invoke-SacPostPayload {
         $body = Get-SacHttpErrorBody -Exception $_.Exception
         if ($_.Exception.Response) {
             $code = [int]$_.Exception.Response.StatusCode
+        }
+        if (Test-SacIngestAcceptedStatus -StatusCode $code) {
+            Complete-SacIngestSuccess -EventId $eventId -EventType $eventType -StatusCode $code
+            return $true
         }
         if ($code -eq 422) {
             $spoolOnFailure = $false
