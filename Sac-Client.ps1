@@ -4,7 +4,7 @@
 .DESCRIPTION
     Dot-source после login_monitor.settings.ps1 и функции Write-Log.
     Ожидает: $UseSAC, $SacUrl, $SacApiKey, $ScriptVersion, $script:InstallRoot.
-    Release: 1.2.12-SAC (fix null+JSON body from pipeline; no ConvertFrom-Json on ingest).
+    Release: 1.2.13-SAC (fix BOM strip: never StartsWith([char]0xFEFF) on PS strings).
 #>
 
 function Test-SacIngestAcceptedStatus {
@@ -27,16 +27,46 @@ function Complete-SacIngestSuccess {
     }
 }
 
-function Get-SacUtf8Bytes {
-    param([Parameter(Mandatory = $true)][string]$Text)
-    $t = Get-SacSingleString -Value $Text -Label 'request body'
-    if ($t.StartsWith([char]0xFEFF)) { $t = $t.Substring(1) }
-    # PowerShell иногда склеивает $null и JSON в "null{...}" — ломает FastAPI json parser
+function Remove-SacLeadingBomChar {
+    param([string]$Text)
+    $t = $Text
+    # Нельзя $t.StartsWith([char]0xFEFF): в PS нет StartsWith(char), char→string даёт ложные совпадения и срезает '{'.
+    while ($t.Length -gt 0 -and [int][char]$t[0] -eq 0xFEFF) {
+        Write-SacLog 'WARN: SAC stripped U+FEFF BOM character before JSON body'
+        $t = $t.Substring(1)
+    }
+    return $t
+}
+
+function Repair-SacJsonText {
+    param([string]$Text)
+    $t = Get-SacSingleString -Value $Text -Label 'json body'
+    $t = Remove-SacLeadingBomChar -Text $t
+    $t = $t.TrimStart()
     if ($t.Length -gt 5 -and $t.StartsWith('null', [System.StringComparison]::Ordinal) -and $t[4] -eq '{') {
         Write-SacLog 'WARN: SAC stripped accidental null prefix before JSON body'
-        $t = $t.Substring(4)
+        $t = $t.Substring(4).TrimStart()
     }
-    return (New-Object System.Text.UTF8Encoding $false).GetBytes($t)
+    if ($t.Length -gt 0 -and $t[0] -ne '{') {
+        $brace = $t.IndexOf('{')
+        if ($brace -gt 0) {
+            Write-SacLog "WARN: SAC stripped $brace chars before first '{' in JSON body"
+            $t = $t.Substring($brace)
+        }
+    }
+    return $t
+}
+
+function Get-SacUtf8Bytes {
+    param([Parameter(Mandatory = $true)][string]$Text)
+    $t = Repair-SacJsonText -Text $Text
+    $enc = New-Object System.Text.UTF8Encoding $false
+    $bytes = $enc.GetBytes($t)
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        Write-SacLog 'WARN: SAC stripped UTF-8 BOM bytes before JSON body'
+        $bytes = $bytes[3..($bytes.Length - 1)]
+    }
+    return $bytes
 }
 
 function Write-SacLog {
@@ -113,16 +143,24 @@ function Get-SacAgentInstanceId {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
     if (Test-Path -LiteralPath $idFile) {
-        $existing = (Get-Content -LiteralPath $idFile -TotalCount 1 -ErrorAction SilentlyContinue)
+        $existing = Read-SacAgentIdFileText -Path $idFile
         if (-not [string]::IsNullOrWhiteSpace($existing)) {
+            $existing = Remove-SacLeadingBomChar -Text $existing.Trim()
             return $existing.Trim()
         }
     }
     $newId = [guid]::NewGuid().ToString()
     try {
-        Set-Content -LiteralPath $idFile -Value $newId -Encoding UTF8 -NoNewline
+        [System.IO.File]::WriteAllText($idFile, $newId, (New-Object System.Text.UTF8Encoding $false))
     } catch { }
     return $newId
+}
+
+function Read-SacAgentIdFileText {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    $enc = New-Object System.Text.UTF8Encoding $false
+    return [System.IO.File]::ReadAllText($Path, $enc).Trim()
 }
 
 function Get-SacOccurredAtIso {
@@ -160,10 +198,10 @@ function ConvertTo-SacJsonText {
         $ser = New-Object System.Web.Script.Serialization.JavaScriptSerializer
         $ser.MaxJsonLength = 16777216
         $ser.RecursionLimit = 32
-        return $ser.Serialize($serializable)
+        return ,$ser.Serialize($serializable)
     } catch {
         Write-SacLog "WARN: JavaScriptSerializer unavailable, fallback ConvertTo-Json ($($_.Exception.Message))"
-        return ($serializable | ConvertTo-Json -Depth 12 -Compress)
+        return ,($serializable | ConvertTo-Json -Depth 12 -Compress)
     }
 }
 
@@ -342,6 +380,29 @@ function Move-SacSpoolToRejected {
     Move-Item -LiteralPath $src -Destination $dst -Force -ErrorAction SilentlyContinue
 }
 
+function Write-SacPostBodyDiagnostic {
+    param(
+        [byte[]]$BodyBytes,
+        [string]$EventId
+    )
+    if ($null -eq $BodyBytes -or $BodyBytes.Length -eq 0) { return }
+    $take = [Math]::Min(32, $BodyBytes.Length)
+    $hex = (($BodyBytes[0..($take - 1)] | ForEach-Object { '{0:X2}' -f $_ }) -join ' ')
+    Write-SacLog "WARN: SAC POST body prefix ($take bytes hex): $hex"
+    if ([string]::IsNullOrWhiteSpace($script:InstallRoot)) { return }
+    try {
+        $logDir = Join-Path $script:InstallRoot 'Logs'
+        if (-not (Test-Path -LiteralPath $logDir)) {
+            New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+        }
+        $path = Join-Path $logDir 'sac-last-post.json'
+        [System.IO.File]::WriteAllBytes($path, $BodyBytes)
+        Write-SacLog "WARN: SAC saved last POST body to $path (event_id=$EventId)"
+    } catch {
+        Write-SacLog "WARN: SAC could not save sac-last-post.json: $($_.Exception.Message)"
+    }
+}
+
 function Invoke-SacPostPayload {
     param([string]$JsonBody)
 
@@ -351,7 +412,7 @@ function Invoke-SacPostPayload {
     $ingest = Get-SacIngestUrl
     if ([string]::IsNullOrWhiteSpace($ingest)) { return $false }
 
-    $jsonText = Get-SacSingleString -Value $JsonBody -Label 'spool payload'
+    $jsonText = Repair-SacJsonText -Text (Get-SacSingleString -Value $JsonBody -Label 'spool payload')
     if ($jsonText -notmatch '"event_id"\s*:\s*"([0-9a-fA-F-]{36})"') {
         Write-SacLog 'WARN: SAC JSON has no event_id (uuid); skip POST'
         return $false
@@ -381,6 +442,7 @@ function Invoke-SacPostPayload {
         if ($resp.StatusCode -eq 422) {
             $spoolOnFailure = $false
             Write-SacLog "WARN: SAC POST HTTP 422 validation (not spooled) type=$eventType event_id=$eventId"
+            Write-SacPostBodyDiagnostic -BodyBytes $bodyBytes -EventId $eventId
         }
         if ($body.Length -gt 0) {
             $snippet = $body.Substring(0, [Math]::Min(800, $body.Length))
@@ -401,6 +463,7 @@ function Invoke-SacPostPayload {
         if ($code -eq 422) {
             $spoolOnFailure = $false
             Write-SacLog "WARN: SAC POST HTTP 422 validation (not spooled) type=$eventType event_id=$eventId"
+            Write-SacPostBodyDiagnostic -BodyBytes $bodyBytes -EventId $eventId
         }
         $err = $_.Exception.Message
         if ($body.Length -gt 0) {
@@ -440,12 +503,12 @@ function Send-SacEvent {
         return $false
     }
 
-    $payload = New-SacEventPayload -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $Details
+    $payload = $(New-SacEventPayload -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $Details)
     if ($payload -is [System.Array]) {
         $payload = $payload[-1]
     }
-    $json = ConvertTo-SacJsonText -Payload $payload
-    $json = Get-SacSingleString -Value $json -Label 'event json'
+    $json = $(ConvertTo-SacJsonText -Payload $payload)
+    $json = Repair-SacJsonText -Text (Get-SacSingleString -Value $json -Label 'event json')
     if ([string]::IsNullOrWhiteSpace($json) -or $json[0] -ne '{') {
         Write-SacLog "WARN: SAC invalid JSON for type=$EventType (empty or does not start with {{)"
         return $false
