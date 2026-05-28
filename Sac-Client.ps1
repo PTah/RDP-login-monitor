@@ -4,7 +4,7 @@
 .DESCRIPTION
     Dot-source после login_monitor.settings.ps1 и функции Write-Log.
     Ожидает: $UseSAC, $SacUrl, $SacApiKey, $ScriptVersion, $script:InstallRoot.
-    Release: 1.2.11-SAC (JSON via JavaScriptSerializer for Cyrillic; better 422 logging).
+    Release: 1.2.12-SAC (fix null+JSON body from pipeline; no ConvertFrom-Json on ingest).
 #>
 
 function Test-SacIngestAcceptedStatus {
@@ -29,16 +29,39 @@ function Complete-SacIngestSuccess {
 
 function Get-SacUtf8Bytes {
     param([Parameter(Mandatory = $true)][string]$Text)
-    return (New-Object System.Text.UTF8Encoding $false).GetBytes($Text)
+    $t = Get-SacSingleString -Value $Text -Label 'request body'
+    if ($t.StartsWith([char]0xFEFF)) { $t = $t.Substring(1) }
+    # PowerShell иногда склеивает $null и JSON в "null{...}" — ломает FastAPI json parser
+    if ($t.Length -gt 5 -and $t.StartsWith('null', [System.StringComparison]::Ordinal) -and $t[4] -eq '{') {
+        Write-SacLog 'WARN: SAC stripped accidental null prefix before JSON body'
+        $t = $t.Substring(4)
+    }
+    return (New-Object System.Text.UTF8Encoding $false).GetBytes($t)
 }
 
 function Write-SacLog {
     param([string]$Message)
     if (Get-Command Write-Log -ErrorAction SilentlyContinue) {
-        Write-Log $Message
+        [void](Write-Log $Message)
     } else {
         Write-Host $Message
     }
+}
+
+function Get-SacSingleString {
+    param($Value, [string]$Label)
+    if ($null -eq $Value) { return '' }
+    if ($Value -is [string]) { return $Value }
+    if ($Value -is [System.Array]) {
+        $parts = @($Value | Where-Object { $null -ne $_ -and $_ -is [string] -and $_.Length -gt 0 })
+        if ($parts.Count -gt 0) {
+            if ($parts.Count -gt 1) {
+                Write-SacLog "WARN: SAC $Label had $($parts.Count) string parts; using last"
+            }
+            return [string]$parts[-1]
+        }
+    }
+    return [string]$Value
 }
 
 function Get-SacNormalizedMode {
@@ -328,9 +351,16 @@ function Invoke-SacPostPayload {
     $ingest = Get-SacIngestUrl
     if ([string]::IsNullOrWhiteSpace($ingest)) { return $false }
 
-    $obj = $JsonBody | ConvertFrom-Json
-    $eventId = [string]$obj.event_id
-    $eventType = [string]$obj.type
+    $jsonText = Get-SacSingleString -Value $JsonBody -Label 'spool payload'
+    if ($jsonText -notmatch '"event_id"\s*:\s*"([0-9a-fA-F-]{36})"') {
+        Write-SacLog 'WARN: SAC JSON has no event_id (uuid); skip POST'
+        return $false
+    }
+    $eventId = $Matches[1]
+    $eventType = 'unknown'
+    if ($jsonText -match '"type"\s*:\s*"([^"]+)"') {
+        $eventType = $Matches[1]
+    }
     $timeout = if ($SacTimeoutSec) { [int]$SacTimeoutSec } else { 12 }
     $spoolOnFailure = $true
 
@@ -341,7 +371,7 @@ function Invoke-SacPostPayload {
             'Content-Type'    = 'application/json; charset=utf-8'
             'Idempotency-Key' = $eventId
         }
-        $bodyBytes = Get-SacUtf8Bytes -Text $JsonBody
+        $bodyBytes = Get-SacUtf8Bytes -Text $jsonText
         $resp = Invoke-WebRequest -Uri $ingest -Method Post -Headers $headers -Body $bodyBytes -UseBasicParsing -TimeoutSec $timeout
         if (Test-SacIngestAcceptedStatus -StatusCode $resp.StatusCode) {
             Complete-SacIngestSuccess -EventId $eventId -EventType $eventType -StatusCode $resp.StatusCode
@@ -386,7 +416,7 @@ function Invoke-SacPostPayload {
         return $false
     }
 
-    Write-SacSpoolFile -EventId $eventId -JsonBody $JsonBody
+    Write-SacSpoolFile -EventId $eventId -JsonBody $jsonText
     $max = if ($SacFallbackFailures) { [int]$SacFallbackFailures } else { 5 }
     $n = Get-SacFailCount + 1
     Set-SacFailCount -Count $n
@@ -411,7 +441,15 @@ function Send-SacEvent {
     }
 
     $payload = New-SacEventPayload -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $Details
+    if ($payload -is [System.Array]) {
+        $payload = $payload[-1]
+    }
     $json = ConvertTo-SacJsonText -Payload $payload
+    $json = Get-SacSingleString -Value $json -Label 'event json'
+    if ([string]::IsNullOrWhiteSpace($json) -or $json[0] -ne '{') {
+        Write-SacLog "WARN: SAC invalid JSON for type=$EventType (empty or does not start with {{)"
+        return $false
+    }
     return (Invoke-SacPostPayload -JsonBody $json)
 }
 
