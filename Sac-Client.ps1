@@ -4,7 +4,7 @@
 .DESCRIPTION
     Dot-source после login_monitor.settings.ps1 и функции Write-Log.
     Ожидает: $UseSAC, $SacUrl, $SacApiKey, $ScriptVersion, $script:InstallRoot.
-    Release: 1.2.8-SAC (ingest UTF-8 body for Cyrillic summary/details).
+    Release: 1.2.9-SAC (UTF-8 ingest, title/summary limits, no spool on HTTP 422).
 #>
 
 function Get-SacUtf8Bytes {
@@ -92,6 +92,33 @@ function Get-SacCategoryForType {
     return 'agent'
 }
 
+function Limit-SacString {
+    param(
+        [string]$Text,
+        [int]$MaxLen,
+        [string]$Label
+    )
+    if ([string]::IsNullOrEmpty($Text)) { return '' }
+    if ($Text.Length -le $MaxLen) { return $Text }
+    Write-SacLog "WARN: SAC truncate $Label $($Text.Length) -> $MaxLen chars (event schema limit)"
+    return $Text.Substring(0, $MaxLen)
+}
+
+function Get-SacHttpErrorBody {
+    param($Exception)
+    try {
+        if ($null -eq $Exception -or $null -eq $Exception.Response) { return '' }
+        $stream = $Exception.Response.GetResponseStream()
+        if ($null -eq $stream) { return '' }
+        $reader = New-Object System.IO.StreamReader($stream)
+        $body = $reader.ReadToEnd()
+        $reader.Close()
+        return $body
+    } catch {
+        return ''
+    }
+}
+
 function New-SacEventPayload {
     param(
         [Parameter(Mandatory = $true)][string]$EventType,
@@ -100,6 +127,9 @@ function New-SacEventPayload {
         [Parameter(Mandatory = $true)][string]$Summary,
         [hashtable]$Details = $null
     )
+
+    $Title = Limit-SacString -Text $Title -MaxLen 256 -Label 'title'
+    $Summary = Limit-SacString -Text $Summary -MaxLen 8192 -Label 'summary'
 
     $payload = [ordered]@{
         schema_version = '1.0'
@@ -209,6 +239,19 @@ function Remove-SacSpoolFile {
     }
 }
 
+function Move-SacSpoolToRejected {
+    param([string]$EventId)
+    $dir = Get-SacSpoolDirResolved
+    $src = Join-Path $dir "$EventId.json"
+    if (-not (Test-Path -LiteralPath $src)) { return }
+    $rejDir = Join-Path $dir 'rejected'
+    if (-not (Test-Path -LiteralPath $rejDir)) {
+        New-Item -ItemType Directory -Path $rejDir -Force | Out-Null
+    }
+    $dst = Join-Path $rejDir "$EventId.json"
+    Move-Item -LiteralPath $src -Destination $dst -Force -ErrorAction SilentlyContinue
+}
+
 function Invoke-SacPostPayload {
     param([string]$JsonBody)
 
@@ -222,6 +265,7 @@ function Invoke-SacPostPayload {
     $eventId = [string]$obj.event_id
     $eventType = [string]$obj.type
     $timeout = if ($SacTimeoutSec) { [int]$SacTimeoutSec } else { 12 }
+    $spoolOnFailure = $true
 
     try {
         Invoke-SacTlsPrep
@@ -239,14 +283,38 @@ function Invoke-SacPostPayload {
             return $true
         }
         $body = if ($resp.Content) { $resp.Content } else { '' }
-        Write-SacLog "WARN: SAC POST HTTP $($resp.StatusCode): $($body.Substring(0, [Math]::Min(200, $body.Length)))"
+        if ($resp.StatusCode -eq 422) {
+            $spoolOnFailure = $false
+            Write-SacLog "WARN: SAC POST HTTP 422 validation (not spooled) type=$eventType event_id=$eventId"
+        }
+        if ($body.Length -gt 0) {
+            $snippet = $body.Substring(0, [Math]::Min(800, $body.Length))
+            Write-SacLog "WARN: SAC POST HTTP $($resp.StatusCode): $snippet"
+        } else {
+            Write-SacLog "WARN: SAC POST HTTP $($resp.StatusCode) (empty body)"
+        }
     } catch {
         $code = 0
+        $body = Get-SacHttpErrorBody -Exception $_.Exception
         if ($_.Exception.Response) {
             $code = [int]$_.Exception.Response.StatusCode
         }
+        if ($code -eq 422) {
+            $spoolOnFailure = $false
+            Write-SacLog "WARN: SAC POST HTTP 422 validation (not spooled) type=$eventType event_id=$eventId"
+        }
         $err = $_.Exception.Message
-        Write-SacLog "WARN: SAC POST HTTP ${code}: $err"
+        if ($body.Length -gt 0) {
+            $snippet = $body.Substring(0, [Math]::Min(800, $body.Length))
+            Write-SacLog "WARN: SAC POST HTTP ${code}: $err | $snippet"
+        } else {
+            Write-SacLog "WARN: SAC POST HTTP ${code}: $err"
+        }
+    }
+
+    if (-not $spoolOnFailure) {
+        Move-SacSpoolToRejected -EventId $eventId
+        return $false
     }
 
     Write-SacSpoolFile -EventId $eventId -JsonBody $JsonBody
@@ -371,9 +439,12 @@ function Invoke-SacFlushSpool {
         $count++
         if ($count -gt $MaxFiles) { break }
         try {
-            $json = [System.IO.File]::ReadAllText($f.FullName)
+            $utf8 = New-Object System.Text.UTF8Encoding $false
+            $json = [System.IO.File]::ReadAllText($f.FullName, $utf8)
             Invoke-SacPostPayload -JsonBody $json | Out-Null
-        } catch { }
+        } catch {
+            Write-SacLog "WARN: SAC spool flush failed for $($f.Name): $($_.Exception.Message)"
+        }
     }
 }
 
