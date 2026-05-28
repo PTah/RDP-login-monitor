@@ -4,8 +4,13 @@
 .DESCRIPTION
     Dot-source после login_monitor.settings.ps1 и функции Write-Log.
     Ожидает: $UseSAC, $SacUrl, $SacApiKey, $ScriptVersion, $script:InstallRoot.
-    Release: 1.2.7-SAC (ingest HTTP 201/409/202).
+    Release: 1.2.8-SAC (ingest UTF-8 body for Cyrillic summary/details).
 #>
+
+function Get-SacUtf8Bytes {
+    param([Parameter(Mandatory = $true)][string]$Text)
+    return (New-Object System.Text.UTF8Encoding $false).GetBytes($Text)
+}
 
 function Write-SacLog {
     param([string]$Message)
@@ -221,11 +226,12 @@ function Invoke-SacPostPayload {
     try {
         Invoke-SacTlsPrep
         $headers = @{
-            Authorization   = "Bearer $SacApiKey"
-            'Content-Type'  = 'application/json'
+            Authorization     = "Bearer $SacApiKey"
+            'Content-Type'    = 'application/json; charset=utf-8'
             'Idempotency-Key' = $eventId
         }
-        $resp = Invoke-WebRequest -Uri $ingest -Method Post -Headers $headers -Body $JsonBody -UseBasicParsing -TimeoutSec $timeout
+        $bodyBytes = Get-SacUtf8Bytes -Text $JsonBody
+        $resp = Invoke-WebRequest -Uri $ingest -Method Post -Headers $headers -Body $bodyBytes -UseBasicParsing -TimeoutSec $timeout
         if ($resp.StatusCode -in 201, 409, 202) {
             Remove-SacSpoolFile -EventId $eventId
             Reset-SacFailCount
