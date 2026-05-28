@@ -80,7 +80,7 @@ $script:MonitorLoopInitialized = $false
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.2.17-SAC"
+$ScriptVersion = "1.2.18-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -94,6 +94,8 @@ $LogRotationMinute = 0
 # Heartbeat (файл; при отсутствии обновления > HeartbeatStaleAlertMultiplier × интервал — оповещение)
 $HeartbeatInterval = 3600
 $HeartbeatStaleAlertMultiplier = 2
+# Один RDP-вход часто даёт 2+ события 4624 с одним временем — не слать дубли в Telegram/SAC.
+$LoginSuccessNotifyDedupSeconds = 90
 $HeartbeatFile = Join-Path $script:InstallRoot "Logs\last_heartbeat.txt"
 $DeployUpdateMarkerFile = Join-Path $script:InstallRoot "deploy_last_update.txt"
 # Построчные правила подавления уведомлений Security 4624/4625 (см. ignore.lst.example в репозитории).
@@ -1900,6 +1902,37 @@ function Format-LoginEvent {
 }
 
 $script:FailedLogonBuckets = @{}
+$script:LoginSuccessNotifyDedup = @{}
+
+function Get-RdpLoginSuccessNotifyDedupKey {
+    param(
+        [string]$SecurityLogComputerName,
+        [string]$Username,
+        [string]$SourceIP,
+        [int]$LogonType
+    )
+    $hostPart = if ([string]::IsNullOrWhiteSpace($SecurityLogComputerName)) { $env:COMPUTERNAME } else { $SecurityLogComputerName.Trim() }
+    $userPart = if ($null -ne $Username) { $Username.Trim() } else { '-' }
+    $ipPart = if ($null -ne $SourceIP) { $SourceIP.Trim() } else { '-' }
+    return "$hostPart|4624|$userPart|$ipPart|$LogonType"
+}
+
+function Test-RdpLoginSuccessNotifyDedupAllow {
+    param(
+        [string]$DedupKey,
+        [datetime]$TimeCreated
+    )
+    if ($LoginSuccessNotifyDedupSeconds -le 0) { return $true }
+    if ($script:LoginSuccessNotifyDedup.ContainsKey($DedupKey)) {
+        $lastUtc = $script:LoginSuccessNotifyDedup[$DedupKey]
+        $delta = ($TimeCreated.ToUniversalTime() - $lastUtc).TotalSeconds
+        if ($delta -ge 0 -and $delta -lt $LoginSuccessNotifyDedupSeconds) {
+            return $false
+        }
+    }
+    $script:LoginSuccessNotifyDedup[$DedupKey] = $TimeCreated.ToUniversalTime()
+    return $true
+}
 
 function Get-FailedLogonSourceKeyPart {
     param(
@@ -2634,35 +2667,57 @@ function Start-LoginMonitor {
                     $eventInfo = Get-LoginEventInfo -Event $event
                     $logonTypeName = Get-LogonTypeName -LogonType $eventInfo.LogonType
                     $shouldIgnore = $false
+                    $ignoreReason = ''
 
                     if ($MonitorInteractiveOnly -and -not $MonitorAllEvents) {
                         if ($event.Id -eq 4648) {
                             $shouldIgnore = $true
+                            $ignoreReason = 'EventID 4648 excluded (MonitorInteractiveOnly)'
                         } elseif ($event.Id -in 4624, 4625) {
                             if ($osKind.IsWorkstation) {
                                 $interactiveTypes = @(10)
+                                $modeLabel = 'workstation LT10'
                             } else {
                                 $interactiveTypes = @(2, 3, 10)
+                                $modeLabel = 'server LT2/3/10'
                             }
                             if ($interactiveTypes -notcontains $eventInfo.LogonType) {
                                 $shouldIgnore = $true
+                                $ignoreReason = "LogonType $($eventInfo.LogonType) not in $modeLabel"
                             }
                         } else {
                             $shouldIgnore = $true
+                            $ignoreReason = "EventID $($event.Id) not monitored"
                         }
                     }
 
                     if (-not $shouldIgnore -and -not $MonitorAllEvents) {
-                        $shouldIgnore = Should-IgnoreEvent -Username $eventInfo.Username `
-                            -ProcessName $eventInfo.ProcessName `
-                            -ComputerName $eventInfo.ComputerName `
-                            -EventID $event.Id `
-                            -LogonType $eventInfo.LogonType `
-                            -SourceIP $eventInfo.SourceIP
+                        if (Should-IgnoreEvent -Username $eventInfo.Username `
+                                -ProcessName $eventInfo.ProcessName `
+                                -ComputerName $eventInfo.ComputerName `
+                                -EventID $event.Id `
+                                -LogonType $eventInfo.LogonType `
+                                -SourceIP $eventInfo.SourceIP) {
+                            $shouldIgnore = $true
+                            $ignoreReason = 'ignore.lst or built-in exclusion (user/process/IP/workstation)'
+                        }
                     }
 
-                    if (-not $shouldIgnore) {
-                        if ($event.Id -eq 4625 -and $FailedLogonRateLimitEnabled) {
+                    if ($shouldIgnore) {
+                        Write-Log "Skip $($event.Id): User=$($eventInfo.Username) LT=$($eventInfo.LogonType) IP=$($eventInfo.SourceIP) Wks=$($eventInfo.ComputerName) — $ignoreReason"
+                        continue
+                    }
+
+                    if ($event.Id -eq 4624) {
+                        $dedupKey = Get-RdpLoginSuccessNotifyDedupKey -SecurityLogComputerName $event.MachineName `
+                            -Username $eventInfo.Username -SourceIP $eventInfo.SourceIP -LogonType $eventInfo.LogonType
+                        if (-not (Test-RdpLoginSuccessNotifyDedupAllow -DedupKey $dedupKey -TimeCreated $eventInfo.TimeCreated)) {
+                            Write-Log "Notify dedup 4624: User=$($eventInfo.Username) LT=$($eventInfo.LogonType) IP=$($eventInfo.SourceIP) (window ${LoginSuccessNotifyDedupSeconds}s)"
+                            continue
+                        }
+                    }
+
+                    if ($event.Id -eq 4625 -and $FailedLogonRateLimitEnabled) {
                             $rl = Get-FailedLogonRateLimitDecision4625 -SourceIP $eventInfo.SourceIP `
                                 -ComputerName $eventInfo.ComputerName -Username $eventInfo.Username `
                                 -LogonType $eventInfo.LogonType -TimeCreated $eventInfo.TimeCreated `
@@ -2731,7 +2786,6 @@ function Start-LoginMonitor {
                                     event_id_windows = [int]$event.Id
                                     workstation_name = $eventInfo.ComputerName
                                 } | Out-Null
-                        }
                     }
                 }
                 $lastCheckTime = ($events | Measure-Object -Property TimeCreated -Maximum | Select-Object -ExpandProperty Maximum).AddSeconds(1)

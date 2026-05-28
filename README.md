@@ -84,6 +84,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\ProgramData\RDP-logi
 - Stale heartbeat: если **`last_heartbeat.txt`** не обновлялся дольше **`$HeartbeatStaleAlertMultiplier` × `$HeartbeatInterval`** — оповещение в Telegram/Email (см. п. 8 подготовки).
 - При старте в Telegram/Email: строка **«Каналы уведомлений»** (фактический порядок доставки), плюс режим RDS/4740 по конфигурации.
 - Telegram при старте: при установленном **RD Session Host** (или аналогичных компонентах RDS, не только шлюз) — строка про входы по RDP/RDS на этом сервере; при доступном журнале **RD Gateway** — отдельная строка про подключения к **внутренним целевым ПК** через шлюз (302/303). Узел только с ролью RD Gateway не дублирует формулировку «хост сессий».
+- **Дубли Telegram на один RDP-вход:** Windows часто пишет **несколько 4624** с одним временем; с версии **1.2.18-SAC** второе уведомление за **`$LoginSuccessNotifyDedupSeconds`** (90 с) подавляется (`Notify dedup 4624` в логе).
+- **В логе нет `Notify`, но 4624 в Security есть:** монитор обрабатывает только события **после** своего `StartTime` (окно опроса ~10 с при старте). Ищите строки **`Skip 4624:`** (фильтр LogonType / ignore.lst). Диагностика: **`tools\Show-Rdp4624Recent.ps1`**.
 
 ## 5) Автоматический перезапуск при падении
 
