@@ -80,7 +80,7 @@ $script:MonitorLoopInitialized = $false
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.2.20-SAC"
+$ScriptVersion = "1.2.21-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -106,6 +106,8 @@ $script:IgnoreListCacheStampUtc = $null
 # Ежедневный отчет
 $DailyReportHour = 9
 $DailyReportMinute = 0
+# $false = не слать report.daily.rdp с агента (суточный отчёт только из SAC)
+$DailyReportEnabled = $true
 $LastReportFile = Join-Path $script:InstallRoot "Logs\last_daily_report.txt"
 
 # RD Gateway
@@ -1256,6 +1258,153 @@ function Get-MonitorServerLabel {
     return [string]$env:COMPUTERNAME
 }
 
+function Get-MonitorServerLabelWithIp {
+    $label = Get-MonitorServerLabel
+    $ip = ''
+    if (Get-Command -Name Get-SacHostIPv4 -ErrorAction SilentlyContinue) {
+        $ip = [string](Get-SacHostIPv4)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ip)) {
+        return '{0} ({1})' -f $label, $ip.Trim()
+    }
+    return $label
+}
+
+function Get-InteractiveLogonTypesForDailyReport {
+    if ($script:IsWorkstation) { return @(10) }
+    return @(2, 3, 10)
+}
+
+function Get-DailyReportAuthStats24h {
+    $since = (Get-Date).AddHours(-24)
+    $interactive = @(Get-InteractiveLogonTypesForDailyReport)
+    $ok = 0
+    $fail = 0
+    $failedByIp = @{}
+    try {
+        $events = @(Get-WinEvent -FilterHashtable @{
+            LogName   = 'Security'
+            Id        = 4624, 4625
+            StartTime = $since
+        } -ErrorAction Stop)
+    } catch {
+        Write-Log "Daily report: Security log unavailable: $($_.Exception.Message)"
+        return @{
+            rdp_success      = 0
+            rdp_failed       = 0
+            active_bans      = 0
+            top_failed_ips   = @()
+        }
+    }
+    foreach ($ev in $events) {
+        $info = Get-LoginEventInfo -Event $ev
+        if (Should-IgnoreEvent -Username $info.Username -ProcessName $info.ProcessName `
+                -ComputerName $info.ComputerName -EventID $ev.Id -LogonType $info.LogonType -SourceIP $info.SourceIP) {
+            continue
+        }
+        if ($interactive -notcontains $info.LogonType) { continue }
+        if ($ev.Id -eq 4624) {
+            $ok++
+        } else {
+            $fail++
+            $ip = [string]$info.SourceIP
+            if (-not [string]::IsNullOrWhiteSpace($ip) -and $ip -ne '-') {
+                if (-not $failedByIp.ContainsKey($ip)) { $failedByIp[$ip] = 0 }
+                $failedByIp[$ip]++
+            }
+        }
+    }
+    $top = @(
+        $failedByIp.GetEnumerator() |
+            Sort-Object -Property Value -Descending |
+            Select-Object -First 5 |
+            ForEach-Object { '{0} — {1}' -f $_.Key, $_.Value }
+    )
+    return @{
+        rdp_success    = $ok
+        rdp_failed     = $fail
+        active_bans    = 0
+        top_failed_ips = $top
+    }
+}
+
+function Get-DailyReportActiveUsersFromQuser {
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $quserExe = Join-Path $env:SystemRoot 'System32\quser.exe'
+    if (-not (Test-Path -LiteralPath $quserExe)) {
+        return ,$lines
+    }
+    $quserOutput = @(& $quserExe 2>$null)
+    if (-not $quserOutput -or $quserOutput.Count -le 1) {
+        return ,$lines
+    }
+    foreach ($raw in @($quserOutput | Select-Object -Skip 1)) {
+        $line = ($raw -replace '\s+', ' ').Trim()
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        $parts = $line -split ' ', 2
+        if ($parts.Count -lt 1) { continue }
+        $u = $parts[0].Trim()
+        if ([string]::IsNullOrWhiteSpace($u) -or $u -eq 'USERNAME') { continue }
+        $lines.Add(('👤 {0}' -f $u)) | Out-Null
+    }
+    return ,$lines
+}
+
+function Build-DailyReportPlainBodyWindows {
+    param(
+        [hashtable]$Stats,
+        [string[]]$ActiveUsers,
+        [datetime]$ReportTime
+    )
+    $server = Get-MonitorServerLabelWithIp
+    $timeStr = $ReportTime.ToString('dd.MM.yyyy HH:mm:ss')
+    $ok = [int]$Stats.rdp_success
+    $fail = [int]$Stats.rdp_failed
+    $bans = [int]$Stats.active_bans
+    $top = @($Stats.top_failed_ips)
+    $sb = [System.Text.StringBuilder]::new()
+    [void]$sb.AppendLine('📊 ЕЖЕДНЕВНЫЙ ОТЧЕТ МОНИТОРИНГА WINDOWS')
+    [void]$sb.AppendLine("🖥️ Сервер: $server")
+    [void]$sb.AppendLine("🕐 Время отчета: $timeStr")
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine('📈 СТАТИСТИКА ЗА ПОСЛЕДНИЕ 24 ЧАСА:')
+    [void]$sb.AppendLine(" ✅ Успешных RDP подключений: $ok")
+    [void]$sb.AppendLine(" ❌ Неудачных попыток RDP: $fail")
+    [void]$sb.AppendLine(" 🚫 Активных банов: $bans")
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine('🧾 ТОП-5 IP ПО НЕУДАЧНЫМ ПОПЫТКАМ:')
+    if ($top.Count -gt 0) {
+        foreach ($row in $top) { [void]$sb.AppendLine(" $row") }
+    } else {
+        [void]$sb.AppendLine(' (нет данных)')
+    }
+    [void]$sb.AppendLine('')
+    $userCount = $ActiveUsers.Count
+    [void]$sb.AppendLine("👥 АКТИВНЫЕ ПОЛЬЗОВАТЕЛИ ($userCount):")
+    if ($userCount -gt 0) {
+        foreach ($u in $ActiveUsers) { [void]$sb.AppendLine(" $u") }
+    } else {
+        [void]$sb.AppendLine(' (нет данных)')
+    }
+    return $sb.ToString().TrimEnd()
+}
+
+function Convert-DailyReportPlainToTelegramHtml {
+    param([string]$PlainBody)
+    $lines = $PlainBody -split "`r?`n"
+    $out = [System.Collections.Generic.List[string]]::new()
+    foreach ($line in $lines) {
+        if ($line -match '^📊') {
+            $out.Add(('<b>{0}</b>' -f [System.Net.WebUtility]::HtmlEncode($line))) | Out-Null
+        } elseif ($line.Length -gt 0) {
+            $out.Add([System.Net.WebUtility]::HtmlEncode($line)) | Out-Null
+        } else {
+            $out.Add('') | Out-Null
+        }
+    }
+    return ($out -join "`r`n")
+}
+
 function Send-Heartbeat {
     param([switch]$IsStartup = $false)
 
@@ -2342,58 +2491,44 @@ function Format-RDGatewayEvent {
 
 function Send-DailyReport {
     try {
-        $quserExe = Join-Path $env:SystemRoot 'System32\quser.exe'
-        $quserOutput = if (Test-Path -LiteralPath $quserExe) {
-            @(& $quserExe 2>$null)
-        } else {
-            Write-Log "quser.exe not found: $quserExe"
-            @()
+        $reportTime = Get-Date
+        $stats = Get-DailyReportAuthStats24h
+        $activeUsers = @(Get-DailyReportActiveUsersFromQuser)
+        $plainBody = Build-DailyReportPlainBodyWindows -Stats $stats -ActiveUsers $activeUsers -ReportTime $reportTime
+        $telegramMessage = Convert-DailyReportPlainToTelegramHtml -PlainBody $plainBody
+
+        $uniqueUsers = @(
+            $activeUsers | ForEach-Object {
+                ($_ -replace '^👤\s*', '').Trim()
+            } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique
+        )
+        $statsForSac = @{
+            platform           = 'windows'
+            successful_logins  = [int]$stats.rdp_success
+            failed_logins      = [int]$stats.rdp_failed
+            rdp_success        = [int]$stats.rdp_success
+            rdp_failed         = [int]$stats.rdp_failed
+            active_bans        = [int]$stats.active_bans
+            top_failed_ips     = @($stats.top_failed_ips)
+            active_users       = @($activeUsers)
+            unique_users       = @($uniqueUsers)
+            active_sessions_rdp = $activeUsers.Count
+            generated_by       = 'agent'
         }
-        $usernames = [System.Collections.Generic.List[string]]::new()
-        if ($quserOutput -and $quserOutput.Count -gt 1) {
-            $sessionLines = @($quserOutput | Select-Object -Skip 1)
-            foreach ($raw in $sessionLines) {
-                $line = ($raw -replace '\s+', ' ').Trim()
-                if ([string]::IsNullOrWhiteSpace($line)) { continue }
-                $parts = $line -split ' ', 2
-                if ($parts.Count -lt 1) { continue }
-                $u = $parts[0].Trim()
-                if (-not [string]::IsNullOrWhiteSpace($u) -and $u -ne 'USERNAME') {
-                    $usernames.Add($u) | Out-Null
-                }
-            }
-        }
-        $count = $usernames.Count
-        # PS 5.1: без @() один логин даёт скаляр String (нет .Count); пустой список даёт $null.
-        $uniqueUsers = @($usernames | Sort-Object -Unique)
-        $message = "<b>📊 ЕЖЕДНЕВНЫЙ ОТЧЕТ</b>`r`n"
-        $message += "🖥️ Сервер: $(ConvertTo-TelegramHtml (Get-MonitorServerLabel))`r`n"
-        $message += "🕐 Время отчета: $(Get-Date -Format 'dd.MM.yyyy HH:mm:ss')`r`n"
-        $message += "👥 Активных сессий (quser): $count`r`n"
-        if ($uniqueUsers.Count -gt 0) {
-            $message += "`r`n<b>Уникальные логины ($($uniqueUsers.Count)):</b>`r`n"
-            foreach ($name in $uniqueUsers) {
-                $safe = [System.Net.WebUtility]::HtmlEncode($name)
-                $message += "  • $safe`r`n"
-            }
-        } else {
-            $message += "`r`n<i>Список пользователей недоступен (quser пуст или недостаточно прав).</i>"
-        }
+        $escaped = [System.Net.WebUtility]::HtmlEncode($plainBody)
+        $reportHtml = '<div class="agent-report">' + ($escaped -replace "`r?`n", '<br>') + '</div>'
         $rdpReportDetails = @{
-            stats           = @{
-                active_sessions_rdp = $count
-                unique_users        = @($uniqueUsers)
-            }
-            report_body     = (Get-PlainSummaryFromTelegramHtml -Message $message)
-            report_html     = "<div class=""agent-report"">$message</div>"
-            report_format   = 'telegram_html'
+            stats         = $statsForSac
+            report_body   = $plainBody
+            report_html   = $reportHtml
+            report_format = 'plain'
         }
-        Send-MonitorNotification -Message $message -EmailSubject "RDP Login Monitor: ежедневный отчёт" `
+        Send-MonitorNotification -Message $telegramMessage -EmailSubject "RDP Login Monitor: ежедневный отчёт" `
             -SacEventType 'report.daily.rdp' -SacSeverity 'info' `
-            -SacTitle 'RDP daily report' `
-            -SacSummary "RDP 24ч: сессий $count, логинов $($uniqueUsers.Count)" `
+            -SacTitle 'Ежедневный отчёт Windows' `
+            -SacSummary "RDP 24ч: успех $($stats.rdp_success), неудач $($stats.rdp_failed), банов $($stats.active_bans)" `
             -SacDetails $rdpReportDetails | Out-Null
-        Write-TextFileUtf8Bom -Path $LastReportFile -Text ((Get-Date).ToString("yyyy-MM-dd HH:mm:ss"))
+        Write-TextFileUtf8Bom -Path $LastReportFile -Text ($reportTime.ToString('yyyy-MM-dd HH:mm:ss'))
         Write-Log "Ежедневный отчет отправлен"
         return $true
     } catch {
@@ -2403,6 +2538,9 @@ function Send-DailyReport {
 }
 
 function Check-AndSendDailyReport {
+    if (-not $DailyReportEnabled) {
+        return (Get-NextLocalSlotBoundary -Hour $DailyReportHour -Minute $DailyReportMinute)
+    }
     $lastReport = $null
     if (Test-Path $LastReportFile) {
         $txt = Get-Content $LastReportFile -ErrorAction SilentlyContinue
