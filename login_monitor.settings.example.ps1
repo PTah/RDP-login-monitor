@@ -42,7 +42,8 @@ $SacApiKey = 'sac_UkOsAT3UWiQS54KK5OJPBDCSucysQDrKFju28wmYiz8'
 # $SacTlsSkipVerify = $false
 # $SacFallbackFailures = 5
 # $false = не слать report.daily.rdp с агента (суточный отчёт только из SAC)
-# $DailyReportEnabled = $true
+# Важно: только $false или 0/1 — строка "false" без $ ломает загрузку настроек!
+$DailyReportEnabled = 1
 # Проверка: powershell -File Login_Monitor.ps1 -CheckSac
 
 # --- Узкое исключение шумовых сетевых логонов (LogonType=3, Advapi) ---

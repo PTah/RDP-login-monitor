@@ -80,7 +80,7 @@ $script:MonitorLoopInitialized = $false
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.2.21-SAC"
+$ScriptVersion = "1.2.22-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -107,7 +107,8 @@ $script:IgnoreListCacheStampUtc = $null
 $DailyReportHour = 9
 $DailyReportMinute = 0
 # $false = не слать report.daily.rdp с агента (суточный отчёт только из SAC)
-$DailyReportEnabled = $true
+# В settings.ps1 используйте 1/0 или $true/$false — не пишите голое false без $
+$DailyReportEnabled = 1
 $LastReportFile = Join-Path $script:InstallRoot "Logs\last_daily_report.txt"
 
 # RD Gateway
@@ -2537,8 +2538,20 @@ function Send-DailyReport {
     }
 }
 
+function Test-DailyReportEnabledFlag {
+    if (-not (Get-Variable -Name DailyReportEnabled -ErrorAction SilentlyContinue)) {
+        return $true
+    }
+    $v = $DailyReportEnabled
+    if ($v -is [bool]) { return $v }
+    if ($v -is [int] -or $v -is [long]) { return ([int]$v -ne 0) }
+    $s = ([string]$v).Trim().ToLowerInvariant()
+    if ($s -in @('0', 'false', 'no', 'off')) { return $false }
+    return $true
+}
+
 function Check-AndSendDailyReport {
-    if (-not $DailyReportEnabled) {
+    if (-not (Test-DailyReportEnabledFlag)) {
         return (Get-NextLocalSlotBoundary -Hour $DailyReportHour -Minute $DailyReportMinute)
     }
     $lastReport = $null

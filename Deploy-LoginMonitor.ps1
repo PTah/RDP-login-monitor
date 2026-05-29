@@ -264,6 +264,92 @@ function Test-RdpMonitorSettingsNeedsServerDisplayNameHint {
     return $true
 }
 
+function Test-RdpMonitorSettingsNeedsDailyReportHint {
+    param([string]$SettingsPath)
+    if (-not (Test-Path -LiteralPath $SettingsPath)) { return $false }
+    $c = Get-RdpMonitorSettingsRaw -Path $SettingsPath
+    if ([string]::IsNullOrWhiteSpace($c)) { return $false }
+    if ($c -match '(?m)^\s*(\#\s*)?\$DailyReportEnabled\s*=') { return $false }
+    return $true
+}
+
+function Test-RdpMonitorSettingsHasInvalidDailyReportAssignment {
+    param([string]$SettingsPath)
+    if (-not (Test-Path -LiteralPath $SettingsPath)) { return $false }
+    $c = Get-RdpMonitorSettingsRaw -Path $SettingsPath
+    if ([string]::IsNullOrWhiteSpace($c)) { return $false }
+    if ($c -match '(?m)^\s*\$DailyReportEnabled\s*=\s*\$(?:true|false)\b') { return $false }
+    if ($c -match '(?m)^\s*\$DailyReportEnabled\s*=\s*(?:0|1)\s*(?:#.*)?$') { return $false }
+    if ($c -match '(?m)^\s*\$DailyReportEnabled\s*=\s*(?:true|false)\s*(?:#.*)?$') { return $true }
+    return $false
+}
+
+function Repair-RdpMonitorSettingsDailyReportAssignmentIfInvalid {
+    param([string]$LocalSettings)
+    if (-not (Test-Path -LiteralPath $LocalSettings)) { return $false }
+    if (-not (Test-RdpMonitorSettingsHasInvalidDailyReportAssignment -SettingsPath $LocalSettings)) {
+        return $false
+    }
+
+    $c = Get-RdpMonitorSettingsRaw -Path $LocalSettings
+    $newContent = [regex]::Replace(
+        $c,
+        '(?m)^(\s*\$DailyReportEnabled\s*=\s*)(true|false)(\s*(?:#.*)?)$',
+        { param($m) "$($m.Groups[1].Value)`$$($m.Groups[2].Value)$($m.Groups[3].Value)" }
+    )
+    if ($newContent -eq $c) { return $false }
+
+    $bak = "$LocalSettings.bak.$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+    Copy-Item -LiteralPath $LocalSettings -Destination $bak -Force
+    [System.IO.File]::WriteAllText($LocalSettings, $newContent.TrimEnd() + "`r`n", $Utf8Bom)
+    Write-DeployLog "login_monitor.settings.ps1: исправлено DailyReportEnabled = true/false без dollar — заменено на `$true/`$false (резервная копия: $bak)"
+    return $true
+}
+
+function Update-RdpMonitorSettingsDailyReportHintIfMissing {
+    param([string]$LocalSettings)
+    if (-not (Test-Path -LiteralPath $LocalSettings)) { return $false }
+    if (-not (Test-RdpMonitorSettingsNeedsDailyReportHint -SettingsPath $LocalSettings)) {
+        return $false
+    }
+
+    $c = Get-RdpMonitorSettingsRaw -Path $LocalSettings
+    if ([string]::IsNullOrWhiteSpace($c)) { return $false }
+
+    $hintBlock = @(
+        '# --- Суточный отчёт report.daily.rdp (агент или только SAC) ---'
+        '# $DailyReportEnabled = $false   # по умолчанию: только SAC; $true или 1 — отчёт с агента'
+        '# Не пишите "= false" без $ — PowerShell воспримет false как команду.'
+    ) -join "`r`n"
+
+    $bak = "$LocalSettings.bak.$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+    Copy-Item -LiteralPath $LocalSettings -Destination $bak -Force
+    Write-DeployLog "Добавление закомментированного `$DailyReportEnabled в login_monitor.settings.ps1; резервная копия: $bak"
+
+    $insertBefore = '(?m)^\s*#\s*---\s*Security Alert Center'
+    if ($c -match $insertBefore) {
+        $newContent = [regex]::Replace($c, $insertBefore, ($hintBlock + "`r`n`r`n" + '$0'), 1)
+    } else {
+        $newContent = ($c.TrimEnd() + "`r`n`r`n" + $hintBlock + "`r`n")
+    }
+    [System.IO.File]::WriteAllText($LocalSettings, $newContent.TrimEnd() + "`r`n", $Utf8Bom)
+    Write-DeployLog 'login_monitor.settings.ps1: добавлена подсказка # $DailyReportEnabled = $false'
+    return $true
+}
+
+function Sync-RdpMonitorSettingsDailyReportPatches {
+    param([string]$LocalSettings)
+    if (-not (Test-Path -LiteralPath $LocalSettings)) { return $false }
+    $changed = $false
+    if (Repair-RdpMonitorSettingsDailyReportAssignmentIfInvalid -LocalSettings $LocalSettings) {
+        $changed = $true
+    }
+    if (Update-RdpMonitorSettingsDailyReportHintIfMissing -LocalSettings $LocalSettings) {
+        $changed = $true
+    }
+    return $changed
+}
+
 function Update-RdpMonitorSettingsServerDisplayNameHintIfMissing {
     param([string]$LocalSettings)
     if (-not (Test-Path -LiteralPath $LocalSettings)) { return $false }
@@ -372,6 +458,7 @@ function Sync-RdpMonitorSettingsFromShare {
     if (-not $needsBootstrap) {
         Write-DeployLog "login_monitor.settings.ps1: SAC уже настроен, файл не перезаписываем."
         Update-RdpMonitorSettingsServerDisplayNameHintIfMissing -LocalSettings $LocalSettings | Out-Null
+        Sync-RdpMonitorSettingsDailyReportPatches -LocalSettings $LocalSettings | Out-Null
         return
     }
 
@@ -383,11 +470,13 @@ function Sync-RdpMonitorSettingsFromShare {
         Write-DeployLog "Создан login_monitor.settings.ps1 из example (Telegram + SAC dual)."
         Copy-Item -LiteralPath $ExampleOnShare -Destination $LocalSettings -Force
         Update-RdpMonitorSettingsServerDisplayNameHintIfMissing -LocalSettings $LocalSettings | Out-Null
+        Sync-RdpMonitorSettingsDailyReportPatches -LocalSettings $LocalSettings | Out-Null
         return
     }
 
     if (Update-RdpMonitorSettingsSacBlockIfMissing -LocalSettings $LocalSettings -ExampleOnShare $ExampleOnShare) {
         Update-RdpMonitorSettingsServerDisplayNameHintIfMissing -LocalSettings $LocalSettings | Out-Null
+        Sync-RdpMonitorSettingsDailyReportPatches -LocalSettings $LocalSettings | Out-Null
         return
     }
 
@@ -396,6 +485,7 @@ function Sync-RdpMonitorSettingsFromShare {
     Write-DeployLog "Апгрейд settings: резервная копия $bak, применяем example с шары."
     Copy-Item -LiteralPath $ExampleOnShare -Destination $LocalSettings -Force
     Update-RdpMonitorSettingsServerDisplayNameHintIfMissing -LocalSettings $LocalSettings | Out-Null
+    Sync-RdpMonitorSettingsDailyReportPatches -LocalSettings $LocalSettings | Out-Null
 }
 
 function Stop-RdpLoginMonitorMainProcesses {
@@ -473,8 +563,10 @@ try {
 
     $needsSettingsBootstrap = Test-RdpMonitorSettingsNeedsSacBootstrap -SettingsPath $settingsLocal
     $needsDisplayNameHint = Test-RdpMonitorSettingsNeedsServerDisplayNameHint -SettingsPath $settingsLocal
+    $needsDailyReportHint = Test-RdpMonitorSettingsNeedsDailyReportHint -SettingsPath $settingsLocal
+    $needsDailyReportRepair = Test-RdpMonitorSettingsHasInvalidDailyReportAssignment -SettingsPath $settingsLocal
     $needsBundleSync = Test-RdpMonitorDeployBundleNeedsSync -ShareRoot $shareRoot
-    $needsSacBootstrap = $needsSettingsBootstrap -or $needsBundleSync -or $needsDisplayNameHint
+    $needsSacBootstrap = $needsSettingsBootstrap -or $needsBundleSync -or $needsDisplayNameHint -or $needsDailyReportHint -or $needsDailyReportRepair
 
     $cmp = Compare-VersionStrings -Left $shareVerRaw -Right $localVerRaw
     if ($null -ne $cmp) {
@@ -489,6 +581,10 @@ try {
                 Write-DeployLog "Версия совпадает ($shareVerRaw), но нужна донастройка SAC в settings — продолжаем деплой."
             } elseif ($needsDisplayNameHint) {
                 Write-DeployLog "Версия совпадает ($shareVerRaw), но нет подсказки `$ServerDisplayName в settings — продолжаем деплой."
+            } elseif ($needsDailyReportHint) {
+                Write-DeployLog "Версия совпадает ($shareVerRaw), но нет `$DailyReportEnabled в settings — продолжаем деплой."
+            } elseif ($needsDailyReportRepair) {
+                Write-DeployLog "Версия совпадает ($shareVerRaw), но в settings некорректно задан `$DailyReportEnabled (= true/false без `$) — продолжаем деплой."
             }
         }
         if ($cmp -lt 0 -and -not $AllowDowngrade) {

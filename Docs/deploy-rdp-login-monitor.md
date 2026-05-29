@@ -50,6 +50,7 @@
 - Если файла нет — Deploy **один раз** копирует example → settings (**`UseSAC = 'dual'`**).
 - Если файл есть, но **нет блока SAC** — Deploy **дописывает** блок из example (Telegram/SMTP не трогает).
 - Если **нет** строки `$ServerDisplayName` — Deploy **дописывает** закомментированную подсказку `# $ServerDisplayName = '<имя ПК>'`.
+- Если **нет** `$DailyReportEnabled` — Deploy **дописывает** закомментированную подсказку `# $DailyReportEnabled = $false` (суточный отчёт только из SAC). Если в файле ошибочно `= false` без `$` — Deploy **исправляет** на `$false`.
 
 ```powershell
 $root = 'C:\ProgramData\RDP-login-monitor'
