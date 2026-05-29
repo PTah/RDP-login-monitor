@@ -9,6 +9,8 @@
 
     СТРУКТУРА НА ШАРЕ (пример):
       \\dc\share\RDP-login-monitor\Login_Monitor.ps1
+      \\dc\share\RDP-login-monitor\Sac-Client.ps1   — обязателен для SAC
+      \\dc\share\RDP-login-monitor\login_monitor.settings.example.ps1
       \\dc\share\RDP-login-monitor\version.txt         — одна строка, например: 1.3.0
       \\dc\share\RDP-login-monitor\Deploy-LoginMonitor.ps1
 
@@ -51,7 +53,9 @@ $VersionStampPath = Join-Path $InstallRoot "deployed_version.txt"
 $DeployUpdateMarkerPath = Join-Path $InstallRoot "deploy_last_update.txt"
 $DeployLogPath = Join-Path $InstallRoot "Logs\deploy.log"
 $ScriptName = "Login_Monitor.ps1"
+$SacClientName = "Sac-Client.ps1"
 $VersionFileName = "version.txt"
+$DeployBundleFiles = @($ScriptName, $SacClientName)
 $PsExe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
 
 $Utf8Bom = New-Object System.Text.UTF8Encoding $true
@@ -194,13 +198,49 @@ function Get-RdpMonitorSettingsRaw {
     }
 }
 
-function Test-RdpMonitorSettingsNeedsSacBootstrap {
-    param(
-        [string]$SettingsPath,
-        [string]$SacClientPath
-    )
-    if (-not (Test-Path -LiteralPath $SacClientPath)) { return $true }
+function Get-DeployFileSha256 {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash
+}
 
+function Test-RdpMonitorDeployBundleNeedsSync {
+    param([string]$ShareRoot)
+    foreach ($rel in $DeployBundleFiles) {
+        $src = Join-Path $ShareRoot $rel
+        if (-not (Test-Path -LiteralPath $src)) {
+            if ($rel -eq $SacClientName) {
+                Write-DeployLog "ОШИБКА: на шаре нет обязательного $SacClientName — опубликуйте пакет (update-rdp-monitor.ps1)."
+            }
+            continue
+        }
+        $dst = Join-Path $InstallRoot $rel
+        if (-not (Test-Path -LiteralPath $dst)) { return $true }
+        $hs = Get-DeployFileSha256 -Path $src
+        $hd = Get-DeployFileSha256 -Path $dst
+        if ($hs -ne $hd) { return $true }
+    }
+    return $false
+}
+
+function Copy-RdpMonitorDeployBundle {
+    param([string]$ShareRoot)
+    foreach ($rel in $DeployBundleFiles) {
+        $src = Join-Path $ShareRoot $rel
+        $dst = Join-Path $InstallRoot $rel
+        if (-not (Test-Path -LiteralPath $src)) {
+            if ($rel -eq $SacClientName) {
+                Write-DeployLog "Предупреждение: на шаре нет $SacClientName — SAC недоступен до публикации файла на шару."
+            }
+            continue
+        }
+        Copy-Item -LiteralPath $src -Destination $dst -Force
+        Write-DeployLog "Файл скопирован: $dst"
+    }
+}
+
+function Test-RdpMonitorSettingsNeedsSacBootstrap {
+    param([string]$SettingsPath)
     $c = Get-RdpMonitorSettingsRaw -Path $SettingsPath
     if ([string]::IsNullOrWhiteSpace($c)) { return $true }
 
@@ -210,8 +250,110 @@ function Test-RdpMonitorSettingsNeedsSacBootstrap {
     }
     if ($c -match '(?m)^\s*\$SacApiKey\s*=\s*[''"]\s*[''"]') { return $true }
     if ($c -notmatch '(?m)^\s*\$SacApiKey\s*=\s*[''"]sac_[^''"]+[''"]') { return $true }
+    if ($c -notmatch '(?m)^\s*\$SacUrl\s*=\s*[''"]https?://[^''"]+[''"]') { return $true }
 
     return $false
+}
+
+function Test-RdpMonitorSettingsNeedsServerDisplayNameHint {
+    param([string]$SettingsPath)
+    if (-not (Test-Path -LiteralPath $SettingsPath)) { return $false }
+    $c = Get-RdpMonitorSettingsRaw -Path $SettingsPath
+    if ([string]::IsNullOrWhiteSpace($c)) { return $false }
+    if ($c -match '(?m)^\s*(\#\s*)?\$ServerDisplayName\s*=') { return $false }
+    return $true
+}
+
+function Update-RdpMonitorSettingsServerDisplayNameHintIfMissing {
+    param([string]$LocalSettings)
+    if (-not (Test-Path -LiteralPath $LocalSettings)) { return $false }
+    if (-not (Test-RdpMonitorSettingsNeedsServerDisplayNameHint -SettingsPath $LocalSettings)) {
+        return $false
+    }
+
+    $c = Get-RdpMonitorSettingsRaw -Path $LocalSettings
+    if ([string]::IsNullOrWhiteSpace($c)) { return $false }
+
+    $hostLabel = if ([string]::IsNullOrWhiteSpace($env:COMPUTERNAME)) { 'New-PC' } else { $env:COMPUTERNAME.Trim() }
+    $hintBlock = @(
+        '# --- Подпись сервера в Telegram и SAC (host.display_name); раскомментируйте при необходимости ---'
+        "# `$ServerDisplayName = '$hostLabel'"
+        '# --- Явный IPv4 хоста для SAC (опционально; иначе автоопределение) ---'
+        '# $ServerIPv4 = '''
+    ) -join "`r`n"
+
+    $bak = "$LocalSettings.bak.$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+    Copy-Item -LiteralPath $LocalSettings -Destination $bak -Force
+    Write-DeployLog "Добавление закомментированного `$ServerDisplayName в login_monitor.settings.ps1; резервная копия: $bak"
+
+    $insertBefore = '(?m)^\s*#\s*---\s*Security Alert Center'
+    if ($c -match $insertBefore) {
+        $newContent = [regex]::Replace($c, $insertBefore, ($hintBlock + "`r`n`r`n" + '$0'), 1)
+    } else {
+        $newContent = ($c.TrimEnd() + "`r`n`r`n" + $hintBlock + "`r`n")
+    }
+    [System.IO.File]::WriteAllText($LocalSettings, $newContent.TrimEnd() + "`r`n", $Utf8Bom)
+    Write-DeployLog "login_monitor.settings.ps1: добавлена подсказка # `$ServerDisplayName = '$hostLabel'"
+    return $true
+}
+
+function Get-RdpMonitorSacBlockFromExample {
+    param([string]$ExamplePath)
+    if (-not (Test-Path -LiteralPath $ExamplePath)) { return $null }
+    $ex = Get-RdpMonitorSettingsRaw -Path $ExamplePath
+    if ([string]::IsNullOrWhiteSpace($ex)) { return $null }
+    if ($ex -match '(?ms)(#\s*---\s*Security Alert Center.*?)(?=\r?\n#\s*---|\z)') {
+        return $Matches[1].TrimEnd()
+    }
+    return @(
+        '# --- Security Alert Center (SAC) ---'
+        '$UseSAC = ''dual'''
+        '$SacUrl = ''https://sac.kalinamall.ru'''
+        '$SacApiKey = ''sac_CHANGE_ME'''
+    ) -join "`r`n"
+}
+
+function Update-RdpMonitorSettingsSacBlockIfMissing {
+    param(
+        [string]$LocalSettings,
+        [string]$ExampleOnShare
+    )
+    if (-not (Test-Path -LiteralPath $LocalSettings)) { return $false }
+
+    $c = Get-RdpMonitorSettingsRaw -Path $LocalSettings
+    if ([string]::IsNullOrWhiteSpace($c)) { return $false }
+
+    if ($c -match '(?m)^\s*\$UseSAC\s*=' -and $c -match '(?m)^\s*\$SacApiKey\s*=\s*[''"]sac_[^''"]+[''"]') {
+        if ($c -notmatch '(?m)^\s*\$UseSAC\s*=\s*[''"]off[''"]') {
+            Write-DeployLog "login_monitor.settings.ps1: блок SAC уже задан, файл не меняем."
+            return $false
+        }
+    }
+
+    $sacBlock = Get-RdpMonitorSacBlockFromExample -ExamplePath $ExampleOnShare
+    if ([string]::IsNullOrWhiteSpace($sacBlock)) {
+        Write-DeployLog "Предупреждение: не удалось извлечь блок SAC из example — пропуск patch settings."
+        return $false
+    }
+
+    $bak = "$LocalSettings.bak.$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+    Copy-Item -LiteralPath $LocalSettings -Destination $bak -Force
+    Write-DeployLog "Добавление блока SAC (UseSAC=dual) в login_monitor.settings.ps1; резервная копия: $bak"
+
+    if ($c -match '(?m)^\s*\$UseSAC\s*=') {
+        $c = [regex]::Replace($c, '(?m)^\s*\$UseSAC\s*=.*$', '')
+        $c = [regex]::Replace($c, '(?m)^\s*\$SacUrl\s*=.*$', '')
+        $c = [regex]::Replace($c, '(?m)^\s*\$SacApiKey\s*=.*$', '')
+        $c = [regex]::Replace($c, '(?m)^\s*\$SacSpoolDir\s*=.*$', '')
+        $c = [regex]::Replace($c, '(?m)^\s*\$SacTimeoutSec\s*=.*$', '')
+        $c = [regex]::Replace($c, '(?m)^\s*\$SacTlsSkipVerify\s*=.*$', '')
+        $c = [regex]::Replace($c, '(?m)^\s*\$SacFallbackFailures\s*=.*$', '')
+    }
+
+    $newContent = ($c.TrimEnd() + "`r`n`r`n" + $sacBlock + "`r`n").TrimEnd() + "`r`n"
+    [System.IO.File]::WriteAllText($LocalSettings, $newContent, $Utf8Bom)
+    Write-DeployLog "login_monitor.settings.ps1: добавлен блок SAC (UseSAC=dual из example на шаре)."
+    return $true
 }
 
 function Sync-RdpMonitorSettingsFromShare {
@@ -224,12 +366,12 @@ function Sync-RdpMonitorSettingsFromShare {
         return
     }
 
-    $localSac = Join-Path $InstallRoot 'Sac-Client.ps1'
     $needsCreate = -not (Test-Path -LiteralPath $LocalSettings)
-    $needsBootstrap = $needsCreate -or (Test-RdpMonitorSettingsNeedsSacBootstrap -SettingsPath $LocalSettings -SacClientPath $localSac)
+    $needsBootstrap = $needsCreate -or (Test-RdpMonitorSettingsNeedsSacBootstrap -SettingsPath $LocalSettings)
 
     if (-not $needsBootstrap) {
         Write-DeployLog "login_monitor.settings.ps1: SAC уже настроен, файл не перезаписываем."
+        Update-RdpMonitorSettingsServerDisplayNameHintIfMissing -LocalSettings $LocalSettings | Out-Null
         return
     }
 
@@ -239,13 +381,21 @@ function Sync-RdpMonitorSettingsFromShare {
 
     if ($needsCreate) {
         Write-DeployLog "Создан login_monitor.settings.ps1 из example (Telegram + SAC dual)."
-    } else {
-        $bak = "$LocalSettings.bak.$(Get-Date -Format 'yyyyMMdd_HHmmss')"
-        Copy-Item -LiteralPath $LocalSettings -Destination $bak -Force
-        Write-DeployLog "Апгрейд с версии без SAC: резервная копия $bak, применяем example с шары."
+        Copy-Item -LiteralPath $ExampleOnShare -Destination $LocalSettings -Force
+        Update-RdpMonitorSettingsServerDisplayNameHintIfMissing -LocalSettings $LocalSettings | Out-Null
+        return
     }
 
+    if (Update-RdpMonitorSettingsSacBlockIfMissing -LocalSettings $LocalSettings -ExampleOnShare $ExampleOnShare) {
+        Update-RdpMonitorSettingsServerDisplayNameHintIfMissing -LocalSettings $LocalSettings | Out-Null
+        return
+    }
+
+    $bak = "$LocalSettings.bak.$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+    Copy-Item -LiteralPath $LocalSettings -Destination $bak -Force
+    Write-DeployLog "Апгрейд settings: резервная копия $bak, применяем example с шары."
     Copy-Item -LiteralPath $ExampleOnShare -Destination $LocalSettings -Force
+    Update-RdpMonitorSettingsServerDisplayNameHintIfMissing -LocalSettings $LocalSettings | Out-Null
 }
 
 function Stop-RdpLoginMonitorMainProcesses {
@@ -317,10 +467,14 @@ try {
     $localVerRaw = Get-LocalDeployedVersion
     Write-DeployLog "Версия на шаре: $shareVerRaw; локально установлено: $(if ($localVerRaw) { $localVerRaw } else { '(нет)' })."
 
-    $localSacPath = Join-Path $InstallRoot 'Sac-Client.ps1'
-    $sourceSacOnShare = Join-Path $shareRoot 'Sac-Client.ps1'
-    $needsSacBootstrap = (Test-RdpMonitorSettingsNeedsSacBootstrap -SettingsPath $settingsLocal -SacClientPath $localSacPath) `
-        -or ((-not (Test-Path -LiteralPath $localSacPath)) -and (Test-Path -LiteralPath $sourceSacOnShare))
+    if (-not (Test-Path -LiteralPath (Join-Path $shareRoot $SacClientName))) {
+        Write-DeployLog "ОШИБКА: на шаре отсутствует $SacClientName — выполните update-rdp-monitor.ps1 на сервере публикации."
+    }
+
+    $needsSettingsBootstrap = Test-RdpMonitorSettingsNeedsSacBootstrap -SettingsPath $settingsLocal
+    $needsDisplayNameHint = Test-RdpMonitorSettingsNeedsServerDisplayNameHint -SettingsPath $settingsLocal
+    $needsBundleSync = Test-RdpMonitorDeployBundleNeedsSync -ShareRoot $shareRoot
+    $needsSacBootstrap = $needsSettingsBootstrap -or $needsBundleSync -or $needsDisplayNameHint
 
     $cmp = Compare-VersionStrings -Left $shareVerRaw -Right $localVerRaw
     if ($null -ne $cmp) {
@@ -329,7 +483,13 @@ try {
                 Write-DeployLog "Актуально, копирование не требуется."
                 exit 0
             }
-            Write-DeployLog "Версия совпадает ($shareVerRaw), но нужна донастройка SAC — продолжаем деплой."
+            if ($needsBundleSync) {
+                Write-DeployLog "Версия совпадает ($shareVerRaw), но пакет файлов (Login_Monitor/Sac-Client) отличается — продолжаем деплой."
+            } elseif ($needsSettingsBootstrap) {
+                Write-DeployLog "Версия совпадает ($shareVerRaw), но нужна донастройка SAC в settings — продолжаем деплой."
+            } elseif ($needsDisplayNameHint) {
+                Write-DeployLog "Версия совпадает ($shareVerRaw), но нет подсказки `$ServerDisplayName в settings — продолжаем деплой."
+            }
         }
         if ($cmp -lt 0 -and -not $AllowDowngrade) {
             Write-DeployLog "На шаре версия старше локальной — пропуск (используйте -AllowDowngrade для отката)."
@@ -346,10 +506,13 @@ try {
     }
 
     if ($WhatIf) {
-        if ($needsSacBootstrap) {
-            Write-DeployLog "[WhatIf] Применить login_monitor.settings.ps1 из example (SAC/Telegram)."
+        if ($needsSettingsBootstrap) {
+            Write-DeployLog "[WhatIf] Донастроить login_monitor.settings.ps1 (SAC dual из example)."
         }
-        Write-DeployLog "[WhatIf] Скопировать $sourceScript -> $LocalScript; InstallTasks; версия $shareVerRaw"
+        if ($needsBundleSync) {
+            Write-DeployLog "[WhatIf] Синхронизировать пакет: $($DeployBundleFiles -join ', ')."
+        }
+        Write-DeployLog "[WhatIf] InstallTasks; версия $shareVerRaw"
         exit 0
     }
 
@@ -360,17 +523,7 @@ try {
 
     Stop-RdpLoginMonitorMainProcesses
 
-    Copy-Item -LiteralPath $sourceScript -Destination $LocalScript -Force
-    Write-DeployLog "Файл скопирован: $LocalScript"
-
-    $sourceSac = Join-Path $shareRoot 'Sac-Client.ps1'
-    $localSac = Join-Path $InstallRoot 'Sac-Client.ps1'
-    if (Test-Path -LiteralPath $sourceSac) {
-        Copy-Item -LiteralPath $sourceSac -Destination $localSac -Force
-        Write-DeployLog "Файл скопирован: $localSac"
-    } else {
-        Write-DeployLog "Предупреждение: на шаре нет Sac-Client.ps1 — SAC будет недоступен до следующего деплоя."
-    }
+    Copy-RdpMonitorDeployBundle -ShareRoot $shareRoot
 
     Sync-RdpMonitorSettingsFromShare -ExampleOnShare $settingsExampleShare -LocalSettings $settingsLocal
 

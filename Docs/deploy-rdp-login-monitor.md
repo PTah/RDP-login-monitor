@@ -30,9 +30,11 @@
 
 2. Читается **`version.txt`** на шаре и сравнивается с локальной меткой **`deployed_version.txt`**. Если метки нет — подтягивается **`$ScriptVersion`** из установленного **`Login_Monitor.ps1`**.
 
-3. Версия на шаре **совпадает** с локальной — выход без копирования.
+3. Версия на шаре **совпадает** с локальной — выход **без копирования**, **кроме** случаев:
+   - на ПК **нет** `Sac-Client.ps1` или его SHA256 **отличается** от шары;
+   - в `login_monitor.settings.ps1` **нет** блока SAC (`$UseSAC`, `$SacUrl`, `$SacApiKey`) — тогда добавляется **`UseSAC = 'dual'`** из example (без перезаписи Telegram, если возможно).
 
-4. Версия на шаре **новее** — остановка процессов монитора → копирование **`Login_Monitor.ps1`** и **`Sac-Client.ps1`** → **`Login_Monitor.ps1 -InstallTasks`** → **`deployed_version.txt`** → запуск монитора (если не **`-SkipStartMonitorAfterUpdate`**).
+4. Версия на шаре **новее** (или сработало условие выше) — остановка процессов → копирование **`Login_Monitor.ps1`** и **`Sac-Client.ps1`** → настройка SAC в settings при необходимости → **`Login_Monitor.ps1 -InstallTasks`** → **`deployed_version.txt`** → запуск монитора.
 
 5. Версия на шаре **старее** — откат блокируется, пока не указан **`-AllowDowngrade`**.
 
@@ -44,8 +46,9 @@
 
 - Секреты и параметры сайта (Telegram, SMTP, **4740**, `$IgnoreAdvapiNetworkLogonSourceIps`) — **только** в этом файле.
 - Образец в репозитории и на шаре: **`login_monitor.settings.example.ps1`**.
-- **`Deploy-LoginMonitor.ps1`** **не перезаписывает** `login_monitor.settings.ps1` при обновлении скрипта.
-- Если файла нет, Deploy **один раз** копирует example → settings (дальше правки только локально).
+- **`Deploy-LoginMonitor.ps1`** **не перезаписывает** существующий `login_monitor.settings.ps1`, если SAC уже настроен (`UseSAC` не `off`, заданы `$SacUrl` и `$SacApiKey`).
+- Если файла нет — Deploy **один раз** копирует example → settings (**`UseSAC = 'dual'`**).
+- Если файл есть, но **нет блока SAC** — Deploy **дописывает** блок из example (Telegram/SMTP не трогает).
 
 ```powershell
 $root = 'C:\ProgramData\RDP-login-monitor'
