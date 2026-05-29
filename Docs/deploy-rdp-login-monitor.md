@@ -49,6 +49,7 @@
 - **`Deploy-LoginMonitor.ps1`** **не перезаписывает** существующий `login_monitor.settings.ps1`, если SAC уже настроен (`UseSAC` не `off`, заданы `$SacUrl` и `$SacApiKey`).
 - Если файла нет — Deploy **один раз** копирует example → settings (**`UseSAC = 'dual'`**).
 - Если файл есть, но **нет блока SAC** — Deploy **дописывает** блок из example (Telegram/SMTP не трогает).
+- Если **нет** строки `$ServerDisplayName` — Deploy **дописывает** закомментированную подсказку `# $ServerDisplayName = '<имя ПК>'`.
 
 ```powershell
 $root = 'C:\ProgramData\RDP-login-monitor'
