@@ -80,7 +80,7 @@ $script:MonitorLoopInitialized = $false
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.2.24-SAC"
+$ScriptVersion = "1.2.25-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -131,6 +131,9 @@ $WinRmLogName = 'Microsoft-Windows-WinRM/Operational'
 $WinRmInboundShellEventIds = @(91)
 $WinRmCorrelateSecurity4624 = 1
 $WinRm4624CorrelationWindowSeconds = 15
+# Исключить шум Exchange/локальный WinRM: HealthMailbox*, учётки *$, ::1, fe80:, 127.0.0.1
+$WinRmIgnoreLocalSource = 1
+$WinRmIgnoreMachineAccounts = 1
 
 $ExcludedProcesses = @(
     "HTTP", "HTTP/*", "W3WP.EXE", "MSExchange", "SYSTEM", "LOCAL SERVICE",
@@ -1487,6 +1490,70 @@ function Test-RdpMonitorNotifyDedup {
         if ($now -lt $until) { return $true }
     }
     $script:NotifyDedupCache[$Key] = $now.AddSeconds($WindowSeconds)
+    return $false
+}
+
+function Test-RdpMonitorIsMachineAccountName {
+    param([string]$Username)
+    if ([string]::IsNullOrWhiteSpace($Username) -or $Username -eq '-') { return $false }
+    $sam = $Username.Trim()
+    $i = $sam.LastIndexOf('\')
+    if ($i -ge 0 -and $i -lt ($sam.Length - 1)) {
+        $sam = $sam.Substring($i + 1)
+    }
+    return $sam.EndsWith('$')
+}
+
+function Test-RdpMonitorIsLoopbackOrLinkLocalSourceIp {
+    param([string]$Ip)
+    if ([string]::IsNullOrWhiteSpace($Ip) -or $Ip -eq '-') { return $true }
+    $t = $Ip.Trim().ToLowerInvariant()
+    if ($t -eq '::1' -or $t -eq '127.0.0.1' -or $t -eq '0:0:0:0:0:0:0:1') { return $true }
+    if ($t.StartsWith('fe80:') -or $t.StartsWith('fe80::')) { return $true }
+    if ($t.StartsWith('::ffff:127.')) { return $true }
+    return $false
+}
+
+function Test-RdpMonitorUsernameExcludedByPattern {
+    param([string]$Username)
+    if ([string]::IsNullOrWhiteSpace($Username) -or $Username -eq '-') { return $false }
+    foreach ($excludedUser in $ExcludedUsers) {
+        if ($Username -like "*$excludedUser*") { return $true }
+    }
+    $sam = $Username.Trim()
+    $i = $sam.LastIndexOf('\')
+    if ($i -ge 0 -and $i -lt ($sam.Length - 1)) {
+        $sam = $sam.Substring($i + 1)
+    }
+    foreach ($p in $ExcludedUserPatterns) {
+        if ($Username -like $p) { return $true }
+        if ($sam -like $p) { return $true }
+        if ($p.EndsWith('*')) {
+            $prefix = $p.Substring(0, $p.Length - 1)
+            if ($sam.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+        }
+    }
+    if ($Username -match '(?i)(\\)?DWM-\d+') { return $true }
+    if ($Username -match '(?i)(\\)?UMFD-\d+') { return $true }
+    return $false
+}
+
+function Should-IgnoreWinRmSession {
+    param(
+        [string]$Username,
+        [string]$SourceIP
+    )
+    if ([string]::IsNullOrWhiteSpace($Username) -or $Username -eq '-') { return $true }
+    if (Test-RdpMonitorUsernameExcludedByPattern -Username $Username) { return $true }
+    if (Test-MonitorFeatureEnabled -Value $WinRmIgnoreMachineAccounts) {
+        if (Test-RdpMonitorIsMachineAccountName -Username $Username) { return $true }
+    }
+    if (Test-MonitorFeatureEnabled -Value $WinRmIgnoreLocalSource) {
+        if (Test-RdpMonitorIsLoopbackOrLinkLocalSourceIp -SourceIP $SourceIP) { return $true }
+    }
+    if (Test-RdpMonitorIgnoreListMatch -EventId 'winrm' -Username $Username -SourceIP $SourceIP) {
+        return $true
+    }
     return $false
 }
 
@@ -3336,7 +3403,6 @@ function Start-LoginMonitor {
                     foreach ($event in $winRmEvents) {
                         if ($event.TimeCreated -le $lastWinRmCheckTime) { continue }
                         $wr = Get-WinRm91EventInfo -Event $event
-                        if ($wr.User -like '*$') { continue }
                         if (Test-MonitorFeatureEnabled -Value $WinRmCorrelateSecurity4624) {
                             $corr = Find-CorrelatedNetworkLogon4624 -AroundTime $wr.TimeCreated `
                                 -UsernameHint $wr.User -WindowSeconds $WinRm4624CorrelationWindowSeconds
@@ -3346,8 +3412,8 @@ function Start-LoginMonitor {
                                 $wr.LogonType = $corr.LogonType
                             }
                         }
-                        if (Test-RdpMonitorIgnoreListMatch -EventId 'winrm' -Username $wr.User -SourceIP $wr.SourceIP) {
-                            Write-Log "Skip WinRM $($event.Id): User=$($wr.User) IP=$($wr.SourceIP) — ignore.lst"
+                        if (Should-IgnoreWinRmSession -Username $wr.User -SourceIP $wr.SourceIP) {
+                            Write-Log "Skip WinRM $($event.Id): User=$($wr.User) IP=$($wr.SourceIP) — built-in/ignore.lst"
                             continue
                         }
                         $dedupKey = "winrm|$($event.Id)|$($wr.User)|$($wr.SourceIP)|$($event.RecordId)"
