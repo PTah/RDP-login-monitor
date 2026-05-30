@@ -80,7 +80,7 @@ $script:MonitorLoopInitialized = $false
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.2.22-SAC"
+$ScriptVersion = "1.2.23-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -119,6 +119,17 @@ $RDGatewayEvents = @(302, 303)
 # RDP Remote Connection Manager (workstations): User authentication succeeded — событие 1149
 $RcmLogName = "Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational"
 $RcmEventId = 1149
+
+# RDS Shadow Control (RCM/Operational): опасные теневые подключения с управлением
+$EnableRcmShadowControlMonitoring = 1
+$RcmShadowControlEventIds = @(20506, 20507, 20510)
+
+# WinRM / Enter-PSSession inbound (удалённая PowerShell-сессия на этот хост)
+$EnableWinRmInboundMonitoring = 1
+$WinRmLogName = 'Microsoft-Windows-WinRM/Operational'
+$WinRmInboundShellEventIds = @(91)
+$WinRmCorrelateSecurity4624 = 1
+$WinRm4624CorrelationWindowSeconds = 15
 
 $ExcludedProcesses = @(
     "HTTP", "HTTP/*", "W3WP.EXE", "MSExchange", "SYSTEM", "LOCAL SERVICE",
@@ -1248,6 +1259,236 @@ function Format-Rcm1149Event {
     return $message
 }
 
+function Test-MonitorFeatureEnabled {
+    param(
+        $Value,
+        [bool]$DefaultEnabled = $true
+    )
+    if ($null -eq $Value) { return $DefaultEnabled }
+    if ($Value -is [bool]) { return $Value }
+    if ($Value -is [int] -or $Value -is [long]) { return ([int]$Value -ne 0) }
+    $s = ([string]$Value).Trim().ToLowerInvariant()
+    if ($s -in @('0', 'false', 'no', 'off')) { return $false }
+    return $true
+}
+
+function Test-WinRmLogAvailable {
+    try {
+        $logExists = Get-WinEvent -ListLog $WinRmLogName -ErrorAction SilentlyContinue
+        return [bool]$logExists
+    } catch {
+        return $false
+    }
+}
+
+function Get-RcmShadowEventInfo {
+    param($Event)
+    $eventData = @{
+        TimeCreated = $Event.TimeCreated
+        EventId = [int]$Event.Id
+        ShadowerUser = '-'
+        TargetUser = '-'
+        SessionId = '-'
+        ShadowAction = 'control'
+    }
+    try {
+        $map = Get-EventDataMap -Event $Event
+        $eventData.ShadowerUser = Get-FirstNonEmptyMapValue -DataMap $map -Keys @(
+            'Shadower', 'ShadowerUser', 'Admin', 'Administrator', 'UserName', 'SubjectUserName', 'Param1'
+        )
+        if ([string]::IsNullOrWhiteSpace($eventData.ShadowerUser)) { $eventData.ShadowerUser = '-' }
+        $eventData.TargetUser = Get-FirstNonEmptyMapValue -DataMap $map -Keys @(
+            'TargetUser', 'User', 'AccountName', 'TargetUserName', 'ConnectionUser', 'Param2'
+        )
+        if ([string]::IsNullOrWhiteSpace($eventData.TargetUser)) { $eventData.TargetUser = '-' }
+        $sid = Get-FirstNonEmptyMapValue -DataMap $map -Keys @('SessionID', 'SessionId', 'Session', 'Param3')
+        if (-not [string]::IsNullOrWhiteSpace($sid)) { $eventData.SessionId = [string]$sid }
+
+        if ($eventData.ShadowerUser -eq '-' -and $Event.Properties.Count -gt 0) {
+            $eventData.ShadowerUser = [string]$Event.Properties[0].Value
+        }
+        if ($eventData.TargetUser -eq '-' -and $Event.Properties.Count -gt 1) {
+            $eventData.TargetUser = [string]$Event.Properties[1].Value
+        }
+        if ($eventData.SessionId -eq '-' -and $Event.Properties.Count -gt 2) {
+            $eventData.SessionId = [string]$Event.Properties[2].Value
+        }
+
+        $msg = [string]$Event.Message
+        if ($eventData.SessionId -eq '-' -and $msg -match '(?i)(?:session|сеанс)\s*(?:id\s*)?[:\s#]*(\d+)') {
+            $eventData.SessionId = $Matches[1]
+        }
+        switch ([int]$Event.Id) {
+            20506 { $eventData.ShadowAction = 'control_started' }
+            20507 { $eventData.ShadowAction = 'control_stopped' }
+            20510 { $eventData.ShadowAction = 'control_permission' }
+        }
+    } catch {
+        Write-Log "Ошибка разбора RCM shadow $($Event.Id): $($_.Exception.Message)"
+    }
+    return $eventData
+}
+
+function Format-RcmShadowControlEvent {
+    param(
+        [hashtable]$Info,
+        [string]$SecurityLogComputerName
+    )
+    $logHost = $SecurityLogComputerName
+    if ([string]::IsNullOrWhiteSpace($logHost)) { $logHost = $env:COMPUTERNAME }
+    $hHost = (ConvertTo-TelegramHtml (Get-MonitorServerLabelWithIp))
+    $hLog = (ConvertTo-TelegramHtml $logHost)
+    $hShadower = (ConvertTo-TelegramHtml $Info.ShadowerUser)
+    $hTarget = (ConvertTo-TelegramHtml $Info.TargetUser)
+    $hSid = (ConvertTo-TelegramHtml $Info.SessionId)
+    $hTime = (ConvertTo-TelegramHtml ($Info.TimeCreated.ToString('dd.MM.yyyy HH:mm:ss')))
+
+    $header = switch ($Info.ShadowAction) {
+        'control_started' { '🎭 RDS SHADOW CONTROL — начато' }
+        'control_stopped' { '🎭 RDS SHADOW CONTROL — остановлено' }
+        'control_permission' { '🎭 RDS SHADOW CONTROL — разрешение выдано' }
+        default { '🎭 RDS SHADOW CONTROL' }
+    }
+    $message = "<b>$header</b>`r`n"
+    $message += "🏢 Сервер: $hHost`r`n"
+    $message += "👤 Администратор (shadow): $hShadower`r`n"
+    $message += "🎯 Сессия пользователя: $hTarget`r`n"
+    if ($Info.SessionId -ne '-') {
+        $message += "🔢 Session ID: $hSid`r`n"
+    }
+    $message += "🕐 Время: $hTime`r`n"
+    $message += "🔢 Event ID: $($Info.EventId) (RemoteConnectionManager)"
+    return $message
+}
+
+function Get-SacTypeForRcmShadowEvent {
+    param([int]$EventId)
+    switch ($EventId) {
+        20506 { return 'rdp.shadow.control.started' }
+        20507 { return 'rdp.shadow.control.stopped' }
+        20510 { return 'rdp.shadow.control.permission' }
+        default { return 'rdp.shadow.control.started' }
+    }
+}
+
+function Get-WinRm91EventInfo {
+    param($Event)
+    $eventData = @{
+        TimeCreated = $Event.TimeCreated
+        EventId = [int]$Event.Id
+        User = '-'
+        ResourceUri = '-'
+        SourceIP = '-'
+        LogonType = 0
+    }
+    try {
+        $map = Get-EventDataMap -Event $Event
+        $eventData.User = Get-FirstNonEmptyMapValue -DataMap $map -Keys @(
+            'user', 'User', 'UserName', 'AccountName', 'SubjectUserName'
+        )
+        $eventData.ResourceUri = Get-FirstNonEmptyMapValue -DataMap $map -Keys @(
+            'resourceUri', 'ResourceUri', 'shellId', 'ShellId', 'connection', 'Connection'
+        )
+        if ([string]::IsNullOrWhiteSpace($eventData.User) -and $Event.Properties.Count -gt 0) {
+            $eventData.User = [string]$Event.Properties[0].Value
+        }
+        $msg = [string]$Event.Message
+        if ($eventData.ResourceUri -eq '-' -and $msg -match '(?i)ResourceUri:\s*(.+)$') {
+            $eventData.ResourceUri = $Matches[1].Trim()
+        }
+    } catch {
+        Write-Log "Ошибка разбора WinRM $($Event.Id): $($_.Exception.Message)"
+    }
+    if ([string]::IsNullOrWhiteSpace($eventData.User)) { $eventData.User = '-' }
+    if ([string]::IsNullOrWhiteSpace($eventData.ResourceUri)) { $eventData.ResourceUri = '-' }
+    return $eventData
+}
+
+function Find-CorrelatedNetworkLogon4624 {
+    param(
+        [datetime]$AroundTime,
+        [string]$UsernameHint = '',
+        [int]$WindowSeconds = 15
+    )
+    $start = $AroundTime.AddSeconds(-1 * [Math]::Abs($WindowSeconds))
+    $end = $AroundTime.AddSeconds([Math]::Abs($WindowSeconds))
+    try {
+        $events = @(Get-WinEvent -FilterHashtable @{
+            LogName = 'Security'
+            ID = 4624
+            StartTime = $start
+        } -ErrorAction SilentlyContinue | Where-Object { $_.TimeCreated -le $end })
+    } catch {
+        return $null
+    }
+    $best = $null
+    foreach ($ev in $events) {
+        $info = Get-LoginEventInfo -Event $ev
+        if ($info.LogonType -ne 3) { continue }
+        if ($info.SourceIP -eq '-' -or [string]::IsNullOrWhiteSpace($info.SourceIP)) { continue }
+        if (-not [string]::IsNullOrWhiteSpace($UsernameHint) -and $UsernameHint -ne '-') {
+            if (-not (Test-RdpMonitorUsernameMatchesToken -Username $info.Username -Token $UsernameHint)) {
+                continue
+            }
+        }
+        if ($null -eq $best -or $ev.TimeCreated -gt $best.TimeCreated) {
+            $best = [pscustomobject]@{
+                Username = $info.Username
+                SourceIP = $info.SourceIP
+                LogonType = $info.LogonType
+                ProcessName = $info.ProcessName
+                TimeCreated = $ev.TimeCreated
+            }
+        }
+    }
+    return $best
+}
+
+function Format-WinRmSessionEvent {
+    param(
+        [hashtable]$Info,
+        [string]$SecurityLogComputerName
+    )
+    $logHost = $SecurityLogComputerName
+    if ([string]::IsNullOrWhiteSpace($logHost)) { $logHost = $env:COMPUTERNAME }
+    $hHost = (ConvertTo-TelegramHtml (Get-MonitorServerLabelWithIp))
+    $hUser = (ConvertTo-TelegramHtml $Info.User)
+    $hIp = (ConvertTo-TelegramHtml $Info.SourceIP)
+    $hUri = (ConvertTo-TelegramHtml $Info.ResourceUri)
+    $hTime = (ConvertTo-TelegramHtml ($Info.TimeCreated.ToString('dd.MM.yyyy HH:mm:ss')))
+
+    $message = "<b>⚠️ WinRM / Enter-PSSession — удалённая shell</b>`r`n"
+    $message += "🏢 Сервер: $hHost`r`n"
+    $message += "👤 Пользователь: $hUser`r`n"
+    if ($Info.SourceIP -ne '-') {
+        $message += "🌐 IP источника: $hIp`r`n"
+    }
+    if ($Info.ResourceUri -ne '-') {
+        $message += "🔗 ResourceUri: $hUri`r`n"
+    }
+    $message += "🕐 Время: $hTime`r`n"
+    $message += "🔢 Event ID: $($Info.EventId) (WinRM Operational)"
+    return $message
+}
+
+function Test-RdpMonitorNotifyDedup {
+    param(
+        [string]$Key,
+        [int]$WindowSeconds = 90
+    )
+    if ([string]::IsNullOrWhiteSpace($Key)) { return $false }
+    if (-not $script:NotifyDedupCache) {
+        $script:NotifyDedupCache = @{}
+    }
+    $now = Get-Date
+    if ($script:NotifyDedupCache.ContainsKey($Key)) {
+        $until = $script:NotifyDedupCache[$Key]
+        if ($now -lt $until) { return $true }
+    }
+    $script:NotifyDedupCache[$Key] = $now.AddSeconds($WindowSeconds)
+    return $false
+}
+
 function Get-MonitorServerLabel {
     $label = $null
     if (Get-Variable -Name ServerDisplayName -ErrorAction SilentlyContinue) {
@@ -1757,8 +1998,14 @@ function Parse-RdpMonitorIgnoreListLine {
     if ($line -match '^(?i)(4740|lockout|блокир)\s*:\s*(.+)$') {
         $scopes = @('4740')
         $line = $Matches[2].Trim()
+    } elseif ($line -match '^(?i)(shadow|20506)\s*:\s*(.+)$') {
+        $scopes = @('20506', '20507', '20510')
+        $line = $Matches[2].Trim()
+    } elseif ($line -match '^(?i)(winrm|pssession|91)\s*:\s*(.+)$') {
+        $scopes = @('winrm')
+        $line = $Matches[2].Trim()
     } elseif ($line -match '^(?i)(all|\*)\s*:\s*(.+)$') {
-        $scopes = @('4624', '4625', '4740')
+        $scopes = @('4624', '4625', '4740', '20506', '20507', '20510', 'winrm')
         $line = $Matches[2].Trim()
     }
     if ([string]::IsNullOrWhiteSpace($line)) { return $null }
@@ -2756,6 +3003,21 @@ function Start-LoginMonitor {
         Write-Log "Мониторинг 4740 задан для КД '$LockoutMonitorDomainController', но этот узел — $env:COMPUTERNAME (блокировки не отслеживаются)."
     }
 
+    if (Test-MonitorFeatureEnabled -Value $EnableRcmShadowControlMonitoring) {
+        if (Test-RcmLogAvailable) {
+            Write-Log "RDS Shadow Control: включён (RCM Operational IDs: $($RcmShadowControlEventIds -join ', '))."
+        } else {
+            Write-Log "RDS Shadow Control: включён в настройках, но журнал RCM недоступен."
+        }
+    }
+    if (Test-MonitorFeatureEnabled -Value $EnableWinRmInboundMonitoring) {
+        if (Test-WinRmLogAvailable) {
+            Write-Log "WinRM inbound (Enter-PSSession): включён (Operational IDs: $($WinRmInboundShellEventIds -join ', '); correlate 4624=$WinRmCorrelateSecurity4624)."
+        } else {
+            Write-Log "WinRM inbound: включён в настройках, но журнал WinRM Operational недоступен."
+        }
+    }
+
     $script:MonitorStartedAt = Get-Date
     $script:HeartbeatStaleAlertActive = $false
 
@@ -2777,13 +3039,19 @@ function Start-LoginMonitor {
             Write-Log "Рабочая станция: журнал Remote Connection Manager недоступен — уведомления только по Security 4624/4625 (LogonType 10). Проверьте, что включён удалённый рабочий стол."
         }
 
+        $rcmShadowMonitoringEnabled = (Test-MonitorFeatureEnabled -Value $EnableRcmShadowControlMonitoring) -and (Test-RcmLogAvailable)
+        $winRmMonitoringEnabled = (Test-MonitorFeatureEnabled -Value $EnableWinRmInboundMonitoring) -and (Test-WinRmLogAvailable)
+
         $nextHeartbeatTime = (Get-Date).AddSeconds($HeartbeatInterval)
         $nextRotationCheck = Check-AndRotateLog
         $nextReportCheck = Check-AndSendDailyReport
         $lastCheckTime = (Get-Date).AddSeconds(-10)
         $lastGatewayCheckTime = (Get-Date).AddSeconds(-10)
         $lastRcmCheckTime = (Get-Date).AddSeconds(-10)
+        $lastRcmShadowCheckTime = (Get-Date).AddSeconds(-10)
+        $lastWinRmCheckTime = (Get-Date).AddSeconds(-10)
         $lastLockout4740CheckTime = (Get-Date).AddSeconds(-10)
+        if (-not $script:NotifyDedupCache) { $script:NotifyDedupCache = @{} }
         $monitorEvents = @(4624, 4625, 4648)
 
         while ($true) {
@@ -3010,6 +3278,101 @@ function Start-LoginMonitor {
                             } | Out-Null
                     }
                     $lastRcmCheckTime = ($rcmEvents | Measure-Object -Property TimeCreated -Maximum | Select-Object -ExpandProperty Maximum).AddSeconds(1)
+                }
+            }
+
+            if ($rcmShadowMonitoringEnabled) {
+                $shadowEvents = Get-WinEvent -FilterHashtable @{
+                    LogName = $RcmLogName
+                    ID = $RcmShadowControlEventIds
+                    StartTime = $lastRcmShadowCheckTime
+                } -ErrorAction SilentlyContinue
+
+                if ($shadowEvents) {
+                    foreach ($event in $shadowEvents) {
+                        if ($event.TimeCreated -le $lastRcmShadowCheckTime) { continue }
+                        $sh = Get-RcmShadowEventInfo -Event $event
+                        if ($sh.ShadowerUser -like '*$') { continue }
+                        if (Test-RdpMonitorIgnoreListMatch -EventId ([string]$event.Id) -Username $sh.ShadowerUser `
+                                -ComputerName $sh.TargetUser -SourceIP '-') {
+                            Write-Log "Skip shadow $($event.Id): Shadower=$($sh.ShadowerUser) Target=$($sh.TargetUser) — ignore.lst"
+                            continue
+                        }
+                        $dedupKey = "shadow|$($event.Id)|$($sh.ShadowerUser)|$($sh.TargetUser)|$($sh.SessionId)"
+                        if (Test-RdpMonitorNotifyDedup -Key $dedupKey -WindowSeconds 120) {
+                            Write-Log "Notify dedup shadow $($event.Id): $dedupKey"
+                            continue
+                        }
+                        $sacType = Get-SacTypeForRcmShadowEvent -EventId $event.Id
+                        $msg = Format-RcmShadowControlEvent -Info $sh -SecurityLogComputerName $event.MachineName
+                        Write-Log "Notify shadow $($event.Id): Shadower=$($sh.ShadowerUser) Target=$($sh.TargetUser) Session=$($sh.SessionId)"
+                        Send-MonitorNotification -Message $msg `
+                            -EmailSubject "RDP Login Monitor: RDS Shadow $($event.Id)" `
+                            -SacEventType $sacType -SacSeverity 'warning' `
+                            -SacTitle "RDS Shadow Control $($event.Id)" `
+                            -SacSummary "Shadow $($event.Id) $($sh.ShadowerUser) -> $($sh.TargetUser)" `
+                            -SacDetails @{
+                                event_id_windows = [int]$event.Id
+                                shadow_mode = 'control'
+                                shadow_action = $sh.ShadowAction
+                                shadower_user = $sh.ShadowerUser
+                                target_user = $sh.TargetUser
+                                target_session_id = $sh.SessionId
+                                session_id = $sh.SessionId
+                            } | Out-Null
+                    }
+                    $lastRcmShadowCheckTime = ($shadowEvents | Measure-Object -Property TimeCreated -Maximum | Select-Object -ExpandProperty Maximum).AddSeconds(1)
+                }
+            }
+
+            if ($winRmMonitoringEnabled) {
+                $winRmEvents = Get-WinEvent -FilterHashtable @{
+                    LogName = $WinRmLogName
+                    ID = $WinRmInboundShellEventIds
+                    StartTime = $lastWinRmCheckTime
+                } -ErrorAction SilentlyContinue
+
+                if ($winRmEvents) {
+                    foreach ($event in $winRmEvents) {
+                        if ($event.TimeCreated -le $lastWinRmCheckTime) { continue }
+                        $wr = Get-WinRm91EventInfo -Event $event
+                        if ($wr.User -like '*$') { continue }
+                        if (Test-MonitorFeatureEnabled -Value $WinRmCorrelateSecurity4624) {
+                            $corr = Find-CorrelatedNetworkLogon4624 -AroundTime $wr.TimeCreated `
+                                -UsernameHint $wr.User -WindowSeconds $WinRm4624CorrelationWindowSeconds
+                            if ($null -ne $corr) {
+                                $wr.SourceIP = $corr.SourceIP
+                                if ($wr.User -eq '-' -and $corr.Username -ne '-') { $wr.User = $corr.Username }
+                                $wr.LogonType = $corr.LogonType
+                            }
+                        }
+                        if (Test-RdpMonitorIgnoreListMatch -EventId 'winrm' -Username $wr.User -SourceIP $wr.SourceIP) {
+                            Write-Log "Skip WinRM $($event.Id): User=$($wr.User) IP=$($wr.SourceIP) — ignore.lst"
+                            continue
+                        }
+                        $dedupKey = "winrm|$($event.Id)|$($wr.User)|$($wr.SourceIP)|$($event.RecordId)"
+                        if (Test-RdpMonitorNotifyDedup -Key $dedupKey -WindowSeconds 90) {
+                            Write-Log "Notify dedup WinRM $($event.Id): $dedupKey"
+                            continue
+                        }
+                        $msg = Format-WinRmSessionEvent -Info $wr -SecurityLogComputerName $event.MachineName
+                        Write-Log "Notify WinRM $($event.Id): User=$($wr.User) IP=$($wr.SourceIP)"
+                        Send-MonitorNotification -Message $msg `
+                            -EmailSubject "RDP Login Monitor: WinRM shell (Enter-PSSession)" `
+                            -SacEventType 'winrm.session.started' -SacSeverity 'warning' `
+                            -SacTitle 'WinRM remote shell (Enter-PSSession)' `
+                            -SacSummary "WinRM 91 $($wr.User) from $($wr.SourceIP)" `
+                            -SacDetails @{
+                                event_id_windows = [int]$event.Id
+                                user = $wr.User
+                                source_ip = $wr.SourceIP
+                                ip_address = $wr.SourceIP
+                                resource_uri = $wr.ResourceUri
+                                logon_type = $wr.LogonType
+                                transport = 'winrm'
+                            } | Out-Null
+                    }
+                    $lastWinRmCheckTime = ($winRmEvents | Measure-Object -Property TimeCreated -Maximum | Select-Object -ExpandProperty Maximum).AddSeconds(1)
                 }
             }
 

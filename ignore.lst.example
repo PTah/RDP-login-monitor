@@ -6,7 +6,9 @@
 # Область действия (префикс в начале строки, необязателен):
 #   (по умолчанию)     — только Security 4624/4625
 #   4740:             — только блокировка учётной записи (4740); для IP — любой IP из IIS
-#   all:              — и 4624/4625, и 4740
+#   shadow:           — RDS Shadow Control (RCM 20506/20507/20510)
+#   winrm: / pssession: — WinRM inbound / Enter-PSSession (Operational 91)
+#   all:              — 4624/4625, 4740, shadow, winrm
 #
 # Форматы правила (после префикса области):
 #   user:domain\user
@@ -25,6 +27,13 @@
 # --- только блокировки 4740 ---
 # 4740:user:test.user
 # 4740:ip:203.0.113.50
+
+# --- только WinRM / Enter-PSSession inbound ---
+# winrm:user:DOMAIN\jump-admin
+# winrm:ip:192.168.160.50
+
+# --- только RDS Shadow Control ---
+# shadow:user:DOMAIN\helpdesk
 
 # --- все перечисленные события ---
 # all:user:domain\noise_account

@@ -42,8 +42,13 @@ $SacApiKey = 'sac_UkOsAT3UWiQS54KK5OJPBDCSucysQDrKFju28wmYiz8'
 # $SacTlsSkipVerify = $false
 # $SacFallbackFailures = 5
 # $false = не слать report.daily.rdp с агента (суточный отчёт только из SAC)
-# Важно: только $false или 0/1 — строка "false" без $ ломает загрузку настроек!
+# В settings.ps1 используйте 1/0 или $true/$false — не пишите голое false без $
 $DailyReportEnabled = 1
+
+# --- RDS Shadow Control + WinRM inbound (Enter-PSSession), severity warning ---
+# $EnableRcmShadowControlMonitoring = 1   # RCM Operational 20506/20507/20510
+# $EnableWinRmInboundMonitoring = 1       # WinRM Operational 91 (+ correlate Security 4624)
+# $WinRmCorrelateSecurity4624 = 1
 # Проверка: powershell -File Login_Monitor.ps1 -CheckSac
 
 # --- Узкое исключение шумовых сетевых логонов (LogonType=3, Advapi) ---
