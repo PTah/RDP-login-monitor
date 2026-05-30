@@ -350,6 +350,111 @@ function Sync-RdpMonitorSettingsDailyReportPatches {
     return $changed
 }
 
+function Test-RdpMonitorExchangeServerRole {
+    if (-not [string]::IsNullOrWhiteSpace($env:ExchangeInstallPath)) {
+        if (Test-Path -LiteralPath $env:ExchangeInstallPath) { return $true }
+    }
+    foreach ($regPath in @(
+        'HKLM:\SOFTWARE\Microsoft\ExchangeServer\v15\Setup',
+        'HKLM:\SOFTWARE\Microsoft\ExchangeServer\v14\Setup'
+    )) {
+        try {
+            if ($null -ne (Get-ItemProperty -LiteralPath $regPath -ErrorAction Stop)) { return $true }
+        } catch { }
+    }
+    foreach ($root in @(
+        'C:\Program Files\Microsoft\Exchange Server\V15',
+        'C:\Program Files\Microsoft\Exchange Server\V14'
+    )) {
+        if (Test-Path -LiteralPath (Join-Path $root 'bin\RemoteExchange.ps1')) { return $true }
+    }
+    try {
+        $svc = Get-Service -Name 'MSExchangeIS', 'MSExchangeTransport' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Status -eq 'Running' } |
+            Select-Object -First 1
+        if ($null -ne $svc) { return $true }
+    } catch { }
+    return $false
+}
+
+function Get-RdpMonitorExchangeNoiseSettingDefinitions {
+    return @(
+        @{
+            Pattern = '(?m)^\s*(\#\s*)?\$\{Ignore4624-LT3-EmptyIP-Event\}\s*='
+            Line    = '${Ignore4624-LT3-EmptyIP-Event} = $true'
+        },
+        @{
+            Pattern = '(?m)^\s*(\#\s*)?\$WinRmIgnoreLocalSource\s*='
+            Line    = '$WinRmIgnoreLocalSource = 1'
+        },
+        @{
+            Pattern = '(?m)^\s*(\#\s*)?\$WinRmIgnoreMachineAccounts\s*='
+            Line    = '$WinRmIgnoreMachineAccounts = 1'
+        }
+    )
+}
+
+function Test-RdpMonitorSettingsNeedsExchangeNoisePatch {
+    param([string]$SettingsPath)
+    if (-not (Test-RdpMonitorExchangeServerRole)) { return $false }
+    if (-not (Test-Path -LiteralPath $SettingsPath)) { return $false }
+    $c = Get-RdpMonitorSettingsRaw -Path $SettingsPath
+    if ([string]::IsNullOrWhiteSpace($c)) { return $false }
+    foreach ($def in Get-RdpMonitorExchangeNoiseSettingDefinitions) {
+        if ($c -notmatch $def.Pattern) { return $true }
+    }
+    return $false
+}
+
+function Sync-RdpMonitorSettingsExchangeNoisePatches {
+    param([string]$LocalSettings)
+    if (-not (Test-RdpMonitorExchangeServerRole)) { return $false }
+    if (-not (Test-Path -LiteralPath $LocalSettings)) { return $false }
+    if (-not (Test-RdpMonitorSettingsNeedsExchangeNoisePatch -SettingsPath $LocalSettings)) {
+        return $false
+    }
+
+    $c = Get-RdpMonitorSettingsRaw -Path $LocalSettings
+    $linesToAdd = [System.Collections.Generic.List[string]]::new()
+    [void]$linesToAdd.Add('# --- Exchange: подавление шумов WinRM/4624 (добавлено Deploy-LoginMonitor) ---')
+    foreach ($def in Get-RdpMonitorExchangeNoiseSettingDefinitions) {
+        if ($c -notmatch $def.Pattern) {
+            [void]$linesToAdd.Add($def.Line)
+        }
+    }
+    if ($linesToAdd.Count -le 1) { return $false }
+
+    $bak = "$LocalSettings.bak.$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+    Copy-Item -LiteralPath $LocalSettings -Destination $bak -Force
+    Write-DeployLog "Добавление Exchange noise settings в login_monitor.settings.ps1; резервная копия: $bak"
+
+    $block = ($linesToAdd -join "`r`n")
+    $insertBefore = '(?m)^\s*#\s*---\s*Exchange noise filter'
+    if ($c -match $insertBefore) {
+        $newContent = [regex]::Replace($c, $insertBefore, ($block + "`r`n`r`n" + '$0'), 1)
+    } else {
+        $insertLockout = '(?m)^\s*#\s*---\s*Блокировка учётной записи'
+        if ($c -match $insertLockout) {
+            $newContent = [regex]::Replace($c, $insertLockout, ($block + "`r`n`r`n" + '$0'), 1)
+        } else {
+            $newContent = ($c.TrimEnd() + "`r`n`r`n" + $block + "`r`n")
+        }
+    }
+    [System.IO.File]::WriteAllText($LocalSettings, $newContent.TrimEnd() + "`r`n", $Utf8Bom)
+    Write-DeployLog ("login_monitor.settings.ps1: Exchange noise — добавлено строк: {0}" -f ($linesToAdd.Count - 1))
+    return $true
+}
+
+function Invoke-RdpMonitorSettingsPostPatches {
+    param([string]$LocalSettings)
+    if (-not (Test-Path -LiteralPath $LocalSettings)) { return $false }
+    $changed = $false
+    if (Update-RdpMonitorSettingsServerDisplayNameHintIfMissing -LocalSettings $LocalSettings) { $changed = $true }
+    if (Sync-RdpMonitorSettingsDailyReportPatches -LocalSettings $LocalSettings) { $changed = $true }
+    if (Sync-RdpMonitorSettingsExchangeNoisePatches -LocalSettings $LocalSettings) { $changed = $true }
+    return $changed
+}
+
 function Update-RdpMonitorSettingsServerDisplayNameHintIfMissing {
     param([string]$LocalSettings)
     if (-not (Test-Path -LiteralPath $LocalSettings)) { return $false }
@@ -457,8 +562,7 @@ function Sync-RdpMonitorSettingsFromShare {
 
     if (-not $needsBootstrap) {
         Write-DeployLog "login_monitor.settings.ps1: SAC уже настроен, файл не перезаписываем."
-        Update-RdpMonitorSettingsServerDisplayNameHintIfMissing -LocalSettings $LocalSettings | Out-Null
-        Sync-RdpMonitorSettingsDailyReportPatches -LocalSettings $LocalSettings | Out-Null
+        Invoke-RdpMonitorSettingsPostPatches -LocalSettings $LocalSettings | Out-Null
         return
     }
 
@@ -469,14 +573,12 @@ function Sync-RdpMonitorSettingsFromShare {
     if ($needsCreate) {
         Write-DeployLog "Создан login_monitor.settings.ps1 из example (Telegram + SAC dual)."
         Copy-Item -LiteralPath $ExampleOnShare -Destination $LocalSettings -Force
-        Update-RdpMonitorSettingsServerDisplayNameHintIfMissing -LocalSettings $LocalSettings | Out-Null
-        Sync-RdpMonitorSettingsDailyReportPatches -LocalSettings $LocalSettings | Out-Null
+        Invoke-RdpMonitorSettingsPostPatches -LocalSettings $LocalSettings | Out-Null
         return
     }
 
     if (Update-RdpMonitorSettingsSacBlockIfMissing -LocalSettings $LocalSettings -ExampleOnShare $ExampleOnShare) {
-        Update-RdpMonitorSettingsServerDisplayNameHintIfMissing -LocalSettings $LocalSettings | Out-Null
-        Sync-RdpMonitorSettingsDailyReportPatches -LocalSettings $LocalSettings | Out-Null
+        Invoke-RdpMonitorSettingsPostPatches -LocalSettings $LocalSettings | Out-Null
         return
     }
 
@@ -484,8 +586,7 @@ function Sync-RdpMonitorSettingsFromShare {
     Copy-Item -LiteralPath $LocalSettings -Destination $bak -Force
     Write-DeployLog "Апгрейд settings: резервная копия $bak, применяем example с шары."
     Copy-Item -LiteralPath $ExampleOnShare -Destination $LocalSettings -Force
-    Update-RdpMonitorSettingsServerDisplayNameHintIfMissing -LocalSettings $LocalSettings | Out-Null
-    Sync-RdpMonitorSettingsDailyReportPatches -LocalSettings $LocalSettings | Out-Null
+    Invoke-RdpMonitorSettingsPostPatches -LocalSettings $LocalSettings | Out-Null
 }
 
 function Stop-RdpLoginMonitorMainProcesses {
@@ -565,8 +666,13 @@ try {
     $needsDisplayNameHint = Test-RdpMonitorSettingsNeedsServerDisplayNameHint -SettingsPath $settingsLocal
     $needsDailyReportHint = Test-RdpMonitorSettingsNeedsDailyReportHint -SettingsPath $settingsLocal
     $needsDailyReportRepair = Test-RdpMonitorSettingsHasInvalidDailyReportAssignment -SettingsPath $settingsLocal
+    $needsExchangeNoisePatch = Test-RdpMonitorSettingsNeedsExchangeNoisePatch -SettingsPath $settingsLocal
     $needsBundleSync = Test-RdpMonitorDeployBundleNeedsSync -ShareRoot $shareRoot
-    $needsSacBootstrap = $needsSettingsBootstrap -or $needsBundleSync -or $needsDisplayNameHint -or $needsDailyReportHint -or $needsDailyReportRepair
+    $needsSacBootstrap = $needsSettingsBootstrap -or $needsBundleSync -or $needsDisplayNameHint -or $needsDailyReportHint -or $needsDailyReportRepair -or $needsExchangeNoisePatch
+
+    if (Test-RdpMonitorExchangeServerRole) {
+        Write-DeployLog "Обнаружена роль Exchange — при необходимости допишем WinRM/4624 noise settings в login_monitor.settings.ps1."
+    }
 
     $cmp = Compare-VersionStrings -Left $shareVerRaw -Right $localVerRaw
     if ($null -ne $cmp) {
@@ -585,6 +691,8 @@ try {
                 Write-DeployLog "Версия совпадает ($shareVerRaw), но нет `$DailyReportEnabled в settings — продолжаем деплой."
             } elseif ($needsDailyReportRepair) {
                 Write-DeployLog "Версия совпадает ($shareVerRaw), но в settings некорректно задан `$DailyReportEnabled (= true/false без `$) — продолжаем деплой."
+            } elseif ($needsExchangeNoisePatch) {
+                Write-DeployLog "Версия совпадает ($shareVerRaw), но на Exchange не хватает noise settings (WinRM/4624) — продолжаем деплой."
             }
         }
         if ($cmp -lt 0 -and -not $AllowDowngrade) {

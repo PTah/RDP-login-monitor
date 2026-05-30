@@ -51,6 +51,7 @@
 - Если файл есть, но **нет блока SAC** — Deploy **дописывает** блок из example (Telegram/SMTP не трогает).
 - Если **нет** строки `$ServerDisplayName` — Deploy **дописывает** закомментированную подсказку `# $ServerDisplayName = '<имя ПК>'`.
 - Если **нет** `$DailyReportEnabled` — Deploy **дописывает** закомментированную подсказку `# $DailyReportEnabled = $false` (суточный отчёт только из SAC). Если в файле ошибочно `= false` без `$` — Deploy **исправляет** на `$false`.
+- На сервере с **ролью Exchange** Deploy **дописывает** (если строк нет): `${Ignore4624-LT3-EmptyIP-Event} = $true`, `$WinRmIgnoreLocalSource = 1`, `$WinRmIgnoreMachineAccounts = 1` — подавление HealthMailbox/локального WinRM и шумовых 4624 LT3.
 
 ```powershell
 $root = 'C:\ProgramData\RDP-login-monitor'
