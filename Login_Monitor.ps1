@@ -80,7 +80,7 @@ $script:MonitorLoopInitialized = $false
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.2.23-SAC"
+$ScriptVersion = "1.2.24-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -102,6 +102,7 @@ $DeployUpdateMarkerFile = Join-Path $script:InstallRoot "deploy_last_update.txt"
 $script:IgnoreListPath = Join-Path $script:InstallRoot "ignore.lst"
 $script:IgnoreListCache = $null
 $script:IgnoreListCacheStampUtc = $null
+$script:NotifyDedupCache = @{}
 
 # Ежедневный отчет
 $DailyReportHour = 9
@@ -1477,7 +1478,7 @@ function Test-RdpMonitorNotifyDedup {
         [int]$WindowSeconds = 90
     )
     if ([string]::IsNullOrWhiteSpace($Key)) { return $false }
-    if (-not $script:NotifyDedupCache) {
+    if (-not (Get-Variable -Scope Script -Name NotifyDedupCache -ErrorAction SilentlyContinue)) {
         $script:NotifyDedupCache = @{}
     }
     $now = Get-Date
@@ -3051,7 +3052,6 @@ function Start-LoginMonitor {
         $lastRcmShadowCheckTime = (Get-Date).AddSeconds(-10)
         $lastWinRmCheckTime = (Get-Date).AddSeconds(-10)
         $lastLockout4740CheckTime = (Get-Date).AddSeconds(-10)
-        if (-not $script:NotifyDedupCache) { $script:NotifyDedupCache = @{} }
         $monitorEvents = @(4624, 4625, 4648)
 
         while ($true) {
