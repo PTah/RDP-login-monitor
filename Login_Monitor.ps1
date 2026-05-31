@@ -82,7 +82,7 @@ $script:MonitorStopRequested = $false
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.2.31-SAC"
+$ScriptVersion = "1.2.32-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -2413,6 +2413,40 @@ function Get-LoginEventInfo {
     return $eventData
 }
 
+function Test-RdpLoginShowWorkstationLine {
+    param(
+        [string]$WorkstationName,
+        [string]$ServerHostname = $env:COMPUTERNAME
+    )
+
+    $ws = if ($null -ne $WorkstationName) { [string]$WorkstationName.Trim() } else { '' }
+    if ([string]::IsNullOrWhiteSpace($ws) -or $ws -eq '-' -or $ws -eq 'N/A') {
+        return $false
+    }
+
+    $wsKey = $ws.ToLowerInvariant()
+    $hostKey = if ($null -ne $ServerHostname) { [string]$ServerHostname.Trim().ToLowerInvariant() } else { '' }
+    if ($hostKey -and $wsKey -eq $hostKey) {
+        return $false
+    }
+
+    if (Get-Command -Name Get-MonitorServerLabel -ErrorAction SilentlyContinue) {
+        $label = [string](Get-MonitorServerLabel)
+        if (-not [string]::IsNullOrWhiteSpace($label)) {
+            $labelKey = $label.Trim().ToLowerInvariant()
+            if ($wsKey -eq $labelKey) {
+                return $false
+            }
+            $base = ($label -split '\(', 2)[0].Trim().ToLowerInvariant()
+            if ($base -and $wsKey -eq $base) {
+                return $false
+            }
+        }
+    }
+
+    return $true
+}
+
 function Format-LoginEvent {
     param(
         [int]$EventID,
@@ -2444,7 +2478,9 @@ function Format-LoginEvent {
 
     $message += "👤 Пользователь: $hUser`r`n"
     $message += "🏢 Сервер (журнал Security): $hLog`r`n"
-    $message += "🖥️ Рабочая станция (клиент из события): $hWkst`r`n"
+    if (Test-RdpLoginShowWorkstationLine -WorkstationName $ComputerName -ServerHostname $logHost) {
+        $message += "🖥️ Рабочая станция (клиент из события): $hWkst`r`n"
+    }
     $message += "🌐 IP адрес: $hIp`r`n"
     $message += "⚙️ Процесс/Код: $hProc`r`n"
     $message += "🔑 Тип входа: $hLtName ($LogonType)`r`n"
