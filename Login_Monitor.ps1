@@ -82,7 +82,7 @@ $script:MonitorStopRequested = $false
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.2.33-SAC"
+$ScriptVersion = "1.2.34-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -2467,7 +2467,6 @@ function Format-LoginEvent {
     $hWkst = (ConvertTo-TelegramHtml $ComputerName)
     $hIp = (ConvertTo-TelegramHtml $SourceIP)
     $hProc = (ConvertTo-TelegramHtml $ProcessName)
-    $hLtName = (ConvertTo-TelegramHtml $LogonTypeName)
     $hTime = (ConvertTo-TelegramHtml ($TimeCreated.ToString('dd.MM.yyyy HH:mm:ss')))
 
     $message = "<b>"
@@ -2483,7 +2482,8 @@ function Format-LoginEvent {
     }
     $message += "🌐 IP адрес: $hIp`r`n"
     $message += "⚙️ Процесс/Код: $hProc`r`n"
-    $message += "🔑 Тип входа: $hLtName ($LogonType)`r`n"
+    $ltLine = if ($LogonTypeName -match '\(\d+\)\s*$') { $LogonTypeName } else { "$LogonTypeName ($LogonType)" }
+    $message += "🔑 Тип входа: $(ConvertTo-TelegramHtml $ltLine)`r`n"
     $message += "🕐 Время: $hTime`r`n"
     $message += "🔢 Event ID: $EventID"
 
@@ -2493,6 +2493,33 @@ function Format-LoginEvent {
 $script:FailedLogonBuckets = @{}
 $script:LoginSuccessNotifyDedup = @{}
 
+function Get-RdpLoginNotifyDedupHostPart {
+    param([string]$SecurityLogComputerName)
+
+    $hostPart = if ([string]::IsNullOrWhiteSpace($SecurityLogComputerName)) {
+        [string]$env:COMPUTERNAME
+    } else {
+        [string]$SecurityLogComputerName.Trim()
+    }
+    $dotIdx = $hostPart.IndexOf('.')
+    if ($dotIdx -gt 0) {
+        $hostPart = $hostPart.Substring(0, $dotIdx)
+    }
+    return $hostPart.ToUpperInvariant()
+}
+
+function Get-RdpLoginNotifyDedupUsernamePart {
+    param([string]$Username)
+
+    $userPart = if ($null -ne $Username) { [string]$Username.Trim() } else { '' }
+    if ([string]::IsNullOrWhiteSpace($userPart) -or $userPart -eq '-') { return '-' }
+    $bsIdx = $userPart.LastIndexOf('\')
+    if ($bsIdx -ge 0 -and $bsIdx -lt ($userPart.Length - 1)) {
+        $userPart = $userPart.Substring($bsIdx + 1)
+    }
+    return $userPart.ToUpperInvariant()
+}
+
 function Get-RdpLoginSuccessNotifyDedupKey {
     param(
         [string]$SecurityLogComputerName,
@@ -2500,26 +2527,26 @@ function Get-RdpLoginSuccessNotifyDedupKey {
         [string]$SourceIP,
         [int]$LogonType
     )
-    $hostPart = if ([string]::IsNullOrWhiteSpace($SecurityLogComputerName)) { $env:COMPUTERNAME } else { $SecurityLogComputerName.Trim() }
-    $userPart = if ($null -ne $Username) { $Username.Trim() } else { '-' }
-    $ipPart = if ($null -ne $SourceIP) { $SourceIP.Trim() } else { '-' }
+    $hostPart = Get-RdpLoginNotifyDedupHostPart -SecurityLogComputerName $SecurityLogComputerName
+    $userPart = Get-RdpLoginNotifyDedupUsernamePart -Username $Username
+    $ipPart = if ($null -ne $SourceIP) { [string]$SourceIP.Trim() } else { '-' }
+    if ([string]::IsNullOrWhiteSpace($ipPart)) { $ipPart = '-' }
     return "$hostPart|4624|$userPart|$ipPart|$LogonType"
 }
 
 function Test-RdpLoginSuccessNotifyDedupAllow {
-    param(
-        [string]$DedupKey,
-        [datetime]$TimeCreated
-    )
+    param([string]$DedupKey)
+
     if ($LoginSuccessNotifyDedupSeconds -le 0) { return $true }
+    $nowUtc = (Get-Date).ToUniversalTime()
     if ($script:LoginSuccessNotifyDedup.ContainsKey($DedupKey)) {
         $lastUtc = $script:LoginSuccessNotifyDedup[$DedupKey]
-        $delta = ($TimeCreated.ToUniversalTime() - $lastUtc).TotalSeconds
+        $delta = ($nowUtc - $lastUtc).TotalSeconds
         if ($delta -ge 0 -and $delta -lt $LoginSuccessNotifyDedupSeconds) {
             return $false
         }
     }
-    $script:LoginSuccessNotifyDedup[$DedupKey] = $TimeCreated.ToUniversalTime()
+    $script:LoginSuccessNotifyDedup[$DedupKey] = $nowUtc
     return $true
 }
 
@@ -3336,7 +3363,7 @@ function Start-LoginMonitor {
                     if ($event.Id -eq 4624) {
                         $dedupKey = Get-RdpLoginSuccessNotifyDedupKey -SecurityLogComputerName $event.MachineName `
                             -Username $eventInfo.Username -SourceIP $eventInfo.SourceIP -LogonType $eventInfo.LogonType
-                        if (-not (Test-RdpLoginSuccessNotifyDedupAllow -DedupKey $dedupKey -TimeCreated $eventInfo.TimeCreated)) {
+                        if (-not (Test-RdpLoginSuccessNotifyDedupAllow -DedupKey $dedupKey)) {
                             Write-Log "Notify dedup 4624: User=$($eventInfo.Username) LT=$($eventInfo.LogonType) IP=$($eventInfo.SourceIP) (window ${LoginSuccessNotifyDedupSeconds}s)"
                             continue
                         }
