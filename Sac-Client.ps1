@@ -170,8 +170,31 @@ function Get-SacOccurredAtIso {
 function Convert-AnyToJsonSerializable {
     param($Value)
     if ($null -eq $Value) { return $null }
-    if ($Value -is [string] -or $Value -is [bool] -or $Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal]) {
+    if ($Value -is [string] -or $Value -is [bool] -or $Value -is [char]) {
         return $Value
+    }
+    if ($Value -is [byte] -or $Value -is [sbyte] -or $Value -is [int16] -or $Value -is [uint16] -or
+        $Value -is [int] -or $Value -is [uint] -or $Value -is [long] -or $Value -is [ulong] -or
+        $Value -is [float] -or $Value -is [double] -or $Value -is [decimal]) {
+        return $Value
+    }
+    if ($Value -is [datetime] -or $Value -is [datetimeoffset] -or $Value -is [guid]) {
+        return [string]$Value
+    }
+    if ($Value -is [System.Management.Automation.PSMethod] -or
+        $Value -is [System.Management.Automation.ScriptBlock] -or
+        $Value -is [Delegate]) {
+        return $null
+    }
+    if ($Value -is [pscustomobject]) {
+        $out = @{}
+        foreach ($prop in $Value.PSObject.Properties) {
+            if ($prop.MemberType -notin @('NoteProperty', 'Property', 'AliasProperty', 'CodeProperty', 'ScriptProperty')) {
+                continue
+            }
+            $out[$prop.Name] = Convert-AnyToJsonSerializable $prop.Value
+        }
+        return $out
     }
     if ($Value -is [hashtable] -or $Value -is [System.Collections.IDictionary]) {
         $out = @{}
@@ -181,11 +204,11 @@ function Convert-AnyToJsonSerializable {
         return $out
     }
     if ($Value -is [System.Collections.IEnumerable]) {
-        $list = New-Object System.Collections.Generic.List[object]
-        foreach ($item in $Value) {
-            $list.Add((Convert-AnyToJsonSerializable $item)) | Out-Null
-        }
-        return $list
+        return ,@(
+            foreach ($item in $Value) {
+                Convert-AnyToJsonSerializable $item
+            }
+        )
     }
     return [string]$Value
 }
