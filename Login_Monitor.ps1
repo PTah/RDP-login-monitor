@@ -80,7 +80,7 @@ $script:MonitorLoopInitialized = $false
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.2.29-SAC"
+$ScriptVersion = "1.2.30-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -952,6 +952,23 @@ function Send-MonitorNotification {
     return $anyOk
 }
 
+function Send-RdpMonitorLifecycleNotification {
+    param(
+        [Parameter(Mandatory = $true)][string]$Lifecycle,
+        [Parameter(Mandatory = $true)][string]$Trigger,
+        [Parameter(Mandatory = $true)][string]$TelegramHtmlMessage,
+        [Parameter(Mandatory = $true)][string]$SacSummary,
+        [string]$SacTitle = '',
+        [string]$SacSeverity = 'info',
+        [string]$EmailSubject = 'RDP Login Monitor'
+    )
+
+    $title = if (-not [string]::IsNullOrWhiteSpace($SacTitle)) { $SacTitle } else { "RDP login monitor: $Lifecycle" }
+    Send-MonitorNotification -Message $TelegramHtmlMessage -EmailSubject $EmailSubject `
+        -SacEventType 'agent.lifecycle' -SacSeverity $SacSeverity -SacTitle $title -SacSummary $SacSummary `
+        -SacDetails @{ lifecycle = $Lifecycle; trigger = $Trigger } | Out-Null
+}
+
 function Test-Administrator {
     $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($currentUser)
@@ -1806,8 +1823,10 @@ function Send-Heartbeat {
         $message = "<b>✅ Мониторинг логинов ЗАПУЩЕН</b>`r`n"
         $message += "🏷️ Версия скрипта: $(ConvertTo-TelegramHtml $ScriptVersion)"
         $upd = Get-DeployUpdateMarker
+        $lifecycleTrigger = 'boot'
         if ($upd.PendingStartupNotice -and $upd.Version -eq $ScriptVersion -and -not [string]::IsNullOrWhiteSpace($upd.UpdatedAt)) {
             $message += " (обновлён $(ConvertTo-TelegramHtml $upd.UpdatedAt))"
+            $lifecycleTrigger = 'deploy_recycle'
             Set-DeployUpdateMarkerPendingOff -Marker $upd
         }
         $message += "`r`n"
@@ -1863,11 +1882,10 @@ function Send-Heartbeat {
                 $message += " IP из IIS не заданы (<code>ExchangeIisLogPath</code> пуст)."
             }
         }
-        Send-MonitorNotification -Message $message -EmailSubject "RDP Login Monitor: запуск" `
-            -SacEventType 'agent.lifecycle' -SacSeverity 'info' `
+        Send-RdpMonitorLifecycleNotification -Lifecycle 'started' -Trigger $lifecycleTrigger `
+            -TelegramHtmlMessage $message -EmailSubject 'RDP Login Monitor: запуск' `
             -SacTitle 'RDP login monitor started' `
-            -SacSummary "Мониторинг запущен на $(Get-MonitorServerLabel), версия $ScriptVersion" `
-            -SacDetails @{ lifecycle = 'started' } | Out-Null
+            -SacSummary "Мониторинг запущен на $(Get-MonitorServerLabel), версия $ScriptVersion"
         Write-Log "Отправлено уведомление о запуске скрипта (каналы: $notifyChain)"
     } else {
         Write-TextFileUtf8Bom -Path $HeartbeatFile -Text $timestamp
@@ -1944,11 +1962,10 @@ function Send-StopNotification {
     $message += "🕐 Время остановки: $timestamp`r`n"
     $message += "📋 Причина: $hReason"
 
-    Send-MonitorNotification -Message $message -EmailSubject "RDP Login Monitor: остановка" `
-        -SacEventType 'agent.lifecycle' -SacSeverity 'info' `
-        -SacTitle 'RDP login monitor stopped' `
-        -SacSummary "Мониторинг остановлен: $Reason" `
-        -SacDetails @{ lifecycle = 'stopped'; reason = $Reason } | Out-Null
+    Send-RdpMonitorLifecycleNotification -Lifecycle 'stopped' -Trigger 'shutdown' `
+        -TelegramHtmlMessage $message -EmailSubject 'RDP Login Monitor: остановка' `
+        -SacTitle 'RDP login monitor stopped' -SacSeverity 'info' `
+        -SacSummary "Мониторинг остановлен: $Reason"
     Write-Log "Уведомление об остановке отправлено: $Reason"
 }
 
@@ -3175,6 +3192,15 @@ function Start-LoginMonitor {
                 }
                 Write-Log "Graceful restart (settings): запрос '$($restartReq.Reason)' — перечитываю настройки в этом же процессе PowerShell."
                 Invoke-RdpMonitorReloadSettings | Out-Null
+                $hHost = ConvertTo-TelegramHtml (Get-MonitorServerLabel)
+                $reloadMsg = "<b>🔄 Настройки монитора перечитаны</b>`r`n"
+                $reloadMsg += "🖥️ Сервер: $hHost`r`n"
+                $reloadMsg += "🏷️ Версия: $(ConvertTo-TelegramHtml $ScriptVersion)`r`n"
+                $reloadMsg += "📢 Каналы: $(ConvertTo-TelegramHtml (Get-NotifyChainHuman))"
+                Send-RdpMonitorLifecycleNotification -Lifecycle 'settings_reloaded' -Trigger 'settings_reload' `
+                    -TelegramHtmlMessage $reloadMsg -EmailSubject 'RDP Login Monitor: settings reload' `
+                    -SacTitle 'RDP login monitor settings reloaded' `
+                    -SacSummary "Настройки перечитаны на $(Get-MonitorServerLabel), версия $ScriptVersion"
                 break
             }
 

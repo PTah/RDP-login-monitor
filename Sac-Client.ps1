@@ -624,14 +624,9 @@ function Send-SacEvent {
         return $false
     }
 
-    $mergedDetails = @{}
-    if ($null -ne $Details) {
-        foreach ($k in $Details.Keys) {
-            $mergedDetails[$k] = $Details[$k]
-        }
-    }
-    if (-not $mergedDetails.ContainsKey('generated_by')) {
-        $mergedDetails['generated_by'] = 'agent'
+    $mergedDetails = Merge-SacNotifyDetails -Details $Details -TelegramVia ''
+    if ($mergedDetails.Count -eq 0) {
+        $mergedDetails = $null
     }
 
     $payload = $(New-SacEventPayload -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $mergedDetails)
@@ -675,6 +670,27 @@ function Test-SacHeartbeatOnlyEventType {
     return ($EventType -eq 'agent.heartbeat')
 }
 
+function Merge-SacNotifyDetails {
+    param(
+        [hashtable]$Details = $null,
+        [string]$TelegramVia = ''
+    )
+
+    $merged = @{}
+    if ($null -ne $Details) {
+        foreach ($k in $Details.Keys) {
+            $merged[$k] = $Details[$k]
+        }
+    }
+    if (-not $merged.ContainsKey('generated_by')) {
+        $merged['generated_by'] = 'agent'
+    }
+    if (-not [string]::IsNullOrWhiteSpace($TelegramVia) -and -not $merged.ContainsKey('telegram_via')) {
+        $merged['telegram_via'] = $TelegramVia.Trim().ToLowerInvariant()
+    }
+    return $merged
+}
+
 function Send-NotifyOrSac {
     param(
         [Parameter(Mandatory = $true)][string]$EventType,
@@ -697,7 +713,8 @@ function Send-NotifyOrSac {
         if ($mode -eq 'off') {
             return $false
         }
-        return (Send-SacEvent -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $Details)
+        $hbDetails = Merge-SacNotifyDetails -Details $Details -TelegramVia 'sac'
+        return (Send-SacEvent -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $hbDetails)
     }
 
     switch ($mode) {
@@ -705,14 +722,17 @@ function Send-NotifyOrSac {
             return (Send-SacLocalChannels -TelegramMessage $TelegramMessage -EmailSubject $EmailSubject)
         }
         'exclusive' {
-            return (Send-SacEvent -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $Details)
+            $merged = Merge-SacNotifyDetails -Details $Details -TelegramVia 'sac'
+            return (Send-SacEvent -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $merged)
         }
         'dual' {
-            Send-SacEvent -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $Details | Out-Null
+            $merged = Merge-SacNotifyDetails -Details $Details -TelegramVia 'agent'
+            Send-SacEvent -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $merged | Out-Null
             return (Send-SacLocalChannels -TelegramMessage $TelegramMessage -EmailSubject $EmailSubject)
         }
         'fallback' {
-            if (Send-SacEvent -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $Details) {
+            $merged = Merge-SacNotifyDetails -Details $Details -TelegramVia 'sac'
+            if (Send-SacEvent -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $merged) {
                 return $true
             }
             return (Send-SacLocalChannels -TelegramMessage $TelegramMessage -EmailSubject $EmailSubject)
