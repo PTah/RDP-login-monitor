@@ -80,7 +80,7 @@ $script:MonitorLoopInitialized = $false
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.2.27-SAC"
+$ScriptVersion = "1.2.28-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -1638,6 +1638,22 @@ function Get-DailyReportAuthStats24h {
     }
 }
 
+function Expand-DailyReportActiveUserEntries {
+    param([string[]]$Entries)
+    $out = [System.Collections.Generic.List[string]]::new()
+    foreach ($e in @($Entries)) {
+        if ([string]::IsNullOrWhiteSpace($e)) { continue }
+        $parts = [regex]::Split($e.Trim(), '(?=👤)')
+        foreach ($p in $parts) {
+            $p = $p.Trim()
+            if ([string]::IsNullOrWhiteSpace($p)) { continue }
+            if (-not $p.StartsWith('👤')) { $p = "👤 $p" }
+            [void]$out.Add($p)
+        }
+    }
+    return ,@($out)
+}
+
 function Get-DailyReportActiveUsersFromQuser {
     $lines = [System.Collections.Generic.List[string]]::new()
     $quserExe = Join-Path $env:SystemRoot 'System32\quser.exe'
@@ -1674,6 +1690,7 @@ function Build-DailyReportPlainBodyWindows {
     $top = @($Stats.top_failed_ips)
     $sb = [System.Text.StringBuilder]::new()
     [void]$sb.AppendLine('📊 ЕЖЕДНЕВНЫЙ ОТЧЕТ МОНИТОРИНГА WINDOWS')
+    [void]$sb.AppendLine("Agent version $ScriptVersion")
     [void]$sb.AppendLine("🖥️ Сервер: $server")
     [void]$sb.AppendLine("🕐 Время отчета: $timeStr")
     [void]$sb.AppendLine('')
@@ -2809,7 +2826,7 @@ function Send-DailyReport {
     try {
         $reportTime = Get-Date
         $stats = Get-DailyReportAuthStats24h
-        $activeUsers = @(Get-DailyReportActiveUsersFromQuser)
+        $activeUsers = Expand-DailyReportActiveUserEntries -Entries @(Get-DailyReportActiveUsersFromQuser)
         $plainBody = Build-DailyReportPlainBodyWindows -Stats $stats -ActiveUsers $activeUsers -ReportTime $reportTime
         $telegramMessage = Convert-DailyReportPlainToTelegramHtml -PlainBody $plainBody
 
