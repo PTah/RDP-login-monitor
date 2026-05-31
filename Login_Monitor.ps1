@@ -80,7 +80,7 @@ $script:MonitorLoopInitialized = $false
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.2.28-SAC"
+$ScriptVersion = "1.2.29-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -737,6 +737,28 @@ function Get-NotifyChainHuman {
     return ($labels -join ' → ')
 }
 
+function Get-AgentNotificationSourcePlainLine {
+    $ver = if ($ScriptVersion) { [string]$ScriptVersion } else { 'unknown' }
+    return "📡 Оповещение: агент (rdp-login-monitor $ver)"
+}
+
+function Get-AgentNotificationSourceHtmlLine {
+    return [System.Net.WebUtility]::HtmlEncode((Get-AgentNotificationSourcePlainLine))
+}
+
+function Add-NotificationSourceLine {
+    param([string]$Message)
+
+    if ($Message -match 'Оповещение:\s*(агент|SAC)') {
+        return $Message
+    }
+    $line = Get-AgentNotificationSourceHtmlLine
+    if ([string]::IsNullOrWhiteSpace($Message)) {
+        return $line
+    }
+    return ($Message.TrimEnd() + "`r`n`r`n" + $line)
+}
+
 function ConvertTo-TelegramHtml {
     param([string]$Text)
     if ($null -eq $Text) { return '' }
@@ -750,6 +772,8 @@ function Send-TelegramMessage {
         Write-Log "Telegram: не задан токен/chat_id"
         return $false
     }
+
+    $Message = Add-NotificationSourceLine -Message $Message
 
     $uri = "https://api.telegram.org/bot$TelegramBotToken/sendMessage"
     $body = @{
@@ -1713,6 +1737,8 @@ function Build-DailyReportPlainBodyWindows {
     } else {
         [void]$sb.AppendLine(' (нет данных)')
     }
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine((Get-AgentNotificationSourcePlainLine))
     return $sb.ToString().TrimEnd()
 }
 

@@ -624,7 +624,17 @@ function Send-SacEvent {
         return $false
     }
 
-    $payload = $(New-SacEventPayload -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $Details)
+    $mergedDetails = @{}
+    if ($null -ne $Details) {
+        foreach ($k in $Details.Keys) {
+            $mergedDetails[$k] = $Details[$k]
+        }
+    }
+    if (-not $mergedDetails.ContainsKey('generated_by')) {
+        $mergedDetails['generated_by'] = 'agent'
+    }
+
+    $payload = $(New-SacEventPayload -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $mergedDetails)
     if ($payload -is [System.Array]) {
         $payload = $payload[-1]
     }
