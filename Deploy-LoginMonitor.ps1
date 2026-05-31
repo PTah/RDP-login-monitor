@@ -792,10 +792,11 @@ try {
             Write-DeployLog "Монитор уже запущен — повторный старт не выполняем."
         } else {
             $taskName = 'RDP-Login-Monitor'
+            $schtasksExe = Join-Path $env:SystemRoot 'System32\schtasks.exe'
             $runEa = $ErrorActionPreference
             try {
                 $ErrorActionPreference = 'SilentlyContinue'
-                $runOut = & schtasks.exe /Run /TN $taskName 2>&1
+                $runOut = & $schtasksExe /Run /TN $taskName 2>&1
                 foreach ($line in @($runOut)) {
                     if ($null -ne $line -and "$line".Trim().Length -gt 0) {
                         Write-DeployLog "schtasks /Run $taskName : $line"
