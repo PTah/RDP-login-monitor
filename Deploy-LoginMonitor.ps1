@@ -190,8 +190,8 @@ function Test-RdpMonitorMainProcessRunning {
 
 function Set-RdpMonitorRestartRequestFromDeploy {
     param(
-        [ValidateSet('settings', 'recycle')]
-        [string]$Mode = 'recycle',
+        [ValidateSet('settings', 'recycle', 'stop')]
+        [string]$Mode = 'stop',
         [string]$Reason = 'deploy'
     )
 
@@ -617,8 +617,8 @@ function Stop-RdpLoginMonitorMainProcesses {
         return
     }
 
-    Write-DeployLog "Graceful recycle: запись restart.request (mode=recycle), без дочернего PowerShell."
-    Set-RdpMonitorRestartRequestFromDeploy -Mode 'recycle' -Reason 'deploy'
+    Write-DeployLog "Graceful stop: запись restart.request (mode=stop), без дочернего PowerShell."
+    Set-RdpMonitorRestartRequestFromDeploy -Mode 'stop' -Reason 'deploy'
 
     $deadline = (Get-Date).AddSeconds($GracefulWaitSec)
     while ((Get-Date) -lt $deadline) {
@@ -629,7 +629,7 @@ function Stop-RdpLoginMonitorMainProcesses {
         Start-Sleep -Seconds 1
     }
 
-    Write-DeployLog "Таймаут graceful recycle — принудительная остановка оставшихся процессов монитора."
+    Write-DeployLog "Таймаут graceful stop — принудительная остановка оставшихся процессов монитора."
     try {
         $procs = Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe' OR Name = 'pwsh.exe'" -ErrorAction Stop
         foreach ($proc in $procs) {
@@ -751,7 +751,7 @@ try {
     Sync-RdpMonitorSettingsFromShare -ExampleOnShare $settingsExampleShare -LocalSettings $settingsLocal
 
     $installArgs = @(
-        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $LocalScript, '-InstallTasks'
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $LocalScript, '-InstallTasks', '-SkipImmediateMainRun'
     )
     $instOut = Join-Path $InstallRoot "Logs\deploy_installtasks_stdout.log"
     $instErr = Join-Path $InstallRoot "Logs\deploy_installtasks_stderr.log"
@@ -787,10 +787,25 @@ try {
     Write-DeployLog "Записана метка обновления: $DeployUpdateMarkerPath (Version=$shareVerRaw; UpdatedAt=$updStamp)."
 
     if (-not $SkipStartMonitorAfterUpdate) {
-        Start-Process -FilePath $PsExe -ArgumentList @(
-            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $LocalScript
-        ) -WindowStyle Hidden
-        Write-DeployLog "Запущен процесс монитора (новый файл)."
+        $canonical = [System.IO.Path]::GetFullPath($LocalScript)
+        if (Test-RdpMonitorMainProcessRunning -CanonicalScript $canonical) {
+            Write-DeployLog "Монитор уже запущен — повторный старт не выполняем."
+        } else {
+            $taskName = 'RDP-Login-Monitor'
+            $runEa = $ErrorActionPreference
+            try {
+                $ErrorActionPreference = 'SilentlyContinue'
+                $runOut = & schtasks.exe /Run /TN $taskName 2>&1
+                foreach ($line in @($runOut)) {
+                    if ($null -ne $line -and "$line".Trim().Length -gt 0) {
+                        Write-DeployLog "schtasks /Run $taskName : $line"
+                    }
+                }
+            } finally {
+                $ErrorActionPreference = $runEa
+            }
+            Write-DeployLog "Запуск монитора через schtasks /Run ($taskName)."
+        }
     } else {
         Write-DeployLog "Запуск монитора пропущен (-SkipStartMonitorAfterUpdate); поднимется при следующей загрузке или watchdog."
     }

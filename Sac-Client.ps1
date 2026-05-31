@@ -253,11 +253,17 @@ function Get-SacHostBlock {
         hostname  = $hostname
         os_family = 'windows'
     }
-    if (Get-Variable -Name ServerDisplayName -ErrorAction SilentlyContinue) {
+    $displayLabel = $hostname
+    if (Get-Command -Name Get-MonitorServerLabelWithIp -ErrorAction SilentlyContinue) {
+        $displayLabel = [string](Get-MonitorServerLabelWithIp)
+    } elseif (Get-Variable -Name ServerDisplayName -ErrorAction SilentlyContinue) {
         $label = (Get-Variable -Name ServerDisplayName -ValueOnly)
         if (-not [string]::IsNullOrWhiteSpace([string]$label)) {
-            $hostBlock.display_name = [string]$label.Trim()
+            $displayLabel = [string]$label.Trim()
         }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($displayLabel)) {
+        $hostBlock.display_name = $displayLabel
     }
     $ipv4 = Get-SacHostIPv4
     if (-not [string]::IsNullOrWhiteSpace($ipv4)) {

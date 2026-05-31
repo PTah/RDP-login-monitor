@@ -35,6 +35,7 @@ param(
     [string]$MailSmtpPasswordProtectedB64 = '',
     [switch]$Watchdog,
     [switch]$InstallTasks,
+    [switch]$SkipImmediateMainRun,
     [switch]$SkipScheduledTaskMaintenance,
     [switch]$CheckSac,
     [switch]$RequestRestart,
@@ -74,13 +75,14 @@ $script:MonitorSingletonLockStream = $null
 $script:MonitorRestartRequestFile = Join-Path $script:InstallRoot 'restart.request'
 $script:MonitorRecycleRequested = $false
 $script:MonitorLoopInitialized = $false
+$script:MonitorStopRequested = $false
 
 # Версия: пишется в лог и в Telegram. При доменном развёртывании через шару см. DEPLOY.md —
 # триггер обновления на клиентах даёт файл version.txt на шаре (его номер можно поднять и без смены
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.2.30-SAC"
+$ScriptVersion = "1.2.31-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -415,7 +417,7 @@ function Get-RdpMonitorPowerShellExe {
 
 function Set-RdpMonitorRestartRequest {
     param(
-        [ValidateSet('settings', 'recycle')]
+        [ValidateSet('settings', 'recycle', 'stop')]
         [string]$Mode = 'settings',
         [string]$Reason = 'manual'
     )
@@ -446,7 +448,7 @@ function Get-RdpMonitorRestartRequest {
     try {
         Remove-Item -LiteralPath $script:MonitorRestartRequestFile -Force -ErrorAction SilentlyContinue
     } catch { }
-    if ($mode -ne 'recycle') { $mode = 'settings' }
+    if ($mode -notin @('recycle', 'stop')) { $mode = 'settings' }
     return [pscustomobject]@{ Mode = $mode; Reason = $reason }
 }
 
@@ -485,6 +487,8 @@ function Test-RdpMonitorScheduledTaskMatches {
 }
 
 function Register-RdpMonitorScheduledTasksCore {
+    param([switch]$SkipImmediateMainRun)
+
     Write-Log "Register-RdpMonitorScheduledTasksCore: ветка v$ScriptVersion (watchdog через schtasks /SC MINUTE, без CIM RepetitionInterval)."
     $psExe = Get-RdpMonitorPowerShellExe
     $canonicalScript = [System.IO.Path]::GetFullPath((Join-Path $script:InstallRoot $script:CanonicalScriptName))
@@ -522,35 +526,39 @@ function Register-RdpMonitorScheduledTasksCore {
     }
     Write-Log "Задача планировщика: $($script:ScheduledTaskNameWatchdog) (schtasks, каждые 5 минут, контроль процесса)."
 
-    # Не ждём перезагрузку: сразу запускаем основную задачу.
-    $runMainEa = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'SilentlyContinue'
-        $runMainOut = & $schtasksExe /Run /TN $script:ScheduledTaskNameMain 2>&1
-        foreach ($line in @($runMainOut)) {
-            if ($null -ne $line -and "$line".Trim().Length -gt 0) {
-                Write-Log "schtasks main /Run: $line"
+    if (-not $SkipImmediateMainRun) {
+        # Не ждём перезагрузку: сразу запускаем основную задачу.
+        $runMainEa = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'SilentlyContinue'
+            $runMainOut = & $schtasksExe /Run /TN $script:ScheduledTaskNameMain 2>&1
+            foreach ($line in @($runMainOut)) {
+                if ($null -ne $line -and "$line".Trim().Length -gt 0) {
+                    Write-Log "schtasks main /Run: $line"
+                }
             }
+        } finally {
+            $ErrorActionPreference = $runMainEa
         }
-    } finally {
-        $ErrorActionPreference = $runMainEa
-    }
-    Write-Log "Немедленный прогон основной задачи запрошен (schtasks /Run)."
+        Write-Log "Немедленный прогон основной задачи запрошен (schtasks /Run)."
 
-    # Первый запуск watchdog по расписанию может быть почти через 5 мин — ставим одноразовый прогон в очередь.
-    $runEa = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'SilentlyContinue'
-        $runOut = & $schtasksExe /Run /TN $script:ScheduledTaskNameWatchdog 2>&1
-        foreach ($line in @($runOut)) {
-            if ($null -ne $line -and "$line".Trim().Length -gt 0) {
-                Write-Log "schtasks watchdog /Run: $line"
+        # Первый запуск watchdog по расписанию может быть почти через 5 мин — ставим одноразовый прогон в очередь.
+        $runEa = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'SilentlyContinue'
+            $runOut = & $schtasksExe /Run /TN $script:ScheduledTaskNameWatchdog 2>&1
+            foreach ($line in @($runOut)) {
+                if ($null -ne $line -and "$line".Trim().Length -gt 0) {
+                    Write-Log "schtasks watchdog /Run: $line"
+                }
             }
+        } finally {
+            $ErrorActionPreference = $runEa
         }
-    } finally {
-        $ErrorActionPreference = $runEa
+        Write-Log "Немедленный прогон watchdog запрошен (schtasks /Run)."
+    } else {
+        Write-Log "Немедленный schtasks /Run пропущен (-SkipImmediateMainRun)."
     }
-    Write-Log "Немедленный прогон watchdog запрошен (schtasks /Run)."
 }
 
 function Ensure-RdpMonitorScheduledTasks {
@@ -640,7 +648,7 @@ if ($InstallTasks) {
         Write-Log "InstallTasks: нужны права администратора."
         exit 1
     }
-    Register-RdpMonitorScheduledTasksCore
+    Register-RdpMonitorScheduledTasksCore -SkipImmediateMainRun:$SkipImmediateMainRun
     Write-Log "InstallTasks: задачи планировщика обновлены."
     exit 0
 }
@@ -763,6 +771,18 @@ function ConvertTo-TelegramHtml {
     param([string]$Text)
     if ($null -eq $Text) { return '' }
     return [System.Net.WebUtility]::HtmlEncode([string]$Text)
+}
+
+function Convert-TelegramHtmlToPlainBody {
+    param([string]$Html)
+    if ([string]::IsNullOrWhiteSpace($Html)) { return '' }
+    $text = [string]$Html
+    $text = $text -replace '</?b>', ''
+    $text = $text -replace '</?i>', ''
+    $text = $text -replace '</?code>', ''
+    $text = $text -replace '</?pre>', ''
+    $text = [System.Net.WebUtility]::HtmlDecode($text)
+    return $text.Trim()
 }
 
 function Send-TelegramMessage {
@@ -964,9 +984,17 @@ function Send-RdpMonitorLifecycleNotification {
     )
 
     $title = if (-not [string]::IsNullOrWhiteSpace($SacTitle)) { $SacTitle } else { "RDP login monitor: $Lifecycle" }
+    $plainBody = Convert-TelegramHtmlToPlainBody -Html $TelegramHtmlMessage
+    $sacDetails = @{
+        lifecycle = $Lifecycle
+        trigger = $Trigger
+    }
+    if (-not [string]::IsNullOrWhiteSpace($plainBody)) {
+        $sacDetails.notification_body = $plainBody
+    }
     Send-MonitorNotification -Message $TelegramHtmlMessage -EmailSubject $EmailSubject `
         -SacEventType 'agent.lifecycle' -SacSeverity $SacSeverity -SacTitle $title -SacSummary $SacSummary `
-        -SacDetails @{ lifecycle = $Lifecycle; trigger = $Trigger } | Out-Null
+        -SacDetails $sacDetails | Out-Null
 }
 
 function Test-Administrator {
@@ -1779,7 +1807,7 @@ function Send-Heartbeat {
     param([switch]$IsStartup = $false)
 
     $timestamp = Get-Date -Format "dd.MM.yyyy HH:mm:ss"
-    $hHost = (ConvertTo-TelegramHtml (Get-MonitorServerLabel))
+    $hHost = (ConvertTo-TelegramHtml (Get-MonitorServerLabelWithIp))
 
     function Get-DeployUpdateMarker {
         $info = [pscustomobject]@{
@@ -1885,7 +1913,7 @@ function Send-Heartbeat {
         Send-RdpMonitorLifecycleNotification -Lifecycle 'started' -Trigger $lifecycleTrigger `
             -TelegramHtmlMessage $message -EmailSubject 'RDP Login Monitor: запуск' `
             -SacTitle 'RDP login monitor started' `
-            -SacSummary "Мониторинг запущен на $(Get-MonitorServerLabel), версия $ScriptVersion"
+            -SacSummary "Мониторинг запущен на $(Get-MonitorServerLabelWithIp), версия $ScriptVersion"
         Write-Log "Отправлено уведомление о запуске скрипта (каналы: $notifyChain)"
     } else {
         Write-TextFileUtf8Bom -Path $HeartbeatFile -Text $timestamp
@@ -3151,6 +3179,7 @@ function Start-LoginMonitor {
 
     do {
         $script:MonitorRecycleRequested = $false
+        $script:MonitorStopRequested = $false
 
         if (-not $script:MonitorLoopInitialized) {
             Cleanup-OldLogs
@@ -3185,6 +3214,11 @@ function Start-LoginMonitor {
             $restartReq = Get-RdpMonitorRestartRequest
             if ($null -ne $restartReq) {
                 $script:StopNotificationSent = $true
+                if ($restartReq.Mode -eq 'stop') {
+                    Write-Log "Graceful stop: запрос '$($restartReq.Reason)' — выход без запуска нового процесса."
+                    $script:MonitorStopRequested = $true
+                    break
+                }
                 if ($restartReq.Mode -eq 'recycle') {
                     Write-Log "Graceful recycle: запрос '$($restartReq.Reason)' — выход для запуска нового процесса (обновлённый скрипт с диска)."
                     $script:MonitorRecycleRequested = $true
@@ -3192,7 +3226,7 @@ function Start-LoginMonitor {
                 }
                 Write-Log "Graceful restart (settings): запрос '$($restartReq.Reason)' — перечитываю настройки в этом же процессе PowerShell."
                 Invoke-RdpMonitorReloadSettings | Out-Null
-                $hHost = ConvertTo-TelegramHtml (Get-MonitorServerLabel)
+                $hHost = ConvertTo-TelegramHtml (Get-MonitorServerLabelWithIp)
                 $reloadMsg = "<b>🔄 Настройки монитора перечитаны</b>`r`n"
                 $reloadMsg += "🖥️ Сервер: $hHost`r`n"
                 $reloadMsg += "🏷️ Версия: $(ConvertTo-TelegramHtml $ScriptVersion)`r`n"
@@ -3576,6 +3610,9 @@ function Start-LoginMonitor {
         if ($script:MonitorRecycleRequested) {
             return
         }
+        if ($script:MonitorStopRequested) {
+            return
+        }
     } while ($true)
 }
 
@@ -3622,6 +3659,12 @@ try {
         }
     }
     Start-LoginMonitor -MonitorInterval 5 -MonitorInteractiveOnly
+
+    if ($script:MonitorStopRequested) {
+        $script:StopNotificationSent = $true
+        Write-Log "Graceful stop: завершение без запуска нового процесса."
+        exit 0
+    }
 
     if ($script:MonitorRecycleRequested) {
         $script:StopNotificationSent = $true
