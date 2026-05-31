@@ -82,7 +82,7 @@ $script:MonitorStopRequested = $false
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "1.2.34-SAC"
+$ScriptVersion = "1.2.35-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -118,6 +118,8 @@ $LastReportFile = Join-Path $script:InstallRoot "Logs\last_daily_report.txt"
 $EnableRDGatewayMonitoring = $true
 $RDGatewayLogName = "Microsoft-Windows-TerminalServices-Gateway/Operational"
 $RDGatewayEvents = @(302, 303)
+# При старте цикла опроса — сколько минут назад читать 302/303 (чтобы не пропустить события до запуска монитора).
+$GatewayEventsLookbackMinutes = 60
 
 # RDP Remote Connection Manager (workstations): User authentication succeeded — событие 1149
 $RcmLogName = "Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational"
@@ -2792,6 +2794,22 @@ function Get-FailedLogonRateLimitDecision4625 {
     }
 }
 
+function Update-MonitorPollCursor {
+    param(
+        [datetime]$CurrentCursor,
+        [array]$Events
+    )
+    if (-not $Events -or @($Events).Count -eq 0) {
+        return $CurrentCursor
+    }
+    $afterCursor = @($Events | Where-Object { $_.TimeCreated -gt $CurrentCursor })
+    if ($afterCursor.Count -eq 0) {
+        return $CurrentCursor
+    }
+    $maxTime = ($afterCursor | Measure-Object -Property TimeCreated -Maximum | Select-Object -ExpandProperty Maximum)
+    return $maxTime.AddMilliseconds(500)
+}
+
 function Test-RDGatewayLog {
     try {
         $logExists = Get-WinEvent -ListLog $RDGatewayLogName -ErrorAction SilentlyContinue
@@ -2803,6 +2821,26 @@ function Test-RDGatewayLog {
         Write-Log "Ошибка при проверке журнала RD Gateway: $($_.Exception.Message)"
     }
     return $false
+}
+
+function Get-RDGatewayMessageFallback {
+    param([string]$Message)
+    if ([string]::IsNullOrWhiteSpace($Message)) { return $null }
+    $result = @{}
+    if ($Message -match '(?i)Пользователь\s+"([^"]+)"|User\s+"([^"]+)"') {
+        $result.Username = if ($Matches[1]) { $Matches[1] } else { $Matches[2] }
+    }
+    if ($Message -match '(?i)(?:компьютере|computer)\s+"([0-9a-fA-F:\.]+)"') {
+        $result.ExternalIP = $Matches[1]
+    }
+    if ($Message -match '(?i)(?:ресурсу|resource)\s*:\s*"([^"]+)"|(?:ресурсу|resource)\s+"([^"]+)"') {
+        $result.InternalIP = if ($Matches[1]) { $Matches[1] } else { $Matches[2] }
+    }
+    if ($Message -match '(?i)(?:протокол подключения|connection protocol)\s+"([^"]+)"') {
+        $result.Protocol = $Matches[1]
+    }
+    if ($result.Count -eq 0) { return $null }
+    return $result
 }
 
 function Test-RdpMonitorStringLooksLikeIPv4 {
@@ -2908,6 +2946,27 @@ function Get-RDGatewayEventInfo {
             (Test-RdpMonitorStringLooksLikeIPv4 $eventData.Protocol)) {
             $eventData.InternalIP = $eventData.Protocol.Trim()
             $eventData.Protocol = 'N/A'
+        }
+
+        $needsFallback = ($eventData.Username -eq 'N/A' -or [string]::IsNullOrWhiteSpace($eventData.Username)) -or
+            ($eventData.ExternalIP -eq 'N/A' -or [string]::IsNullOrWhiteSpace($eventData.ExternalIP)) -or
+            ($eventData.InternalIP -eq 'N/A' -or [string]::IsNullOrWhiteSpace($eventData.InternalIP))
+        if ($needsFallback) {
+            $fb = Get-RDGatewayMessageFallback -Message ([string]$Event.Message)
+            if ($null -ne $fb) {
+                if (($eventData.Username -eq 'N/A' -or [string]::IsNullOrWhiteSpace($eventData.Username)) -and $fb.Username) {
+                    $eventData.Username = [string]$fb.Username
+                }
+                if (($eventData.ExternalIP -eq 'N/A' -or [string]::IsNullOrWhiteSpace($eventData.ExternalIP)) -and $fb.ExternalIP) {
+                    $eventData.ExternalIP = [string]$fb.ExternalIP
+                }
+                if (($eventData.InternalIP -eq 'N/A' -or [string]::IsNullOrWhiteSpace($eventData.InternalIP)) -and $fb.InternalIP) {
+                    $eventData.InternalIP = [string]$fb.InternalIP
+                }
+                if (($eventData.Protocol -eq 'N/A' -or [string]::IsNullOrWhiteSpace($eventData.Protocol)) -and $fb.Protocol) {
+                    $eventData.Protocol = [string]$fb.Protocol
+                }
+            }
         }
     } catch {
         Write-Log "Ошибка при извлечении RD Gateway события: $($_.Exception.Message)"
@@ -3266,7 +3325,15 @@ function Start-LoginMonitor {
         $nextRotationCheck = Check-AndRotateLog
         $nextReportCheck = Check-AndSendDailyReport
         $lastCheckTime = (Get-Date).AddSeconds(-10)
-        $lastGatewayCheckTime = (Get-Date).AddSeconds(-10)
+        if ($rdGatewayAvailable) {
+            $lastGatewayCheckTime = (Get-Date).AddMinutes(-1 * [math]::Max(1, $GatewayEventsLookbackMinutes))
+            Write-Log "RD Gateway: опрос 302/303 включён, lookback ${GatewayEventsLookbackMinutes} мин (с $($lastGatewayCheckTime.ToString('dd.MM.yyyy HH:mm:ss')))"
+        } else {
+            $lastGatewayCheckTime = (Get-Date).AddSeconds(-10)
+            if ($EnableRDGatewayMonitoring) {
+                Write-Log "RD Gateway: журнал недоступен — опрос 302/303 отключён ($RDGatewayLogName)"
+            }
+        }
         $lastRcmCheckTime = (Get-Date).AddSeconds(-10)
         $lastRcmShadowCheckTime = (Get-Date).AddSeconds(-10)
         $lastWinRmCheckTime = (Get-Date).AddSeconds(-10)
@@ -3440,7 +3507,7 @@ function Start-LoginMonitor {
                                 } | Out-Null
                     }
                 }
-                $lastCheckTime = ($events | Measure-Object -Property TimeCreated -Maximum | Select-Object -ExpandProperty Maximum).AddSeconds(1)
+                $lastCheckTime = Update-MonitorPollCursor -CurrentCursor $lastCheckTime -Events @($events)
             }
 
             if ($rdGatewayAvailable) {
@@ -3451,10 +3518,16 @@ function Start-LoginMonitor {
                 } -ErrorAction SilentlyContinue
 
                 if ($gatewayEvents) {
-                    foreach ($event in $gatewayEvents) {
+                    $gatewaySorted = @($gatewayEvents | Sort-Object TimeCreated, RecordId)
+                    $gatewayFetched = $gatewaySorted.Count
+                    $gatewayNotified = 0
+                    foreach ($event in $gatewaySorted) {
                         if ($event.TimeCreated -le $lastGatewayCheckTime) { continue }
                         $ei = Get-RDGatewayEventInfo -Event $event
-                        if ($ei.Username -like "*$") { continue }
+                        if ($ei.Username.EndsWith('$', [StringComparison]::OrdinalIgnoreCase)) {
+                            Write-Log "Skip RDG $($event.Id): machine account $($ei.Username)"
+                            continue
+                        }
                         $msg = Format-RDGatewayEvent -EventID $event.Id `
                             -Username $ei.Username `
                             -ExternalIP $ei.ExternalIP `
@@ -3462,22 +3535,37 @@ function Start-LoginMonitor {
                             -Protocol $ei.Protocol `
                             -ErrorCode $ei.ErrorCode `
                             -TimeCreated $ei.TimeCreated
-                        Write-Log "Notify RDG: ID=$($event.Id) User=$($ei.Username)"
-                        $rdgType = if ($event.Id -eq 302) { 'rdg.connection.success' } else { 'rdg.connection.failed' }
-                        $rdgSev = if ($event.Id -eq 302) { 'info' } else { 'warning' }
+                        $hasRdgError = ($ei.ErrorCode -ne '0' -and $ei.ErrorCode -ne 'N/A' -and -not [string]::IsNullOrWhiteSpace($ei.ErrorCode))
+                        if ($event.Id -eq 302) {
+                            $rdgType = 'rdg.connection.success'
+                            $rdgSev = 'info'
+                        } elseif ($hasRdgError) {
+                            $rdgType = 'rdg.connection.failed'
+                            $rdgSev = 'warning'
+                        } else {
+                            $rdgType = 'rdg.connection.disconnected'
+                            $rdgSev = 'info'
+                        }
+                        Write-Log "Notify RDG: ID=$($event.Id) User=$($ei.Username) Target=$($ei.InternalIP) Type=$rdgType"
                         Send-MonitorNotification -Message $msg `
                             -EmailSubject "RDP Login Monitor: RD Gateway ($($event.Id))" `
                             -SacEventType $rdgType -SacSeverity $rdgSev `
                             -SacTitle "RD Gateway event $($event.Id)" `
-                            -SacSummary "RDG $($event.Id) $($ei.Username)" `
+                            -SacSummary "RDG $($event.Id) $($ei.Username) -> $($ei.InternalIP)" `
                             -SacDetails @{
                                 user = $ei.Username
                                 external_ip = $ei.ExternalIP
                                 internal_ip = $ei.InternalIP
+                                protocol = $ei.Protocol
+                                gateway_error_code = $ei.ErrorCode
                                 event_id_windows = [int]$event.Id
                             } | Out-Null
+                        $gatewayNotified++
                     }
-                    $lastGatewayCheckTime = ($gatewayEvents | Measure-Object -Property TimeCreated -Maximum | Select-Object -ExpandProperty Maximum).AddSeconds(1)
+                    $lastGatewayCheckTime = Update-MonitorPollCursor -CurrentCursor $lastGatewayCheckTime -Events $gatewaySorted
+                    if ($gatewayFetched -gt 0) {
+                        Write-Log "RD Gateway poll: fetched=$gatewayFetched notified=$gatewayNotified cursor=$($lastGatewayCheckTime.ToString('dd.MM.yyyy HH:mm:ss'))"
+                    }
                 }
             }
 
@@ -3510,7 +3598,7 @@ function Start-LoginMonitor {
                                 event_id_windows = 1149
                             } | Out-Null
                     }
-                    $lastRcmCheckTime = ($rcmEvents | Measure-Object -Property TimeCreated -Maximum | Select-Object -ExpandProperty Maximum).AddSeconds(1)
+                    $lastRcmCheckTime = Update-MonitorPollCursor -CurrentCursor $lastRcmCheckTime -Events @($rcmEvents)
                 }
             }
 
@@ -3554,7 +3642,7 @@ function Start-LoginMonitor {
                                 session_id = $sh.SessionId
                             } | Out-Null
                     }
-                    $lastRcmShadowCheckTime = ($shadowEvents | Measure-Object -Property TimeCreated -Maximum | Select-Object -ExpandProperty Maximum).AddSeconds(1)
+                    $lastRcmShadowCheckTime = Update-MonitorPollCursor -CurrentCursor $lastRcmShadowCheckTime -Events @($shadowEvents)
                 }
             }
 
@@ -3604,7 +3692,7 @@ function Start-LoginMonitor {
                                 transport = 'winrm'
                             } | Out-Null
                     }
-                    $lastWinRmCheckTime = ($winRmEvents | Measure-Object -Property TimeCreated -Maximum | Select-Object -ExpandProperty Maximum).AddSeconds(1)
+                    $lastWinRmCheckTime = Update-MonitorPollCursor -CurrentCursor $lastWinRmCheckTime -Events @($winRmEvents)
                 }
             }
 
@@ -3645,7 +3733,7 @@ function Start-LoginMonitor {
                                 iis_client_ips = @($iisIps)
                             } | Out-Null
                     }
-                    $lastLockout4740CheckTime = ($lockoutEvents | Measure-Object -Property TimeCreated -Maximum | Select-Object -ExpandProperty Maximum).AddSeconds(1)
+                    $lastLockout4740CheckTime = Update-MonitorPollCursor -CurrentCursor $lastLockout4740CheckTime -Events @($lockoutEvents)
                 }
             }
 
