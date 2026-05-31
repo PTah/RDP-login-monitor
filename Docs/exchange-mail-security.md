@@ -2,6 +2,8 @@
 
 Скрипт **`Exchange-MailSecurity.ps1`** предназначен **только для сервера Microsoft Exchange** с Exchange Management Shell (EMS). Не устанавливается на все компьютеры домена через GPO RDP-монитора.
 
+На Exchange-сервере GPO **`Deploy-LoginMonitor.ps1`** по-прежнему ставит **`Login_Monitor.ps1`** (RDP/WinRM/4624) и при необходимости дописывает noise settings в **`login_monitor.settings.ps1`**. Пакет **`Exchange-MailSecurity.ps1`** доставляется отдельно — см. раздел «Деплой на Exchange» ниже и [deploy-rdp-login-monitor.md](deploy-rdp-login-monitor.md).
+
 ## Назначение
 
 | Функция | Режим | Расписание (задача планировщика) |

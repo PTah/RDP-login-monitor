@@ -19,6 +19,9 @@
 
 .NOTES
     Лог: C:\ProgramData\RDP-login-monitor\Logs\deploy.log
+
+    Сравнение версий: метки вида 1.2.26-SAC сравниваются по полному тексту (без учёта регистра);
+    для upgrade/downgrade используется числовой префикс (1.2.26). См. Docs/deploy-rdp-login-monitor.md.
 #>
 
 [CmdletBinding()]
@@ -104,8 +107,8 @@ function Get-LocalDeployedVersion {
     try {
         $head = Get-Content -LiteralPath $LocalScript -TotalCount 120 -ErrorAction Stop
         foreach ($ln in $head) {
-            if ($ln -match '^\s*\$ScriptVersion\s*=\s*["'']([0-9]+(?:\.[0-9]+){0,3})["'']') {
-                return $Matches[1]
+            if ($ln -match '^\s*\$ScriptVersion\s*=\s*["'']([^"'']+)["'']') {
+                return ([string]$Matches[1]).Trim() -replace '^v', ''
             }
         }
     } catch { }
@@ -113,19 +116,35 @@ function Get-LocalDeployedVersion {
     return $null
 }
 
-function Normalize-VersionOrNull {
+function Normalize-DeployVersionLabel {
     param([string]$Text)
     if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
-    $t = $Text.Trim() -replace '^v', ''
+    return ([string]$Text).Trim() -replace '^v', ''
+}
+
+function Normalize-VersionOrNull {
+    param([string]$Text)
+    $t = Normalize-DeployVersionLabel -Text $Text
+    if ($null -eq $t) { return $null }
     try {
         return [version]$t
-    } catch {
-        return $null
+    } catch { }
+    if ($t -match '^([0-9]+(?:\.[0-9]+){0,3})') {
+        try { return [version]$Matches[1] } catch { }
     }
+    return $null
 }
 
 function Compare-VersionStrings {
     param([string]$Left, [string]$Right)
+    if ([string]::IsNullOrWhiteSpace($Left) -and [string]::IsNullOrWhiteSpace($Right)) { return 0 }
+    if ([string]::IsNullOrWhiteSpace($Left)) { return -1 }
+    if ([string]::IsNullOrWhiteSpace($Right)) { return 1 }
+
+    $lt = Normalize-DeployVersionLabel -Text $Left
+    $rt = Normalize-DeployVersionLabel -Text $Right
+    if ($lt.Equals($rt, [StringComparison]::OrdinalIgnoreCase)) { return 0 }
+
     $a = Normalize-VersionOrNull -Text $Left
     $b = Normalize-VersionOrNull -Text $Right
     if ($null -eq $a -or $null -eq $b) { return $null }
