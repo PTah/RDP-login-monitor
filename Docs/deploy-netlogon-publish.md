@@ -33,6 +33,6 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\soft\update-rdp-monit
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\soft\update-rdp-monitor.ps1 -WhatIf
 ```
 
-После pull обязательно проверьте **`version.txt`** на шаре — его номер определяет, подтянут ли обновления на клиентах. Метка может включать суффикс (например **`1.2.26-SAC`**); **`Deploy-LoginMonitor.ps1`** сравнивает её с **`deployed_version.txt`** по полной строке.
+После pull обязательно проверьте **`version.txt`** на шаре — его номер определяет, подтянут ли обновления на клиентах. Метка может включать суффикс (например **`1.2.27-SAC`**); **`Deploy-LoginMonitor.ps1`** сравнивает её с **`deployed_version.txt`** по полной строке.
 
 Файлы **`*.ps1`** при копировании пересохраняются как **UTF-8 с BOM** (иначе PowerShell 5.1 с NETLOGON может не разобрать кириллицу в скриптах). Скрипты **`Deploy-DomainMonitors.ps1`** и **`Install-DomainMonitors.ps1`** используют **ASCII** в рабочих строках — их можно запускать и без перепубликации.

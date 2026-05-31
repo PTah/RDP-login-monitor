@@ -16,7 +16,7 @@
 | `Login_Monitor.ps1` | Основной скрипт мониторинга |
 | `Sac-Client.ps1` | Клиент SAC (обязателен для SAC; сверка SHA256 при деплое) |
 | `login_monitor.settings.example.ps1` | Образец настроек (bootstrap локального settings) |
-| `version.txt` | **Одна строка** — версия пакета на шаре (например `1.2.26-SAC`) |
+| `version.txt` | **Одна строка** — версия пакета на шаре (например `1.2.27-SAC`) |
 | `Deploy-LoginMonitor.ps1` | Установщик для GPO / scheduled task |
 
 Полный список файлов на шару (включая Exchange): [deploy-netlogon-publish.md](deploy-netlogon-publish.md).
@@ -63,7 +63,7 @@ flowchart TD
 | Версия **совпадает**, но нужны патчи | Полный цикл (см. выше) |
 | Версия на шаре **старее** | Пропуск, пока не указан **`-AllowDowngrade`** |
 
-Метки с суффиксом (**`1.2.26-SAC`**) сравниваются **по полной строке**; для порядка версий используется числовой префикс `1.2.26`.
+Метки с суффиксом (**`1.2.27-SAC`**) сравниваются **по полной строке**; для порядка версий используется числовой префикс `1.2.27`.
 
 Лог: **`C:\ProgramData\RDP-login-monitor\Logs\deploy.log`**. Ошибки пишутся в лог и завершаются **`exit 0`** (удобно для GPO).
 
@@ -169,7 +169,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "\\B26\NETLOGON\RDP-logi
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\soft\update-rdp-monitor.ps1
 ```
 
-Проверьте на шаре **`Sac-Client.ps1`** и **`version.txt`** (например `1.2.26-SAC`).
+Проверьте на шаре **`Sac-Client.ps1`** и **`version.txt`** (например `1.2.27-SAC`).
 
 ### B. На целевых машинах
 

@@ -20,8 +20,8 @@
 .NOTES
     Лог: C:\ProgramData\RDP-login-monitor\Logs\deploy.log
 
-    Сравнение версий: метки вида 1.2.26-SAC сравниваются по полному тексту (без учёта регистра);
-    для upgrade/downgrade используется числовой префикс (1.2.26). См. Docs/deploy-rdp-login-monitor.md.
+    Сравнение версий: метки вида 1.2.27-SAC сравниваются по полному тексту (без учёта регистра);
+    для upgrade/downgrade используется числовой префикс (1.2.27). См. Docs/deploy-rdp-login-monitor.md.
 #>
 
 [CmdletBinding()]
