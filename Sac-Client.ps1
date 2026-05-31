@@ -173,9 +173,8 @@ function Convert-AnyToJsonSerializable {
     if ($Value -is [string] -or $Value -is [bool] -or $Value -is [char]) {
         return $Value
     }
-    if ($Value -is [byte] -or $Value -is [sbyte] -or $Value -is [int16] -or $Value -is [uint16] -or
-        $Value -is [int] -or $Value -is [uint] -or $Value -is [long] -or $Value -is [ulong] -or
-        $Value -is [float] -or $Value -is [double] -or $Value -is [decimal]) {
+    # PS 5.1: нет алиасов [uint]/[ulong] — IsPrimitive покрывает все числовые типы.
+    if ($Value.GetType().IsPrimitive) {
         return $Value
     }
     if ($Value -is [datetime] -or $Value -is [datetimeoffset] -or $Value -is [guid]) {
