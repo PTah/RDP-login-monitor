@@ -101,6 +101,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\ProgramData\RDP-logi
 - **`Install-DeployScheduledTask.ps1`** — helper для периодического запуска **`Deploy-LoginMonitor.ps1`** с шары (см. **[DEPLOY.md](DEPLOY.md)**).
 - **`Watchdog_RDP_Monitor.ps1`** и **`Install-ScheduledTasks.ps1`** — **альтернативная** схема с отдельным watchdog-файлом и путями по умолчанию **`D:\Soft`**. Для новых установок рекомендуется встроенный режим **`-Watchdog`** в **`Login_Monitor.ps1`** и задачи **`RDP-Login-Monitor`** / **`RDP-Login-Monitor-Watchdog`**.
 - **`ignore.lst.example`** в репозитории — образец файла **`ignore.lst`** для подавления отдельных уведомлений Security (см. раздел 7).
+- **`Diagnose-RdpLoginMonitor.ps1`** — сбор диагностики после RDP-входа (Security 4624/4778, хвост `login_monitor.log`, симуляция фильтров монитора). Отчёт в **`Logs\diagnose_*.txt`**. Запуск:
+  ```powershell
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\ProgramData\RDP-login-monitor\Diagnose-RdpLoginMonitor.ps1" -MinutesBack 15 -ExpectedUser "ваш_логин"
+  ```
 - **`login_monitor.settings.example.ps1`** — образец **`login_monitor.settings.ps1`** (Telegram, SMTP, 4740, локальные IP-исключения). Deploy при первой установке может создать `login_monitor.settings.ps1` из example автоматически.
 
 ## 7) Подавление уведомлений Security: `ignore.lst`

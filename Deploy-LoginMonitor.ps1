@@ -58,7 +58,7 @@ $DeployLogPath = Join-Path $InstallRoot "Logs\deploy.log"
 $ScriptName = "Login_Monitor.ps1"
 $SacClientName = "Sac-Client.ps1"
 $VersionFileName = "version.txt"
-$DeployBundleFiles = @($ScriptName, $SacClientName)
+$DeployBundleFiles = @($ScriptName, $SacClientName, 'Diagnose-RdpLoginMonitor.ps1')
 $PsExe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
 
 $Utf8Bom = New-Object System.Text.UTF8Encoding $true
