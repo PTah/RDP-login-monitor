@@ -82,7 +82,7 @@ $script:MonitorStopRequested = $false
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "2.0.5-SAC"
+$ScriptVersion = "2.0.6-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -1596,6 +1596,15 @@ function Test-RdpMonitorIsLoopbackOrLinkLocalSourceIp {
     param([string]$Ip)
     if ([string]::IsNullOrWhiteSpace($Ip) -or $Ip -eq '-') { return $true }
     $t = $Ip.Trim().ToLowerInvariant()
+    if ($t -match '(?i)clientip:\s*([0-9a-fA-F\.\:%-]+)') {
+        $t = $Matches[1].Trim().ToLowerInvariant()
+    }
+    if ($t -match '(?i)^::ffff:([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$') {
+        $t = $Matches[1].Trim().ToLowerInvariant()
+    }
+    if ($t -match '\b([0-9]{1,3}(?:\.[0-9]{1,3}){3})\b') {
+        $t = $Matches[1].Trim().ToLowerInvariant()
+    }
     if ($t -eq '::1' -or $t -eq '127.0.0.1' -or $t -eq '0:0:0:0:0:0:0:1') { return $true }
     if ($t.StartsWith('fe80:') -or $t.StartsWith('fe80::')) { return $true }
     if ($t.StartsWith('::ffff:127.')) { return $true }
@@ -1637,7 +1646,7 @@ function Get-WinRmIgnoreReason {
         if (Test-RdpMonitorIsMachineAccountName -Username $Username) { return 'machine-account' }
     }
     if (Test-MonitorFeatureEnabled -Value $WinRmIgnoreLocalSource) {
-        if (Test-RdpMonitorIsLoopbackOrLinkLocalSourceIp -SourceIP $SourceIP) { return 'local-or-linklocal-ip' }
+        if (Test-RdpMonitorIsLoopbackOrLinkLocalSourceIp -Ip $SourceIP) { return 'local-or-linklocal-ip' }
     }
     if (Test-RdpMonitorIgnoreListMatch -EventId 'winrm' -Username $Username -SourceIP $SourceIP) {
         return 'ignore-list-match'
