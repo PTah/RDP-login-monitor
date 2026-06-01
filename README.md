@@ -90,6 +90,39 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\ProgramData\RDP-logi
 - **Дубли Telegram на один RDP-вход:** Windows часто пишет **несколько 4624** с одним временем; с версии **1.2.18-SAC** второе уведомление за **`$LoginSuccessNotifyDedupSeconds`** (90 с) подавляется (`Notify dedup 4624` в логе).
 - **В логе нет `Notify`, но 4624 в Security есть:** монитор обрабатывает только события **после** своего `StartTime` (окно опроса ~10 с при старте). Ищите строки **`Skip 4624:`** (фильтр LogonType / ignore.lst). Диагностика: **`tools\Show-Rdp4624Recent.ps1`**.
 
+## 4.1) Контрольный список стабилизации (5 минут)
+
+После деплоя на сервер быстро проверьте, что WinRM/Enter-PSSession действительно проходит весь путь до SAC:
+
+1. **WinRM Operational включён**
+   ```powershell
+   Get-WinEvent -ListLog 'Microsoft-Windows-WinRM/Operational' |
+     Select-Object LogName, IsEnabled, RecordCount
+   ```
+2. **Тестовый вход с другой машины**
+   ```powershell
+   Enter-PSSession -ComputerName <SERVER> -Credential <DOMAIN\USER>
+   ```
+3. **На целевом сервере есть событие ID=91**
+   ```powershell
+   Get-WinEvent -LogName 'Microsoft-Windows-WinRM/Operational' -MaxEvents 50 |
+     Where-Object Id -eq 91 |
+     Select-Object TimeCreated, Id, Message
+   ```
+4. **В логе агента нет ложного skip**
+   ```powershell
+   Get-Content 'C:\ProgramData\RDP-login-monitor\Logs\login_monitor.log' -Tail 120 |
+     Select-String -Pattern 'WinRM 91|Skip WinRM|reason='
+   ```
+   Для версии `2.0.5-SAC+` при skip указывается конкретная причина: `empty-user`, `excluded-user-pattern`, `machine-account`, `local-or-linklocal-ip`, `ignore-list-match`.
+5. **Событие ушло в SAC**
+   - В UI SAC (`/events`) есть запись типа `winrm.session.started` от нужного хоста.
+
+Минимальная настройка шумоподавления (если нужно):
+- не используйте `all:` в `ignore.lst` для рабочих админских учёток;
+- для WinRM подавление задавайте адресно: `winrm:user:DOMAIN\\service` или `winrm:ip:x.x.x.x`;
+- при проверке troubleshooting временно отключайте лишние исключения и проверяйте повторно.
+
 ## 5) Автоматический перезапуск при падении
 
 Режим `-Watchdog` внутри `Login_Monitor.ps1` делает:
