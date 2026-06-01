@@ -464,6 +464,132 @@ function Sync-RdpMonitorSettingsExchangeNoisePatches {
     return $true
 }
 
+function Get-RdpMonitorWinRmInboundSettingDefinitions {
+    return @(
+        @{
+            Pattern = '(?m)^\s*(\#\s*)?\$EnableWinRmInboundMonitoring\s*='
+            Line    = '$EnableWinRmInboundMonitoring = 1'
+        },
+        @{
+            Pattern = '(?m)^\s*(\#\s*)?\$WinRmLogName\s*='
+            Line    = '$WinRmLogName = ''Microsoft-Windows-WinRM/Operational'''
+        },
+        @{
+            Pattern = '(?m)^\s*(\#\s*)?\$WinRmInboundShellEventIds\s*='
+            Line    = '$WinRmInboundShellEventIds = @(91)'
+        },
+        @{
+            Pattern = '(?m)^\s*(\#\s*)?\$WinRmCorrelateSecurity4624\s*='
+            Line    = '$WinRmCorrelateSecurity4624 = 1'
+        },
+        @{
+            Pattern = '(?m)^\s*(\#\s*)?\$WinRm4624CorrelationWindowSeconds\s*='
+            Line    = '$WinRm4624CorrelationWindowSeconds = 15'
+        }
+    )
+}
+
+function Test-RdpMonitorSettingsNeedsWinRmInboundBlock {
+    param([string]$SettingsPath)
+    if (-not (Test-Path -LiteralPath $SettingsPath)) { return $false }
+    $c = Get-RdpMonitorSettingsRaw -Path $SettingsPath
+    if ([string]::IsNullOrWhiteSpace($c)) { return $false }
+    foreach ($def in Get-RdpMonitorWinRmInboundSettingDefinitions) {
+        if ($c -notmatch $def.Pattern) { return $true }
+    }
+    return $false
+}
+
+function Sync-RdpMonitorSettingsWinRmInboundBlock {
+    param([string]$LocalSettings)
+    if (-not (Test-Path -LiteralPath $LocalSettings)) { return $false }
+    if (-not (Test-RdpMonitorSettingsNeedsWinRmInboundBlock -SettingsPath $LocalSettings)) {
+        return $false
+    }
+
+    $c = Get-RdpMonitorSettingsRaw -Path $LocalSettings
+    $linesToAdd = [System.Collections.Generic.List[string]]::new()
+    [void]$linesToAdd.Add('# --- WinRM inbound (Enter-PSSession): обязательный блок (добавлено Deploy-LoginMonitor) ---')
+    foreach ($def in Get-RdpMonitorWinRmInboundSettingDefinitions) {
+        if ($c -notmatch $def.Pattern) {
+            [void]$linesToAdd.Add($def.Line)
+        }
+    }
+    if ($linesToAdd.Count -le 1) { return $false }
+
+    $bak = "$LocalSettings.bak.$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+    Copy-Item -LiteralPath $LocalSettings -Destination $bak -Force
+    Write-DeployLog "Добавление WinRM inbound блока в login_monitor.settings.ps1; резервная копия: $bak"
+
+    $block = ($linesToAdd -join "`r`n")
+    $insertBefore = '(?m)^\s*#\s*---\s*Узкое исключение шумовых сетевых логонов'
+    if ($c -match $insertBefore) {
+        $newContent = [regex]::Replace($c, $insertBefore, ($block + "`r`n`r`n" + '$0'), 1)
+    } else {
+        $newContent = ($c.TrimEnd() + "`r`n`r`n" + $block + "`r`n")
+    }
+    [System.IO.File]::WriteAllText($LocalSettings, $newContent.TrimEnd() + "`r`n", $Utf8Bom)
+    Write-DeployLog ("login_monitor.settings.ps1: WinRM inbound — добавлено строк: {0}" -f ($linesToAdd.Count - 1))
+    return $true
+}
+
+function Get-RdpMonitorWinRmOperationalLogStatus {
+    try {
+        $log = Get-WinEvent -ListLog 'Microsoft-Windows-WinRM/Operational' -ErrorAction Stop
+        if ($null -eq $log) {
+            return 'not-found'
+        }
+        $enabled = $false
+        try { $enabled = [bool]$log.IsEnabled } catch { $enabled = $false }
+        if ($enabled) {
+            return 'available-enabled'
+        }
+        return 'available-disabled'
+    } catch {
+        return 'not-found'
+    }
+}
+
+function Ensure-RdpMonitorWinRmOperationalLogEnabled {
+    $status = Get-RdpMonitorWinRmOperationalLogStatus
+    if ($status -eq 'available-enabled') { return $true }
+    if ($status -eq 'not-found') {
+        Write-DeployLog "WinRM Operational журнал: не найден/недоступен, авто-включение невозможно."
+        return $false
+    }
+
+    $wevtutilExe = Join-Path $env:SystemRoot 'System32\wevtutil.exe'
+    if (-not (Test-Path -LiteralPath $wevtutilExe)) {
+        Write-DeployLog "WinRM Operational журнал: wevtutil.exe не найден, авто-включение невозможно."
+        return $false
+    }
+
+    try {
+        $runEa = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'SilentlyContinue'
+            $out = & $wevtutilExe sl 'Microsoft-Windows-WinRM/Operational' /e:true 2>&1
+            foreach ($line in @($out)) {
+                if ($null -ne $line -and "$line".Trim().Length -gt 0) {
+                    Write-DeployLog "wevtutil sl WinRM/Operational: $line"
+                }
+            }
+        } finally {
+            $ErrorActionPreference = $runEa
+        }
+    } catch {
+        Write-DeployLog "WinRM Operational журнал: ошибка авто-включения ($($_.Exception.Message))."
+    }
+
+    $after = Get-RdpMonitorWinRmOperationalLogStatus
+    if ($after -eq 'available-enabled') {
+        Write-DeployLog "WinRM Operational журнал: успешно включён deploy-скриптом."
+        return $true
+    }
+    Write-DeployLog "WinRM Operational журнал: после попытки включения остаётся отключён/недоступен."
+    return $false
+}
+
 function Invoke-RdpMonitorSettingsPostPatches {
     param([string]$LocalSettings)
     if (-not (Test-Path -LiteralPath $LocalSettings)) { return $false }
@@ -471,6 +597,7 @@ function Invoke-RdpMonitorSettingsPostPatches {
     if (Update-RdpMonitorSettingsServerDisplayNameHintIfMissing -LocalSettings $LocalSettings) { $changed = $true }
     if (Sync-RdpMonitorSettingsDailyReportPatches -LocalSettings $LocalSettings) { $changed = $true }
     if (Sync-RdpMonitorSettingsExchangeNoisePatches -LocalSettings $LocalSettings) { $changed = $true }
+    if (Sync-RdpMonitorSettingsWinRmInboundBlock -LocalSettings $LocalSettings) { $changed = $true }
     return $changed
 }
 
@@ -686,11 +813,21 @@ try {
     $needsDailyReportHint = Test-RdpMonitorSettingsNeedsDailyReportHint -SettingsPath $settingsLocal
     $needsDailyReportRepair = Test-RdpMonitorSettingsHasInvalidDailyReportAssignment -SettingsPath $settingsLocal
     $needsExchangeNoisePatch = Test-RdpMonitorSettingsNeedsExchangeNoisePatch -SettingsPath $settingsLocal
+    $needsWinRmInboundBlock = Test-RdpMonitorSettingsNeedsWinRmInboundBlock -SettingsPath $settingsLocal
     $needsBundleSync = Test-RdpMonitorDeployBundleNeedsSync -ShareRoot $shareRoot
-    $needsSacBootstrap = $needsSettingsBootstrap -or $needsBundleSync -or $needsDisplayNameHint -or $needsDailyReportHint -or $needsDailyReportRepair -or $needsExchangeNoisePatch
+    $needsSacBootstrap = $needsSettingsBootstrap -or $needsBundleSync -or $needsDisplayNameHint -or $needsDailyReportHint -or $needsDailyReportRepair -or $needsExchangeNoisePatch -or $needsWinRmInboundBlock
 
     if (Test-RdpMonitorExchangeServerRole) {
         Write-DeployLog "Обнаружена роль Exchange — при необходимости допишем WinRM/4624 noise settings в login_monitor.settings.ps1."
+    }
+    $winRmLogStatus = Get-RdpMonitorWinRmOperationalLogStatus
+    switch ($winRmLogStatus) {
+        'available-enabled' { Write-DeployLog "WinRM Operational журнал: доступен и включён (Microsoft-Windows-WinRM/Operational)." }
+        'available-disabled' { Write-DeployLog "WinRM Operational журнал: найден, но отключён. Включите канал в Event Viewer (Applications and Services Logs -> Microsoft -> Windows -> WinRM -> Operational)." }
+        default { Write-DeployLog "WinRM Operational журнал: не найден/недоступен. Проверьте компонент WinRM и канал Microsoft-Windows-WinRM/Operational." }
+    }
+    if ($winRmLogStatus -ne 'available-enabled') {
+        Ensure-RdpMonitorWinRmOperationalLogEnabled | Out-Null
     }
 
     $cmp = Compare-VersionStrings -Left $shareVerRaw -Right $localVerRaw
@@ -712,6 +849,8 @@ try {
                 Write-DeployLog "Версия совпадает ($shareVerRaw), но в settings некорректно задан `$DailyReportEnabled (= true/false без `$) — продолжаем деплой."
             } elseif ($needsExchangeNoisePatch) {
                 Write-DeployLog "Версия совпадает ($shareVerRaw), но на Exchange не хватает noise settings (WinRM/4624) — продолжаем деплой."
+            } elseif ($needsWinRmInboundBlock) {
+                Write-DeployLog "Версия совпадает ($shareVerRaw), но в settings отсутствует обязательный блок WinRM inbound — продолжаем деплой."
             }
         }
         if ($cmp -lt 0 -and -not $AllowDowngrade) {
