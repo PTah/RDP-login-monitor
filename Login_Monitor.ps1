@@ -82,7 +82,7 @@ $script:MonitorStopRequested = $false
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "2.0.3-SAC"
+$ScriptVersion = "2.0.4-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -1461,13 +1461,29 @@ function Get-WinRm91EventInfo {
         $eventData.User = Get-FirstNonEmptyMapValue -DataMap $map -Keys @(
             'user', 'User', 'UserName', 'AccountName', 'SubjectUserName'
         )
+        $eventData.SourceIP = Get-FirstNonEmptyMapValue -DataMap $map -Keys @(
+            'ip', 'IP', 'clientIP', 'ClientIP', 'sourceIP', 'SourceIP'
+        )
         $eventData.ResourceUri = Get-FirstNonEmptyMapValue -DataMap $map -Keys @(
             'resourceUri', 'ResourceUri', 'shellId', 'ShellId', 'connection', 'Connection'
         )
-        if ([string]::IsNullOrWhiteSpace($eventData.User) -and $Event.Properties.Count -gt 0) {
-            $eventData.User = [string]$Event.Properties[0].Value
-        }
         $msg = [string]$Event.Message
+        if ([string]::IsNullOrWhiteSpace($eventData.User) -and $Event.Properties.Count -gt 0) {
+            $propUser = [string]$Event.Properties[0].Value
+            if ($propUser -notmatch '(?i)https?://|ResourceUri|clientIP:') {
+                $eventData.User = $propUser
+            }
+        }
+        if (($eventData.User -match '(?i)https?://|ResourceUri|clientIP:') -or [string]::IsNullOrWhiteSpace($eventData.User)) {
+            if ($msg -match '\(([^()\r\n]+?)\s+clientIP:\s*[^)\r\n]+\)') {
+                $eventData.User = $Matches[1].Trim()
+            }
+        }
+        if (($eventData.SourceIP -eq '-') -or [string]::IsNullOrWhiteSpace($eventData.SourceIP)) {
+            if ($msg -match '(?i)clientIP:\s*([0-9a-fA-F\.\:%-]+)') {
+                $eventData.SourceIP = $Matches[1].Trim()
+            }
+        }
         if ($eventData.ResourceUri -eq '-' -and $msg -match '(?i)ResourceUri:\s*(.+)$') {
             $eventData.ResourceUri = $Matches[1].Trim()
         }
@@ -1475,6 +1491,7 @@ function Get-WinRm91EventInfo {
         Write-Log "Ошибка разбора WinRM $($Event.Id): $($_.Exception.Message)"
     }
     if ([string]::IsNullOrWhiteSpace($eventData.User)) { $eventData.User = '-' }
+    if ([string]::IsNullOrWhiteSpace($eventData.SourceIP)) { $eventData.SourceIP = '-' }
     if ([string]::IsNullOrWhiteSpace($eventData.ResourceUri)) { $eventData.ResourceUri = '-' }
     return $eventData
 }
