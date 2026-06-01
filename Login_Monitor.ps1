@@ -82,7 +82,7 @@ $script:MonitorStopRequested = $false
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "2.0.4-SAC"
+$ScriptVersion = "2.0.5-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -1626,23 +1626,31 @@ function Test-RdpMonitorUsernameExcludedByPattern {
     return $false
 }
 
+function Get-WinRmIgnoreReason {
+    param(
+        [string]$Username,
+        [string]$SourceIP
+    )
+    if ([string]::IsNullOrWhiteSpace($Username) -or $Username -eq '-') { return 'empty-user' }
+    if (Test-RdpMonitorUsernameExcludedByPattern -Username $Username) { return 'excluded-user-pattern' }
+    if (Test-MonitorFeatureEnabled -Value $WinRmIgnoreMachineAccounts) {
+        if (Test-RdpMonitorIsMachineAccountName -Username $Username) { return 'machine-account' }
+    }
+    if (Test-MonitorFeatureEnabled -Value $WinRmIgnoreLocalSource) {
+        if (Test-RdpMonitorIsLoopbackOrLinkLocalSourceIp -SourceIP $SourceIP) { return 'local-or-linklocal-ip' }
+    }
+    if (Test-RdpMonitorIgnoreListMatch -EventId 'winrm' -Username $Username -SourceIP $SourceIP) {
+        return 'ignore-list-match'
+    }
+    return ''
+}
+
 function Should-IgnoreWinRmSession {
     param(
         [string]$Username,
         [string]$SourceIP
     )
-    if ([string]::IsNullOrWhiteSpace($Username) -or $Username -eq '-') { return $true }
-    if (Test-RdpMonitorUsernameExcludedByPattern -Username $Username) { return $true }
-    if (Test-MonitorFeatureEnabled -Value $WinRmIgnoreMachineAccounts) {
-        if (Test-RdpMonitorIsMachineAccountName -Username $Username) { return $true }
-    }
-    if (Test-MonitorFeatureEnabled -Value $WinRmIgnoreLocalSource) {
-        if (Test-RdpMonitorIsLoopbackOrLinkLocalSourceIp -SourceIP $SourceIP) { return $true }
-    }
-    if (Test-RdpMonitorIgnoreListMatch -EventId 'winrm' -Username $Username -SourceIP $SourceIP) {
-        return $true
-    }
-    return $false
+    return -not [string]::IsNullOrWhiteSpace((Get-WinRmIgnoreReason -Username $Username -SourceIP $SourceIP))
 }
 
 function Get-MonitorServerLabel {
@@ -3683,8 +3691,9 @@ function Start-LoginMonitor {
                                 $wr.LogonType = $corr.LogonType
                             }
                         }
-                        if (Should-IgnoreWinRmSession -Username $wr.User -SourceIP $wr.SourceIP) {
-                            Write-Log "Skip WinRM $($event.Id): User=$($wr.User) IP=$($wr.SourceIP) — built-in/ignore.lst"
+                        $winRmIgnoreReason = Get-WinRmIgnoreReason -Username $wr.User -SourceIP $wr.SourceIP
+                        if (-not [string]::IsNullOrWhiteSpace($winRmIgnoreReason)) {
+                            Write-Log "Skip WinRM $($event.Id): User=$($wr.User) IP=$($wr.SourceIP) — reason=$winRmIgnoreReason"
                             continue
                         }
                         $dedupKey = "winrm|$($event.Id)|$($wr.User)|$($wr.SourceIP)|$($event.RecordId)"
