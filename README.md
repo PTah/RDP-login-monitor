@@ -2,6 +2,27 @@
 
 PowerShell-набор для мониторинга входов в Windows с уведомлениями в Telegram и/или Email (SMTP).
 
+## Быстрый старт (1 команда с шары)
+
+Для **первичной установки на новый сервер** используйте только deploy-скрипт с шары:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File "\\<DC>\NETLOGON\RDP-login-monitor\Deploy-LoginMonitor.ps1"
+```
+
+Скрипт сам:
+- создаст `C:\ProgramData\RDP-login-monitor\`;
+- скопирует `Login_Monitor.ps1`, `Sac-Client.ps1` и служебные файлы;
+- создаст/обновит задачи `RDP-Login-Monitor` и `RDP-Login-Monitor-Watchdog`;
+- запустит монитор;
+- при необходимости создаст/дополнит `login_monitor.settings.ps1`;
+- проверит WinRM Operational и попробует включить канал.
+
+Проверка после установки (1 команда):
+```powershell
+Get-Content "C:\ProgramData\RDP-login-monitor\Logs\login_monitor.log" -Tail 60
+```
+
 ## Актуальная схема (рекомендуется)
 
 - Базовый путь установки: **`C:\ProgramData\RDP-login-monitor\`**.
