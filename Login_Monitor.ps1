@@ -3109,28 +3109,70 @@ function Test-DailyReportEnabledFlag {
     return $true
 }
 
+function Read-LastDailyReportSentDate {
+    if (-not (Test-Path -LiteralPath $LastReportFile)) { return $null }
+    $txt = Get-Content -LiteralPath $LastReportFile -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ([string]::IsNullOrWhiteSpace($txt)) { return $null }
+    $raw = $txt.Trim()
+    if ($raw -match '^(\d{4}-\d{2}-\d{2})') {
+        try { return [datetime]::ParseExact($matches[1], 'yyyy-MM-dd', $null).Date } catch { }
+    }
+    try {
+        return ([datetime]::ParseExact($raw, 'yyyy-MM-dd HH:mm:ss', $null)).Date
+    } catch {
+        return $null
+    }
+}
+
+function Try-ClaimDailyReportSlotToday {
+    param([datetime]$Now)
+
+    $lockPath = Join-Path $script:InstallRoot 'Logs\.daily_report_claim.lock'
+    $lockStream = $null
+    try {
+        $lockStream = [System.IO.File]::Open(
+            $lockPath,
+            [System.IO.FileMode]::OpenOrCreate,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::None
+        )
+    } catch {
+        Write-Log 'Ежедневный отчёт: другой процесс уже отправляет (lock).'
+        return $false
+    }
+
+    try {
+        $lastDate = Read-LastDailyReportSentDate
+        if ($null -ne $lastDate -and $lastDate -ge $Now.Date) {
+            return $false
+        }
+        Write-TextFileUtf8Bom -Path $LastReportFile -Text ($Now.ToString('yyyy-MM-dd'))
+        return $true
+    } finally {
+        if ($null -ne $lockStream) {
+            $lockStream.Dispose()
+        }
+        Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Check-AndSendDailyReport {
     if (-not (Test-DailyReportEnabledFlag)) {
         return (Get-NextLocalSlotBoundary -Hour $DailyReportHour -Minute $DailyReportMinute)
-    }
-    $lastReport = $null
-    if (Test-Path $LastReportFile) {
-        $txt = Get-Content $LastReportFile -ErrorAction SilentlyContinue
-        if ($txt) { $lastReport = [datetime]::ParseExact($txt, "yyyy-MM-dd HH:mm:ss", $null) }
     }
 
     $now = Get-Date
     $reportSlotToday = Get-Date -Year $now.Year -Month $now.Month -Day $now.Day -Hour $DailyReportHour -Minute $DailyReportMinute -Second 0
     $shouldSend = $false
     if ($now -ge $reportSlotToday) {
-        if ($null -eq $lastReport) {
+        $lastDate = Read-LastDailyReportSentDate
+        if ($null -eq $lastDate -or $lastDate -lt $now.Date) {
             $shouldSend = $true
-        } else {
-            $dLast = $lastReport.Date
-            if ($dLast -lt $now.Date) { $shouldSend = $true }
         }
     }
-    if ($shouldSend) { Send-DailyReport | Out-Null }
+    if ($shouldSend -and (Try-ClaimDailyReportSlotToday -Now $now)) {
+        Send-DailyReport | Out-Null
+    }
 
     return (Get-NextLocalSlotBoundary -Hour $DailyReportHour -Minute $DailyReportMinute)
 }

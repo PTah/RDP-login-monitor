@@ -644,10 +644,33 @@ function Get-RdpMonitorSacBlockFromExample {
     }
     return @(
         '# --- Security Alert Center (SAC) ---'
-        '$UseSAC = ''dual'''
+        '$UseSAC = ''fallback'''
         '$SacUrl = ''https://sac.kalinamall.ru'''
         '$SacApiKey = ''sac_CHANGE_ME'''
     ) -join "`r`n"
+}
+
+function Sync-RdpMonitorUseSacFallbackMode {
+    param([string]$LocalSettings)
+
+    if (-not (Test-Path -LiteralPath $LocalSettings)) { return $false }
+    $c = Get-RdpMonitorSettingsRaw -Path $LocalSettings
+    if ([string]::IsNullOrWhiteSpace($c)) { return $false }
+    if ($c -match '(?m)^\s*\$UseSAC\s*=\s*[''"]fallback[''"]') { return $false }
+    if ($c -notmatch '(?m)^\s*\$UseSAC\s*=') { return $false }
+
+    $newContent = [regex]::Replace(
+        $c,
+        '(?m)^(\s*\$UseSAC\s*=\s*)[''"][^''"]+[''"]',
+        '$1''fallback'''
+    )
+    if ($newContent -eq $c) { return $false }
+
+    $bak = "$LocalSettings.bak.$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+    Copy-Item -LiteralPath $LocalSettings -Destination $bak -Force
+    [System.IO.File]::WriteAllText($LocalSettings, $newContent.TrimEnd() + "`r`n", $Utf8Bom)
+    Write-DeployLog "login_monitor.settings.ps1: UseSAC переключён на fallback (резервная копия: $bak)."
+    return $true
 }
 
 function Update-RdpMonitorSettingsSacBlockIfMissing {
@@ -675,7 +698,7 @@ function Update-RdpMonitorSettingsSacBlockIfMissing {
 
     $bak = "$LocalSettings.bak.$(Get-Date -Format 'yyyyMMdd_HHmmss')"
     Copy-Item -LiteralPath $LocalSettings -Destination $bak -Force
-    Write-DeployLog "Добавление блока SAC (UseSAC=dual) в login_monitor.settings.ps1; резервная копия: $bak"
+    Write-DeployLog "Добавление блока SAC (UseSAC=fallback) в login_monitor.settings.ps1; резервная копия: $bak"
 
     if ($c -match '(?m)^\s*\$UseSAC\s*=') {
         $c = [regex]::Replace($c, '(?m)^\s*\$UseSAC\s*=.*$', '')
@@ -689,7 +712,7 @@ function Update-RdpMonitorSettingsSacBlockIfMissing {
 
     $newContent = ($c.TrimEnd() + "`r`n`r`n" + $sacBlock + "`r`n").TrimEnd() + "`r`n"
     [System.IO.File]::WriteAllText($LocalSettings, $newContent, $Utf8Bom)
-    Write-DeployLog "login_monitor.settings.ps1: добавлен блок SAC (UseSAC=dual из example на шаре)."
+    Write-DeployLog "login_monitor.settings.ps1: добавлен блок SAC (UseSAC=fallback из example на шаре)."
     return $true
 }
 
@@ -717,7 +740,7 @@ function Sync-RdpMonitorSettingsFromShare {
     }
 
     if ($needsCreate) {
-        Write-DeployLog "Создан login_monitor.settings.ps1 из example (Telegram + SAC dual)."
+        Write-DeployLog "Создан login_monitor.settings.ps1 из example (Telegram + SAC fallback)."
         Copy-Item -LiteralPath $ExampleOnShare -Destination $LocalSettings -Force
         Invoke-RdpMonitorSettingsPostPatches -LocalSettings $LocalSettings | Out-Null
         return
@@ -831,6 +854,7 @@ try {
     }
 
     $cmp = Compare-VersionStrings -Left $shareVerRaw -Right $localVerRaw
+    $isScriptVersionUpgrade = ($null -ne $cmp -and $cmp -gt 0 -and -not [string]::IsNullOrWhiteSpace($localVerRaw))
     if ($null -ne $cmp) {
         if ($cmp -eq 0) {
             if (-not $needsSacBootstrap) {
@@ -869,7 +893,7 @@ try {
 
     if ($WhatIf) {
         if ($needsSettingsBootstrap) {
-            Write-DeployLog "[WhatIf] Донастроить login_monitor.settings.ps1 (SAC dual из example)."
+            Write-DeployLog "[WhatIf] Донастроить login_monitor.settings.ps1 (SAC fallback из example)."
         }
         if ($needsBundleSync) {
             Write-DeployLog "[WhatIf] Синхронизировать пакет: $($DeployBundleFiles -join ', ')."
@@ -888,6 +912,10 @@ try {
     Copy-RdpMonitorDeployBundle -ShareRoot $shareRoot
 
     Sync-RdpMonitorSettingsFromShare -ExampleOnShare $settingsExampleShare -LocalSettings $settingsLocal
+
+    if ($isScriptVersionUpgrade) {
+        Sync-RdpMonitorUseSacFallbackMode -LocalSettings $settingsLocal | Out-Null
+    }
 
     $installArgs = @(
         '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $LocalScript, '-InstallTasks', '-SkipImmediateMainRun'
