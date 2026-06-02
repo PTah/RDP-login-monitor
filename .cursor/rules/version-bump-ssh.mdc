@@ -1,0 +1,28 @@
+---
+description: При правке ssh-monitor обязательно поднимать version.txt и SSH_MONITOR_VERSION
+globs: ssh-monitor,sac-client.sh,update_ssh_monitor.sh,version.txt
+alwaysApply: false
+---
+
+# Bump версии ssh-monitor
+
+Без bump **`update_ssh_monitor.sh` не скопирует новый скрипт** на хост (сравнение sha256; версия нужна для отчётов, SAC и диагностики).
+
+## Что менять в одном коммите с правкой
+
+1. **`ssh-monitor`** — `SSH_MONITOR_VERSION="X.Y.Z-SAC"` (первая строка блока версии)
+2. **`version.txt`** — **та же строка**
+
+Строки должны **совпадать**.
+
+## Как поднимать
+
+- Обычная правка → **patch**: `2.0.0-SAC` → `2.0.1-SAC`
+- Крупный релиз → **minor** по смыслу
+
+`sac-client.sh` отдельный номер **не** задаёт — берёт `SSH_MONITOR_VERSION` из установленного `ssh-monitor`.
+
+## Чеклист перед push
+
+- [ ] `SSH_MONITOR_VERSION` и `version.txt` совпадают
+- [ ] На хостах: `git pull` и запуск `update_ssh_monitor.sh` (или `--deploy`)

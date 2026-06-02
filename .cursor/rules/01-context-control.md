@@ -5,6 +5,9 @@ globs: *
 
 # Global Optimization & Cost Control
 
+## ?? Answers
+-Always answer briefly and only to the point, otherwise only if it is stated in the question or when it is not possible to answer briefly.
+
 ## ?? Context & Local Data
 - **Strict file targeting:** Work ONLY with files explicitly provided via `@` or open in the active editor tab. Do not use global codebase search unless requested.
 - **Local assets only:** Always work with local copies of repositories and dependencies. Never request external web resources or re-download packages without a explicit build error.
@@ -26,3 +29,4 @@ globs: *
 - Simple questions, explanations, docs ? Use lightweight models (e.g., `gpt-4o-mini`, `claude-3-haiku`).
 - Complex code generation, refactoring, and debugging ? Use advanced models (e.g., `claude-3.5-sonnet`).
 - Do not switch models without an explicit reason.
+

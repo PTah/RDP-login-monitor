@@ -1,0 +1,30 @@
+---
+description: Запрет упоминаний Cursor IDE/Agent в git-репозиториях (файлы и коммиты)
+alwaysApply: true
+---
+
+# Не оставлять следов Cursor в репозиториях
+
+В **коммитах и файлах**, которые попадают в git (включая публичный GitHub), **запрещено** добавлять что-либо, связанное с Cursor как инструментом разработки.
+
+## Запрещено
+
+- Упоминания **Cursor**, **Cursor IDE**, **Cursor Agent**, **cursoragent**, **cursor.com**, **cursor.sh** в README, docs, комментариях, конфигах.
+- Trailers в сообщениях коммитов: `Co-authored-by: Cursor …`, `Made-with: Cursor`, email `cursoragent@cursor.com`.
+- Каталог **`.cursor/`**, файлы только для IDE (**`AGENTS.md`**, **`CURSOR.md`**) — **не коммитить** в публичные репозитории (должны быть в `.gitignore`, если репо public).
+- Ссылки на Cursor в runbook, deploy-доках, issue templates.
+
+## Разрешено (не путать с IDE)
+
+- CSS: **`cursor: pointer`** (и аналоги).
+- Предметный код: **poll cursor**, **CurrentCursor**, **Update-MonitorPollCursor**, **Console.CursorLeft**, **DB cursor** (sqlite/psycopg2), **MOEX `analytics.cursor`** и т.п.
+
+## Git / GitHub
+
+- **Author и committer** — только владелец проекта (**Andrey Lutsenko**, email, привязанный к GitHub), **без** co-author Cursor.
+- Перед push в public remote: нет `cursoragent`, `Co-authored-by: Cursor` в истории и дереве (`git log --format=fuller`, поиск по репо).
+
+## При работе агента
+
+- Не добавлять «Powered by Cursor», бейджи, секции про Cursor в документацию продукта.
+- Правила Cursor (`.cursor/rules/`) — локально или только в **приватном** remote; в публичный GitHub не попадают.

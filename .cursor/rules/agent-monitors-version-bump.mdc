@@ -1,0 +1,38 @@
+﻿---
+description: При правках агентских скриптов (RDP/SSH) всегда bump версии — иначе ПК не обновятся
+alwaysApply: true
+---
+
+# Версии агентов: обязательный bump
+
+Workspace **security-monitors** (RDP + SSH + SAC). Любая **существенная правка агентских скриптов** без bump версии **не доедет до компьютеров**.
+
+## RDP-login-monitor
+
+| Файл | Поле |
+|------|------|
+| `Login_Monitor.ps1` | `$ScriptVersion` |
+| `version.txt` | та же строка |
+
+Триггер деплоя на Windows: **`Deploy-LoginMonitor.ps1`** сравнивает `version.txt` на шаре с `C:\ProgramData\RDP-login-monitor\deployed_version.txt`.
+
+## ssh-monitor
+
+| Файл | Поле |
+|------|------|
+| `ssh-monitor` | `SSH_MONITOR_VERSION` |
+| `version.txt` | та же строка |
+
+Обновление на Linux: **`update_ssh_monitor.sh`** (sha256 + перезапуск сервиса).
+
+## Правило для агента
+
+При изменении `Login_Monitor.ps1`, `Deploy-LoginMonitor.ps1`, `Sac-Client.ps1`, `ssh-monitor`, `sac-client.sh`, `update_ssh_monitor.sh`:
+
+1. Поднять **patch** версии (`2.0.6-SAC` → `2.0.7-SAC`) в **обоих** местах репозитория
+2. Включить bump в **тот же коммит**, что и правку (или сразу следом `chore: bump release to …`)
+3. Напомнить: опубликовать RDP на NETLOGON / на SSH-хостах выполнить update
+
+## SAC (backend)
+
+Версия UI/API — `backend/app/version.py` (`APP_VERSION`). Bump при релизе SAC на сервер; на автообновление **агентов на ПК** не влияет.
