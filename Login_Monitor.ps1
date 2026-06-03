@@ -76,22 +76,30 @@ $script:MonitorRestartRequestFile = Join-Path $script:InstallRoot 'restart.reque
 $script:MonitorRecycleRequested = $false
 $script:MonitorLoopInitialized = $false
 $script:MonitorStopRequested = $false
+$script:MonitorShutdownPath = 'startup'
+$script:MonitorLastLoopPhase = 'init'
+$script:MonitorLastLoopAt = $null
+$script:MonitorLastSecurityEventCount = 0
+$script:MonitorLastSkipCount = 0
+$script:MonitorInMainLoop = $false
+$script:SkipLogDetailLimit = 15
 
 # Версия: пишется в лог и в Telegram. При доменном развёртывании через шару см. DEPLOY.md —
 # триггер обновления на клиентах даёт файл version.txt на шаре (его номер можно поднять и без смены
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "2.0.10-SAC"
+$ScriptVersion = "2.0.12-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
 $LogBackupFolder = Join-Path $script:InstallRoot "Logs\Backup"
 $MaxBackupDays = 31
 
-# Ротация логов (ежедневно)
+# Ротация login_monitor.log (ежедневно в указанное локальное время) и срок хранения бэкапов LoginLog_*.bak
 $LogRotationHour = 0
 $LogRotationMinute = 0
+$MaxBackupDays = 31
 
 # Heartbeat (файл; при отсутствии обновления > HeartbeatStaleAlertMultiplier × интервал — оповещение)
 $HeartbeatInterval = 3600
@@ -379,7 +387,7 @@ function Lock-RdpMonitorSingleInstance {
             [System.IO.FileOptions]::DeleteOnClose
         )
     } catch [System.IO.IOException] {
-        Write-Log "Экземпляр монитора уже активен (блокировка файла). Выход без дублирования."
+        Write-Log "Экземпляр монитора уже активен (блокировка файла). Выход без дублирования (pid=$PID)."
         exit 0
     } catch {
         Write-Log "Не удалось занять блокировку экземпляра (${lockPath}): $($_.Exception.Message)"
@@ -2047,8 +2055,74 @@ function Test-AndSendHeartbeatStaleAlert {
     }
 }
 
+function Set-MonitorLoopPhase {
+    param([string]$Phase)
+    $script:MonitorLastLoopPhase = $Phase
+    $script:MonitorLastLoopAt = Get-Date
+}
+
+function Set-MonitorShutdownPath {
+    param([string]$Path)
+    $script:MonitorShutdownPath = $Path
+}
+
+function Get-MonitorShutdownDiagnostics {
+    $parts = [System.Collections.Generic.List[string]]::new()
+    [void]$parts.Add("pid=$PID")
+    [void]$parts.Add("ver=$ScriptVersion")
+    [void]$parts.Add("shutdown=$($script:MonitorShutdownPath)")
+    [void]$parts.Add("phase=$($script:MonitorLastLoopPhase)")
+    if ($null -ne $script:MonitorLastLoopAt) {
+        [void]$parts.Add("phase_age_sec=$([int]((Get-Date) - $script:MonitorLastLoopAt).TotalSeconds)")
+    }
+    if ($null -ne $script:MonitorStartedAt) {
+        [void]$parts.Add("uptime_min=$([math]::Round(((Get-Date) - $script:MonitorStartedAt).TotalMinutes, 1))")
+    }
+    [void]$parts.Add("in_loop=$($script:MonitorInMainLoop)")
+    [void]$parts.Add("stop_req=$($script:MonitorStopRequested)")
+    [void]$parts.Add("recycle_req=$($script:MonitorRecycleRequested)")
+    if ($script:MonitorLastSecurityEventCount -gt 0) {
+        [void]$parts.Add("sec_batch=$($script:MonitorLastSecurityEventCount)")
+    }
+    if ($script:MonitorLastSkipCount -gt 0) {
+        [void]$parts.Add("skip_batch=$($script:MonitorLastSkipCount)")
+    }
+    try {
+        $proc = Get-Process -Id $PID -ErrorAction Stop
+        [void]$parts.Add("ws_mb=$([math]::Round($proc.WorkingSet64 / 1MB, 1))")
+    } catch { }
+    return ($parts -join '; ')
+}
+
+function Write-MonitorSkipBatchLog {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$SkipEntries
+    )
+    if ($SkipEntries.Count -eq 0) { return }
+    $script:MonitorLastSkipCount = $SkipEntries.Count
+    if ($SkipEntries.Count -le $script:SkipLogDetailLimit) {
+        foreach ($entry in $SkipEntries) {
+            Write-Log "Skip $($entry.Id): User=$($entry.User) LT=$($entry.LT) IP=$($entry.IP) Wks=$($entry.Wks) — $($entry.Reason)"
+        }
+        return
+    }
+    $groups = @($SkipEntries | Group-Object -Property User, Reason)
+    $summaryParts = @($groups | ForEach-Object {
+        $user = ($_.Group[0].User)
+        $reason = ($_.Group[0].Reason)
+        "$user/$reason=$($_.Count)"
+    })
+    $preview = ($summaryParts | Select-Object -First 8) -join '; '
+    if ($summaryParts.Count -gt 8) { $preview += "; +$($summaryParts.Count - 8) more groups" }
+    Write-Log "Skip batch: $($SkipEntries.Count) events suppressed ($preview)"
+}
+
 function Send-StopNotification {
-    param([string]$Reason)
+    param(
+        [string]$Reason,
+        [string]$Diagnostics = ''
+    )
 
     $timestamp = Get-Date -Format "dd.MM.yyyy HH:mm:ss"
     $hHost = (ConvertTo-TelegramHtml (Get-MonitorServerLabel))
@@ -2057,12 +2131,56 @@ function Send-StopNotification {
     $message += "🖥️ Сервер: $hHost`r`n"
     $message += "🕐 Время остановки: $timestamp`r`n"
     $message += "📋 Причина: $hReason"
+    if (-not [string]::IsNullOrWhiteSpace($Diagnostics)) {
+        $hDiag = ConvertTo-TelegramHtml $Diagnostics
+        $message += "`r`n🔍 Диагностика: <code>$hDiag</code>"
+        Write-Log "Диагностика остановки: $Diagnostics"
+    }
 
+    $sacSummary = if ([string]::IsNullOrWhiteSpace($Diagnostics)) {
+        "Мониторинг остановлен: $Reason"
+    } else {
+        "Мониторинг остановлен: $Reason | $Diagnostics"
+    }
     Send-RdpMonitorLifecycleNotification -Lifecycle 'stopped' -Trigger 'shutdown' `
         -TelegramHtmlMessage $message -EmailSubject 'RDP Login Monitor: остановка' `
         -SacTitle 'RDP login monitor stopped' -SacSeverity 'info' `
-        -SacSummary "Мониторинг остановлен: $Reason"
+        -SacSummary $sacSummary
     Write-Log "Уведомление об остановке отправлено: $Reason"
+}
+
+function Remove-LogBackupsBeyondRetention {
+    param(
+        [string]$Reason = 'retention'
+    )
+    try {
+        $retentionDays = 31
+        if ($null -ne $MaxBackupDays) {
+            $retentionDays = [int]$MaxBackupDays
+        }
+        if ($retentionDays -lt 1) {
+            Write-Log "WARN: MaxBackupDays=$retentionDays некорректно — используем 31."
+            $retentionDays = 31
+        }
+        if (-not (Test-Path -LiteralPath $LogBackupFolder)) { return 0 }
+
+        $cutoff = (Get-Date).AddDays(-$retentionDays)
+        $oldBackups = @(Get-ChildItem -Path $LogBackupFolder -Filter 'LoginLog_*.bak' -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -lt $cutoff })
+        if ($oldBackups.Count -eq 0) { return 0 }
+
+        $removed = 0
+        foreach ($oldBackup in $oldBackups) {
+            Remove-Item -LiteralPath $oldBackup.FullName -Force -ErrorAction Stop
+            Write-Log "Удален старый бэкап ($Reason, старше ${retentionDays} д): $($oldBackup.Name)"
+            $removed++
+        }
+        Write-Log "Очистка бэкапов ($Reason): удалено $removed файл(ов), MaxBackupDays=$retentionDays."
+        return $removed
+    } catch {
+        Write-Log "Ошибка очистки бэкапов логов ($Reason): $($_.Exception.Message)"
+        return 0
+    }
 }
 
 function Rotate-LogFile {
@@ -2078,13 +2196,7 @@ function Rotate-LogFile {
             Ensure-FileStartsWithUtf8Bom -Path $LogFile
             Write-Log "Лог-файл скопирован в бэкап: $backupFilePath"
 
-            $oldBackups = Get-ChildItem -Path $LogBackupFolder -Filter "LoginLog_*.bak" |
-                Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-$MaxBackupDays) }
-
-            foreach ($oldBackup in $oldBackups) {
-                Remove-Item -Path $oldBackup.FullName -Force
-                Write-Log "Удален старый бэкап: $($oldBackup.Name)"
-            }
+            [void](Remove-LogBackupsBeyondRetention -Reason 'rotation')
             return $true
         }
     } catch {
@@ -2130,23 +2242,14 @@ function Check-AndRotateLog {
 
     if ($shouldRotate -and (Rotate-LogFile)) {
         Write-TextFileUtf8Bom -Path $lastRotationFile -Text ($currentTime.ToString("yyyy-MM-dd HH:mm:ss"))
+    } else {
+        [void](Remove-LogBackupsBeyondRetention -Reason 'rotation_check')
     }
     return (Get-NextLocalSlotBoundary -Hour $LogRotationHour -Minute $LogRotationMinute)
 }
 
 function Cleanup-OldLogs {
-    try {
-        if (Test-Path $LogBackupFolder) {
-            $oldBackups = Get-ChildItem -Path $LogBackupFolder -Filter "LoginLog_*.bak" |
-                Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-$MaxBackupDays) }
-            foreach ($oldBackup in $oldBackups) {
-                Remove-Item -Path $oldBackup.FullName -Force
-                Write-Log "Удален старый бэкап: $($oldBackup.Name)"
-            }
-        }
-    } catch {
-        Write-Log "Ошибка при очистке старых логов: $($_.Exception.Message)"
-    }
+    [void](Remove-LogBackupsBeyondRetention -Reason 'startup')
 }
 
 function Get-EventDataMap {
@@ -3451,6 +3554,7 @@ function Start-LoginMonitor {
 
     $script:MonitorStartedAt = Get-Date
     $script:HeartbeatStaleAlertActive = $false
+    Set-MonitorShutdownPath -Path 'in_monitor_loop'
 
     do {
         $script:MonitorRecycleRequested = $false
@@ -3493,20 +3597,26 @@ function Start-LoginMonitor {
         $lastLockout4740CheckTime = (Get-Date).AddSeconds(-10)
         $monitorEvents = @(4624, 4625, 4648)
 
+        $script:MonitorInMainLoop = $true
         while ($true) {
+            Set-MonitorLoopPhase -Phase 'loop_top'
             $restartReq = Get-RdpMonitorRestartRequest
             if ($null -ne $restartReq) {
-                $script:StopNotificationSent = $true
                 if ($restartReq.Mode -eq 'stop') {
+                    Set-MonitorShutdownPath -Path "graceful_stop:$($restartReq.Reason)"
+                    $script:StopNotificationSent = $true
                     Write-Log "Graceful stop: запрос '$($restartReq.Reason)' — выход без запуска нового процесса."
                     $script:MonitorStopRequested = $true
                     break
                 }
                 if ($restartReq.Mode -eq 'recycle') {
+                    Set-MonitorShutdownPath -Path "graceful_recycle:$($restartReq.Reason)"
+                    $script:StopNotificationSent = $true
                     Write-Log "Graceful recycle: запрос '$($restartReq.Reason)' — выход для запуска нового процесса (обновлённый скрипт с диска)."
                     $script:MonitorRecycleRequested = $true
                     break
                 }
+                Set-MonitorShutdownPath -Path "settings_reload:$($restartReq.Reason)"
                 Write-Log "Graceful restart (settings): запрос '$($restartReq.Reason)' — перечитываю настройки в этом же процессе PowerShell."
                 Invoke-RdpMonitorReloadSettings | Out-Null
                 $hHost = ConvertTo-TelegramHtml (Get-MonitorServerLabelWithIp)
@@ -3522,17 +3632,23 @@ function Start-LoginMonitor {
             }
 
         try {
+            Set-MonitorLoopPhase -Phase 'poll_prepare'
             # ignore.lst: сверка mtime и лог при изменении файла.
             [void](Get-RdpMonitorIgnoreListEntries)
             Test-AndSendHeartbeatStaleAlert
 
+            Set-MonitorLoopPhase -Phase 'poll_security'
             $events = Get-WinEvent -FilterHashtable @{
                 LogName = 'Security'
                 ID = $monitorEvents
                 StartTime = $lastCheckTime
             } -ErrorAction SilentlyContinue
+            $script:MonitorLastSecurityEventCount = @($events).Count
+            $script:MonitorLastSkipCount = 0
+            $skipBatch = [System.Collections.Generic.List[object]]::new()
 
             if ($events) {
+                Set-MonitorLoopPhase -Phase 'process_security_events'
                 foreach ($event in $events) {
                     if ($event.TimeCreated -le $lastCheckTime) { continue }
 
@@ -3576,7 +3692,14 @@ function Start-LoginMonitor {
                     }
 
                     if ($shouldIgnore) {
-                        Write-Log "Skip $($event.Id): User=$($eventInfo.Username) LT=$($eventInfo.LogonType) IP=$($eventInfo.SourceIP) Wks=$($eventInfo.ComputerName) — $ignoreReason"
+                        [void]$skipBatch.Add([pscustomobject]@{
+                            Id = $event.Id
+                            User = $eventInfo.Username
+                            LT = $eventInfo.LogonType
+                            IP = $eventInfo.SourceIP
+                            Wks = $eventInfo.ComputerName
+                            Reason = $ignoreReason
+                        })
                         continue
                     }
 
@@ -3660,10 +3783,12 @@ function Start-LoginMonitor {
                                 } | Out-Null
                     }
                 }
+                Write-MonitorSkipBatchLog -SkipEntries @($skipBatch)
                 $lastCheckTime = Update-MonitorPollCursor -CurrentCursor $lastCheckTime -Events @($events)
             }
 
             if ($rdGatewayAvailable) {
+                Set-MonitorLoopPhase -Phase 'poll_rdgateway'
                 $gatewayEvents = Get-WinEvent -FilterHashtable @{
                     LogName = $RDGatewayLogName
                     ID = $RDGatewayEvents
@@ -3915,11 +4040,14 @@ function Start-LoginMonitor {
             }
         } catch {
             if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw }
+            Set-MonitorLoopPhase -Phase 'loop_error'
             Write-Log "Ошибка цикла мониторинга: $($_.Exception.Message)"
         }
+        Set-MonitorLoopPhase -Phase 'sleep'
         Start-Sleep -Seconds $MonitorInterval
         }
 
+        $script:MonitorInMainLoop = $false
         if ($script:MonitorRecycleRequested) {
             return
         }
@@ -3935,6 +4063,7 @@ try {
     if ($script:SacClientLoaded) { $sacMode = Get-SacNormalizedMode }
     if ($sacMode -ne 'off') {
         if (-not (Test-SacConfigured)) {
+            Set-MonitorShutdownPath -Path 'sac_misconfigured_before_loop'
             Write-Log "ОШИБКА: UseSAC=$sacMode, но SacUrl/SacApiKey не заданы в login_monitor.settings.ps1"
             exit 1
         }
@@ -3972,14 +4101,17 @@ try {
         }
     }
     Start-LoginMonitor -MonitorInterval 5 -MonitorInteractiveOnly
+    $script:MonitorInMainLoop = $false
 
     if ($script:MonitorStopRequested) {
+        Set-MonitorShutdownPath -Path 'graceful_stop_exit'
         $script:StopNotificationSent = $true
         Write-Log "Graceful stop: завершение без запуска нового процесса."
         exit 0
     }
 
     if ($script:MonitorRecycleRequested) {
+        Set-MonitorShutdownPath -Path 'graceful_recycle_exit'
         $script:StopNotificationSent = $true
         $canonicalScript = Join-Path $script:InstallRoot $script:CanonicalScriptName
         Write-Log "Graceful recycle: запуск нового процесса монитора ($canonicalScript)."
@@ -3988,20 +4120,38 @@ try {
         ) -WindowStyle Hidden | Out-Null
         exit 0
     }
+
+    Set-MonitorShutdownPath -Path 'monitor_loop_returned_unexpected'
+    Write-Log "WARN: Start-LoginMonitor завершился без stop/recycle. $(Get-MonitorShutdownDiagnostics)"
 } catch {
     if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) {
-        Write-Log "Выполнение прервано (Ctrl+C / Stop-Pipeline)."
+        Set-MonitorShutdownPath -Path 'pipeline_stopped'
+        $diag = Get-MonitorShutdownDiagnostics
+        Write-Log "Выполнение прервано (Ctrl+C / Stop-Pipeline / внешняя остановка). $diag"
+        Send-StopNotification -Reason 'Выполнение прервано (PipelineStopped)' -Diagnostics $diag
         $script:StopNotificationSent = $true
     } else {
-        Write-Log "Критическая ошибка: $($_.Exception.Message)"
-        Send-StopNotification -Reason "Критическая ошибка: $($_.Exception.Message)"
+        Set-MonitorShutdownPath -Path 'critical_error'
+        $diag = Get-MonitorShutdownDiagnostics
+        Write-Log "Критическая ошибка: $($_.Exception.Message). $diag"
+        Send-StopNotification -Reason "Критическая ошибка: $($_.Exception.Message)" -Diagnostics $diag
         $script:StopNotificationSent = $true
         throw
     }
 } finally {
+    $script:MonitorInMainLoop = $false
     Release-RdpMonitorSingletonLock
     if (-not $script:StopNotificationSent) {
-        Send-StopNotification -Reason "Скрипт завершил работу"
+        if ($script:MonitorShutdownPath -eq 'startup' -or $script:MonitorShutdownPath -eq 'in_monitor_loop') {
+            if ($script:MonitorLoopInitialized) {
+                Set-MonitorShutdownPath -Path 'finally_during_monitor'
+            } else {
+                Set-MonitorShutdownPath -Path 'finally_before_monitor'
+            }
+        }
+        $diag = Get-MonitorShutdownDiagnostics
+        Write-Log "Неожиданное завершение (finally/$($script:MonitorShutdownPath)). $diag"
+        Send-StopNotification -Reason "Неожиданное завершение ($($script:MonitorShutdownPath))" -Diagnostics $diag
     }
 }
 
