@@ -82,7 +82,7 @@ $script:MonitorStopRequested = $false
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "2.0.9-SAC"
+$ScriptVersion = "2.0.10-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -451,19 +451,12 @@ function Get-RdpMonitorRestartRequest {
 }
 
 function Invoke-RdpMonitorReloadSettings {
-    if (-not (Test-Path -LiteralPath $script:LoginMonitorSettingsFile)) {
-        Write-Log "Graceful restart: login_monitor.settings.ps1 не найден, настройки не перечитаны."
-        return $false
-    }
-    try {
-        . $script:LoginMonitorSettingsFile
-        $script:LoginMonitorSettingsLoaded = $true
+    if (Import-LoginMonitorSettingsFile -Force) {
         Write-Log "Graceful restart: login_monitor.settings.ps1 перечитан (каналы: $(Get-NotifyChainHuman))."
         return $true
-    } catch {
-        Write-Log "Graceful restart: ошибка чтения settings: $($_.Exception.Message)"
-        return $false
     }
+    Write-Log "Graceful restart: login_monitor.settings.ps1 не найден или не прочитан."
+    return $false
 }
 
 function Test-RdpMonitorScheduledTaskMatches {
@@ -652,14 +645,37 @@ if ($InstallTasks) {
 }
 
 function Import-LoginMonitorSettingsFile {
-    if ($script:LoginMonitorSettingsLoaded) { return $true }
+    param([switch]$Force)
+
+    if ($script:LoginMonitorSettingsLoaded -and -not $Force) { return $true }
     if (-not (Test-Path -LiteralPath $script:LoginMonitorSettingsFile)) { return $false }
+
     try {
-        . $script:LoginMonitorSettingsFile
+        # Dot-source внутри function scope не виден основному скрипту ($UseSAC, Telegram и т.д.).
+        # Читаем settings в изолированном блоке и копируем новые переменные в script scope.
+        $introduced = & {
+            param([string]$SettingsPath)
+            $before = @((Get-Variable -Scope Local -ErrorAction SilentlyContinue).Name)
+            . $SettingsPath
+            Get-Variable -Scope Local -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -notin $before }
+        } -SettingsPath $script:LoginMonitorSettingsFile
+
+        foreach ($v in @($introduced)) {
+            if ($null -eq $v -or [string]::IsNullOrWhiteSpace($v.Name)) { continue }
+            Set-Variable -Scope Script -Name $v.Name -Value $v.Value -Force
+        }
+
         $script:LoginMonitorSettingsLoaded = $true
         return $true
     } catch {
         $msg = $_.Exception.Message
+        if ($Force) {
+            if (Get-Command Write-Log -ErrorAction SilentlyContinue) {
+                Write-Log "Graceful restart: ошибка чтения settings: $msg"
+            }
+            return $false
+        }
         if (Get-Command Write-Log -ErrorAction SilentlyContinue) {
             Write-Log "ОШИБКА: login_monitor.settings.ps1 — $msg"
         } else {
