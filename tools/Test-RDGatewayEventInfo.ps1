@@ -47,3 +47,9 @@ if ($map['SessionDuration'] -ne '0') {
     throw "Expected SessionDuration=0, got $($map['SessionDuration'])"
 }
 Write-Host 'OK: RD Gateway EventInfo XML fields parsed correctly (ErrorCode != BytesReceived).'
+
+# 1226 в sample — типичный штатный код закрытия туннеля (в Login_Monitor.ps1 → disconnected, не failed).
+if ($map['ErrorCode'] -ne '1226') {
+    throw 'Expected sample ErrorCode 1226 for standard RDG disconnect'
+}
+Write-Host 'OK: sample 303 ErrorCode 1226 (standard RD Gateway disconnect).'

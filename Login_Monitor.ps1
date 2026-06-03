@@ -89,7 +89,7 @@ $script:SkipLogDetailLimit = 15
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "2.0.13-SAC"
+$ScriptVersion = "2.0.14-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -106,6 +106,7 @@ $HeartbeatStaleAlertMultiplier = 2
 # Один RDP-вход часто даёт 2+ события 4624 с одним временем — не слать дубли в Telegram/SAC.
 $LoginSuccessNotifyDedupSeconds = 90
 $HeartbeatFile = Join-Path $script:InstallRoot "Logs\last_heartbeat.txt"
+$GatewayPollCursorFile = Join-Path $script:InstallRoot "Logs\last_rdgateway_poll.txt"
 $DeployUpdateMarkerFile = Join-Path $script:InstallRoot "deploy_last_update.txt"
 # Построчные правила подавления уведомлений Security 4624/4625 (см. ignore.lst.example в репозитории).
 $script:IgnoreListPath = Join-Path $script:InstallRoot "ignore.lst"
@@ -125,7 +126,7 @@ $LastReportFile = Join-Path $script:InstallRoot "Logs\last_daily_report.txt"
 $EnableRDGatewayMonitoring = $true
 $RDGatewayLogName = "Microsoft-Windows-TerminalServices-Gateway/Operational"
 $RDGatewayEvents = @(302, 303)
-# При старте цикла опроса — сколько минут назад читать 302/303 (чтобы не пропустить события до запуска монитора).
+# Макс. возраст сохранённого курсора RD Gateway (мин): если файл старше — replay не делаем.
 $GatewayEventsLookbackMinutes = 60
 
 # RDP Remote Connection Manager (workstations): User authentication succeeded — событие 1149
@@ -976,7 +977,8 @@ function Send-MonitorNotification {
         [string]$SacSeverity = 'info',
         [string]$SacTitle = '',
         [string]$SacSummary = '',
-        [hashtable]$SacDetails = $null
+        [hashtable]$SacDetails = $null,
+        [datetime]$SacOccurredAt = $null
     )
 
     $title = if (-not [string]::IsNullOrWhiteSpace($SacTitle)) { $SacTitle } else { $EmailSubject }
@@ -991,7 +993,7 @@ function Send-MonitorNotification {
         $sacMode = Get-SacNormalizedMode
         if ($sacMode -ne 'off') {
             return Send-NotifyOrSac -EventType $etype -Severity $SacSeverity -Title $title -Summary $summary `
-                -TelegramMessage $Message -EmailSubject $EmailSubject -Details $SacDetails
+                -TelegramMessage $Message -EmailSubject $EmailSubject -Details $SacDetails -OccurredAt $SacOccurredAt
         }
     }
 
@@ -2962,6 +2964,64 @@ function Get-FailedLogonRateLimitDecision4625 {
     }
 }
 
+function Get-RdpGatewayPollCursor {
+    $now = Get-Date
+    $fresh = $now.AddSeconds(-10)
+    if (-not (Test-Path -LiteralPath $GatewayPollCursorFile)) {
+        return $fresh
+    }
+    try {
+        $raw = (Get-Content -LiteralPath $GatewayPollCursorFile -TotalCount 1 -ErrorAction Stop).Trim()
+        if ([string]::IsNullOrWhiteSpace($raw)) { return $fresh }
+        $parsed = [datetime]::Parse($raw, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)
+        if ($parsed.Kind -eq [DateTimeKind]::Utc) {
+            $parsed = $parsed.ToLocalTime()
+        }
+        $maxAgeMin = [math]::Max(1, [int]$GatewayEventsLookbackMinutes)
+        if ($parsed -lt $now.AddMinutes(-1 * $maxAgeMin)) {
+            Write-Log "RD Gateway: сохранённый cursor старше $maxAgeMin мин — без replay, курсор с now-10с"
+            return $fresh
+        }
+        return $parsed
+    } catch {
+        Write-Log "RD Gateway: не удалось прочитать cursor ($GatewayPollCursorFile) — курсор с now-10с"
+        return $fresh
+    }
+}
+
+function Set-RdpGatewayPollCursor {
+    param([Parameter(Mandatory = $true)][datetime]$Cursor)
+    try {
+        $dir = Split-Path -Parent $GatewayPollCursorFile
+        if (-not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+        Write-TextFileUtf8Bom -Path $GatewayPollCursorFile -Text ($Cursor.ToString('o'))
+    } catch {
+        Write-Log "WARN: RD Gateway cursor save failed: $($_.Exception.Message)"
+    }
+}
+
+function Test-RdgGatewayBenignErrorCode {
+    param([string]$ErrorCode)
+    if ([string]::IsNullOrWhiteSpace($ErrorCode)) { return $true }
+    $code = $ErrorCode.Trim()
+    if ($code -eq '0' -or $code -eq 'N/A') { return $true }
+    # RD Gateway: 1226 — штатное закрытие туннеля (не инцидент).
+    if ($code -eq '1226') { return $true }
+    return $false
+}
+
+function Get-RdgGatewaySacEventType {
+    param(
+        [Parameter(Mandatory = $true)][int]$EventId,
+        [string]$ErrorCode = ''
+    )
+    if ($EventId -eq 302) { return 'rdg.connection.success' }
+    if (Test-RdgGatewayBenignErrorCode -ErrorCode $ErrorCode) { return 'rdg.connection.disconnected' }
+    return 'rdg.connection.failed'
+}
+
 function Update-MonitorPollCursor {
     param(
         [datetime]$CurrentCursor,
@@ -3204,10 +3264,10 @@ function Format-RDGatewayEvent {
     $message = "<b>"
     if ($EventID -eq 302) { $message += "🖥️ ПОДКЛЮЧЕНИЕ ЧЕРЕЗ RD GATEWAY" }
     elseif ($EventID -eq 303) {
-        if ($ErrorCode -ne "0" -and $ErrorCode -ne "N/A" -and -not [string]::IsNullOrWhiteSpace($ErrorCode)) {
-            $message += "⚠️ СЕАНС ЧЕРЕЗ RD GATEWAY ЗАВЕРШЁН С ОШИБКОЙ"
-        } else {
+        if (Test-RdgGatewayBenignErrorCode -ErrorCode $ErrorCode) {
             $message += "ℹ️ СЕАНС ЧЕРЕЗ RD GATEWAY ЗАВЕРШЁН"
+        } else {
+            $message += "⚠️ СЕАНС ЧЕРЕЗ RD GATEWAY ЗАВЕРШЁН С ОШИБКОЙ"
         }
     }
     else { $message += "⚠️ СОБЫТИЕ RD GATEWAY" }
@@ -3220,7 +3280,7 @@ function Format-RDGatewayEvent {
     if ($EventID -eq 303 -and $SessionDurationSec -gt 0) {
         $message += "⏱️ Длительность сессии: $(ConvertTo-TelegramHtml ([string]$SessionDurationSec)) с`r`n"
     }
-    if ($EventID -eq 303 -and $ErrorCode -ne "0" -and $ErrorCode -ne "N/A" -and -not [string]::IsNullOrWhiteSpace($ErrorCode)) {
+    if ($EventID -eq 303 -and -not (Test-RdgGatewayBenignErrorCode -ErrorCode $ErrorCode)) {
         $message += "⚠️ Код ошибки: $(ConvertTo-TelegramHtml $ErrorCode)`r`n"
     }
     $message += "🕐 Время: $hTime`r`n"
@@ -3582,8 +3642,8 @@ function Start-LoginMonitor {
         $nextReportCheck = Check-AndSendDailyReport
         $lastCheckTime = (Get-Date).AddSeconds(-10)
         if ($rdGatewayAvailable) {
-            $lastGatewayCheckTime = (Get-Date).AddMinutes(-1 * [math]::Max(1, $GatewayEventsLookbackMinutes))
-            Write-Log "RD Gateway: опрос 302/303 включён, lookback ${GatewayEventsLookbackMinutes} мин (с $($lastGatewayCheckTime.ToString('dd.MM.yyyy HH:mm:ss')))"
+            $lastGatewayCheckTime = Get-RdpGatewayPollCursor
+            Write-Log "RD Gateway: опрос 302/303 включён, cursor=$($lastGatewayCheckTime.ToString('dd.MM.yyyy HH:mm:ss'))"
         } else {
             $lastGatewayCheckTime = (Get-Date).AddSeconds(-10)
             if ($EnableRDGatewayMonitoring) {
@@ -3734,6 +3794,7 @@ function Start-LoginMonitor {
                                     -SacEventType 'rdp.login.failed' -SacSeverity 'warning' `
                                     -SacTitle 'RDP login failed' `
                                     -SacSummary "4625 $($eventInfo.Username) from $($eventInfo.SourceIP)" `
+                                    -SacOccurredAt $eventInfo.TimeCreated `
                                     -SacDetails @{
                                         user = $eventInfo.Username
                                         ip_address = $eventInfo.SourceIP
@@ -3773,6 +3834,7 @@ function Start-LoginMonitor {
                                 -SacEventType $sacType -SacSeverity 'info' `
                                 -SacTitle "RDP login event $($event.Id)" `
                                 -SacSummary "Event $($event.Id) $($eventInfo.Username) from $($eventInfo.SourceIP)" `
+                                -SacOccurredAt $eventInfo.TimeCreated `
                                 -SacDetails @{
                                     user = $eventInfo.Username
                                     ip_address = $eventInfo.SourceIP
@@ -3817,23 +3879,15 @@ function Start-LoginMonitor {
                             -ErrorCode $ei.ErrorCode `
                             -TimeCreated $ei.TimeCreated `
                             -SessionDurationSec $ei.SessionDurationSec
-                        $hasRdgError = ($ei.ErrorCode -ne '0' -and $ei.ErrorCode -ne 'N/A' -and -not [string]::IsNullOrWhiteSpace($ei.ErrorCode))
-                        if ($event.Id -eq 302) {
-                            $rdgType = 'rdg.connection.success'
-                            $rdgSev = 'info'
-                        } elseif ($hasRdgError) {
-                            $rdgType = 'rdg.connection.failed'
-                            $rdgSev = 'warning'
-                        } else {
-                            $rdgType = 'rdg.connection.disconnected'
-                            $rdgSev = 'info'
-                        }
+                        $rdgType = Get-RdgGatewaySacEventType -EventId $event.Id -ErrorCode $ei.ErrorCode
+                        $rdgSev = if ($rdgType -eq 'rdg.connection.failed') { 'warning' } else { 'info' }
                         Write-Log "Notify RDG: ID=$($event.Id) User=$($ei.Username) Target=$($ei.InternalIP) Type=$rdgType"
                         Send-MonitorNotification -Message $msg `
                             -EmailSubject "RDP Login Monitor: RD Gateway ($($event.Id))" `
                             -SacEventType $rdgType -SacSeverity $rdgSev `
                             -SacTitle "RD Gateway event $($event.Id)" `
                             -SacSummary "RDG $($event.Id) $($ei.Username) -> $($ei.InternalIP)" `
+                            -SacOccurredAt $ei.TimeCreated `
                             -SacDetails @{
                                 user = $ei.Username
                                 external_ip = $ei.ExternalIP
@@ -3848,6 +3902,7 @@ function Start-LoginMonitor {
                         $gatewayNotified++
                     }
                     $lastGatewayCheckTime = Update-MonitorPollCursor -CurrentCursor $lastGatewayCheckTime -Events $gatewaySorted
+                    Set-RdpGatewayPollCursor -Cursor $lastGatewayCheckTime
                     if ($gatewayFetched -gt 0) {
                         Write-Log "RD Gateway poll: fetched=$gatewayFetched notified=$gatewayNotified cursor=$($lastGatewayCheckTime.ToString('dd.MM.yyyy HH:mm:ss'))"
                     }
@@ -3877,6 +3932,7 @@ function Start-LoginMonitor {
                             -SacEventType 'rdp.login.success' -SacSeverity 'info' `
                             -SacTitle 'RDP connection (RCM 1149)' `
                             -SacSummary "RCM 1149 $($rcmInfo.Username) $($rcmInfo.ClientIP)" `
+                            -SacOccurredAt $rcmInfo.TimeCreated `
                             -SacDetails @{
                                 user = $rcmInfo.Username
                                 ip_address = $rcmInfo.ClientIP
@@ -3917,6 +3973,7 @@ function Start-LoginMonitor {
                             -SacEventType $sacType -SacSeverity 'warning' `
                             -SacTitle "RDS Shadow Control $($event.Id)" `
                             -SacSummary "Shadow $($event.Id) $($sh.ShadowerUser) -> $($sh.TargetUser)" `
+                            -SacOccurredAt $sh.TimeCreated `
                             -SacDetails @{
                                 event_id_windows = [int]$event.Id
                                 shadow_mode = 'control'
@@ -3968,6 +4025,7 @@ function Start-LoginMonitor {
                             -SacEventType 'winrm.session.started' -SacSeverity 'warning' `
                             -SacTitle 'WinRM remote shell (Enter-PSSession)' `
                             -SacSummary "WinRM 91 $($wr.User) from $($wr.SourceIP)" `
+                            -SacOccurredAt $wr.TimeCreated `
                             -SacDetails @{
                                 event_id_windows = [int]$event.Id
                                 user = $wr.User
@@ -4012,6 +4070,7 @@ function Start-LoginMonitor {
                             -SacEventType 'auth.account.locked' -SacSeverity 'high' `
                             -SacTitle "Account locked $($lo.Username)" `
                             -SacSummary "4740 $($lo.Username)" `
+                            -SacOccurredAt $lo.TimeCreated `
                             -SacDetails @{
                                 user = $lo.Username
                                 domain = $lo.Domain

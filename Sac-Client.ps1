@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Клиент Security Alert Center для RDP-login-monitor.
 .DESCRIPTION
@@ -167,6 +167,16 @@ function Get-SacOccurredAtIso {
     return [DateTimeOffset]::Now.ToString('yyyy-MM-ddTHH:mm:ss.fffK')
 }
 
+function Get-SacOccurredAtIsoFromDateTime {
+    param([Parameter(Mandatory = $true)][datetime]$When)
+
+    $dt = $When
+    if ($dt.Kind -eq [DateTimeKind]::Unspecified) {
+        $dt = [datetime]::SpecifyKind($dt, [DateTimeKind]::Local)
+    }
+    return ([DateTimeOffset]$dt).ToString('yyyy-MM-ddTHH:mm:ss.fffK')
+}
+
 function Convert-AnyToJsonSerializable {
     param($Value)
     if ($null -eq $Value) { return $null }
@@ -331,7 +341,8 @@ function New-SacEventPayload {
         [Parameter(Mandatory = $true)][string]$Severity,
         [Parameter(Mandatory = $true)][string]$Title,
         [Parameter(Mandatory = $true)][string]$Summary,
-        [hashtable]$Details = $null
+        [hashtable]$Details = $null,
+        [datetime]$OccurredAt = $null
     )
 
     $Title = Limit-SacString -Text $Title -MaxLen 256 -Label 'title'
@@ -340,7 +351,7 @@ function New-SacEventPayload {
     $payload = [ordered]@{
         schema_version = '1.0'
         event_id       = [guid]::NewGuid().ToString()
-        occurred_at    = (Get-SacOccurredAtIso)
+        occurred_at    = if ($null -ne $OccurredAt) { (Get-SacOccurredAtIsoFromDateTime -When $OccurredAt) } else { (Get-SacOccurredAtIso) }
         source         = [ordered]@{
             product            = 'rdp-login-monitor'
             product_version    = if ($ScriptVersion) { [string]$ScriptVersion } else { 'unknown' }
@@ -644,7 +655,8 @@ function Send-SacEvent {
         [Parameter(Mandatory = $true)][string]$Severity,
         [Parameter(Mandatory = $true)][string]$Title,
         [Parameter(Mandatory = $true)][string]$Summary,
-        [hashtable]$Details = $null
+        [hashtable]$Details = $null,
+        [datetime]$OccurredAt = $null
     )
 
     if (-not (Test-SacConfigured)) {
@@ -657,7 +669,7 @@ function Send-SacEvent {
         $mergedDetails = $null
     }
 
-    $payload = $(New-SacEventPayload -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $mergedDetails)
+    $payload = $(New-SacEventPayload -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $mergedDetails -OccurredAt $OccurredAt)
     if ($payload -is [System.Array]) {
         $payload = $payload[-1]
     }
@@ -727,7 +739,8 @@ function Send-NotifyOrSac {
         [Parameter(Mandatory = $true)][string]$Summary,
         [string]$TelegramMessage = '',
         [string]$EmailSubject = 'RDP Login Monitor',
-        [hashtable]$Details = $null
+        [hashtable]$Details = $null,
+        [datetime]$OccurredAt = $null
     )
 
     if ([string]::IsNullOrWhiteSpace($TelegramMessage)) {
@@ -742,7 +755,7 @@ function Send-NotifyOrSac {
             return $false
         }
         $hbDetails = Merge-SacNotifyDetails -Details $Details -TelegramVia 'sac'
-        return (Send-SacEvent -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $hbDetails)
+        return (Send-SacEvent -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $hbDetails -OccurredAt $OccurredAt)
     }
 
     switch ($mode) {
@@ -751,16 +764,16 @@ function Send-NotifyOrSac {
         }
         'exclusive' {
             $merged = Merge-SacNotifyDetails -Details $Details -TelegramVia 'sac'
-            return (Send-SacEvent -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $merged)
+            return (Send-SacEvent -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $merged -OccurredAt $OccurredAt)
         }
         'dual' {
             $merged = Merge-SacNotifyDetails -Details $Details -TelegramVia 'agent'
-            Send-SacEvent -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $merged | Out-Null
+            Send-SacEvent -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $merged -OccurredAt $OccurredAt | Out-Null
             return (Send-SacLocalChannels -TelegramMessage $TelegramMessage -EmailSubject $EmailSubject)
         }
         'fallback' {
             $merged = Merge-SacNotifyDetails -Details $Details -TelegramVia 'sac'
-            if (Send-SacEvent -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $merged) {
+            if (Send-SacEvent -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $merged -OccurredAt $OccurredAt) {
                 return $true
             }
             return (Send-SacLocalChannels -TelegramMessage $TelegramMessage -EmailSubject $EmailSubject)
