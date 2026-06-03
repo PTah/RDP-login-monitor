@@ -89,7 +89,7 @@ $script:SkipLogDetailLimit = 15
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "2.0.16-SAC"
+$ScriptVersion = "2.0.17-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -1139,13 +1139,18 @@ function Enable-SecurityAudit {
     function Test-SuccessAndFailureText {
         param([string]$Line)
         if ([string]::IsNullOrWhiteSpace($Line)) { return $false }
-        $w1 = Uc @(0x0443,0x0441,0x043F,0x0435,0x0445)
-        $w2 = Uc @(0x0438)
-        $w3 = Uc @(0x0441,0x0431,0x043E,0x0439)
-        $p1 = '(?i)' + [regex]::Escape($w1) + '\s+' + [regex]::Escape($w2) + '\s+' + [regex]::Escape($w3)
-        $p2 = '(?i)' + [regex]::Escape($w1) + '\s*' + [regex]::Escape($w2) + '\s*' + [regex]::Escape($w3)
-        if ($Line -match $p1) { return $true }
-        if ($Line -match $p2) { return $true }
+        $wSuccess = Uc @(0x0443,0x0441,0x043F,0x0435,0x0445)
+        $wAnd = Uc @(0x0438)
+        # RU auditpol: "Успех и сбой" (older builds) or "Успех и отказ" (common on Server 2016+ RU).
+        $failureWords = @(
+            (Uc @(0x0441,0x0431,0x043E,0x0439)),
+            (Uc @(0x043E,0x0442,0x043A,0x0430,0x0437))
+        )
+        foreach ($wFail in $failureWords) {
+            $p1 = '(?i)' + [regex]::Escape($wSuccess) + '\s+' + [regex]::Escape($wAnd) + '\s+' + [regex]::Escape($wFail)
+            $p2 = '(?i)' + [regex]::Escape($wSuccess) + '\s*' + [regex]::Escape($wAnd) + '\s*' + [regex]::Escape($wFail)
+            if ($Line -match $p1 -or $Line -match $p2) { return $true }
+        }
         if (($Line -match '(?i)Success') -and ($Line -match '(?i)Failure')) { return $true }
         return $false
     }
@@ -1243,6 +1248,23 @@ function Enable-SecurityAudit {
         return $true
     }
 
+    # Locale-neutral subcategory GUIDs (Logon / Logoff).
+    function Ensure-LogonLogoffSubcategoriesByGuid {
+        $targets = @(
+            '0CCE9226-69AE-11D9-BED3-505054503030',
+            '0CCE9227-69AE-11D9-BED3-505054503030'
+        )
+        foreach ($guid in $targets) {
+            $setArgs = ('/set /subcategory:{{{0}}} /success:enable /failure:enable' -f $guid)
+            $set = Invoke-AuditPol -Arguments $setArgs
+            if ($set.ExitCode -ne 0) {
+                Write-Log ("auditpol GUID SET FAIL (code {0}): {1}`n{2}" -f $set.ExitCode, $setArgs, $set.Text)
+                return $false
+            }
+        }
+        return $true
+    }
+
     $preferRu = Test-RussianUiPreferred
 
     if ($preferRu) {
@@ -1258,12 +1280,10 @@ function Enable-SecurityAudit {
         return
     }
 
-    # Logon/Logoff category GUID (not a user id).
-    Write-Log "Trying Logon/Logoff category set via known GUID (fallback)..."
-    $logonLogoffCategoryGuid = "69979849-797A-11D9-BED3-505054503030"
-    $guidSet = Invoke-AuditPol -Arguments ("/set /category:`"$logonLogoffCategoryGuid`" /success:enable /failure:enable")
-    if ($guidSet.ExitCode -ne 0) {
-        Write-Log ("auditpol GUID SET FAIL (code {0}):`n{1}" -f $guidSet.ExitCode, $guidSet.Text)
+    Write-Log "Trying Logon/Logoff subcategories via known GUIDs (locale-neutral fallback)..."
+    if (Ensure-LogonLogoffSubcategoriesByGuid) {
+        Write-Log "Audit policy (GUID): OK for Logon/Logoff subcategories."
+        return
     }
 
     Write-Log "WARNING: could not configure logon/logoff auditing via auditpol automatically. The script will continue; check audit policy in local/domain GPO."
