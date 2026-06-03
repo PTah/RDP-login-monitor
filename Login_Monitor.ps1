@@ -89,7 +89,7 @@ $script:SkipLogDetailLimit = 15
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "2.0.14-SAC"
+$ScriptVersion = "2.0.15-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -978,7 +978,7 @@ function Send-MonitorNotification {
         [string]$SacTitle = '',
         [string]$SacSummary = '',
         [hashtable]$SacDetails = $null,
-        [datetime]$SacOccurredAt = $null
+        $SacOccurredAt = $null
     )
 
     $title = if (-not [string]::IsNullOrWhiteSpace($SacTitle)) { $SacTitle } else { $EmailSubject }
@@ -992,8 +992,19 @@ function Send-MonitorNotification {
     if ($script:SacClientLoaded -and (Get-Command Send-NotifyOrSac -ErrorAction SilentlyContinue)) {
         $sacMode = Get-SacNormalizedMode
         if ($sacMode -ne 'off') {
-            return Send-NotifyOrSac -EventType $etype -Severity $SacSeverity -Title $title -Summary $summary `
-                -TelegramMessage $Message -EmailSubject $EmailSubject -Details $SacDetails -OccurredAt $SacOccurredAt
+            $sacNotifyArgs = @{
+                EventType       = $etype
+                Severity        = $SacSeverity
+                Title           = $title
+                Summary         = $summary
+                TelegramMessage = $Message
+                EmailSubject    = $EmailSubject
+                Details         = $SacDetails
+            }
+            if ($null -ne $SacOccurredAt) {
+                $sacNotifyArgs['OccurredAt'] = $SacOccurredAt
+            }
+            return Send-NotifyOrSac @sacNotifyArgs
         }
     }
 

@@ -342,7 +342,7 @@ function New-SacEventPayload {
         [Parameter(Mandatory = $true)][string]$Title,
         [Parameter(Mandatory = $true)][string]$Summary,
         [hashtable]$Details = $null,
-        [datetime]$OccurredAt = $null
+        $OccurredAt = $null
     )
 
     $Title = Limit-SacString -Text $Title -MaxLen 256 -Label 'title'
@@ -656,7 +656,7 @@ function Send-SacEvent {
         [Parameter(Mandatory = $true)][string]$Title,
         [Parameter(Mandatory = $true)][string]$Summary,
         [hashtable]$Details = $null,
-        [datetime]$OccurredAt = $null
+        $OccurredAt = $null
     )
 
     if (-not (Test-SacConfigured)) {
@@ -669,7 +669,17 @@ function Send-SacEvent {
         $mergedDetails = $null
     }
 
-    $payload = $(New-SacEventPayload -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $mergedDetails -OccurredAt $OccurredAt)
+    $payloadArgs = @{
+        EventType = $EventType
+        Severity  = $Severity
+        Title     = $Title
+        Summary   = $Summary
+        Details   = $mergedDetails
+    }
+    if ($null -ne $OccurredAt) {
+        $payloadArgs['OccurredAt'] = $OccurredAt
+    }
+    $payload = $(New-SacEventPayload @payloadArgs)
     if ($payload -is [System.Array]) {
         $payload = $payload[-1]
     }
@@ -731,6 +741,29 @@ function Merge-SacNotifyDetails {
     return $merged
 }
 
+function Get-SacEventInvokeArgs {
+    param(
+        [Parameter(Mandatory = $true)][string]$EventType,
+        [Parameter(Mandatory = $true)][string]$Severity,
+        [Parameter(Mandatory = $true)][string]$Title,
+        [Parameter(Mandatory = $true)][string]$Summary,
+        [hashtable]$Details = $null,
+        $OccurredAt = $null
+    )
+
+    $args = @{
+        EventType = $EventType
+        Severity  = $Severity
+        Title     = $Title
+        Summary   = $Summary
+        Details   = $Details
+    }
+    if ($null -ne $OccurredAt) {
+        $args['OccurredAt'] = $OccurredAt
+    }
+    return $args
+}
+
 function Send-NotifyOrSac {
     param(
         [Parameter(Mandatory = $true)][string]$EventType,
@@ -740,7 +773,7 @@ function Send-NotifyOrSac {
         [string]$TelegramMessage = '',
         [string]$EmailSubject = 'RDP Login Monitor',
         [hashtable]$Details = $null,
-        [datetime]$OccurredAt = $null
+        $OccurredAt = $null
     )
 
     if ([string]::IsNullOrWhiteSpace($TelegramMessage)) {
@@ -755,7 +788,7 @@ function Send-NotifyOrSac {
             return $false
         }
         $hbDetails = Merge-SacNotifyDetails -Details $Details -TelegramVia 'sac'
-        return (Send-SacEvent -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $hbDetails -OccurredAt $OccurredAt)
+        return (Send-SacEvent @ (Get-SacEventInvokeArgs -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $hbDetails -OccurredAt $OccurredAt))
     }
 
     switch ($mode) {
@@ -764,16 +797,16 @@ function Send-NotifyOrSac {
         }
         'exclusive' {
             $merged = Merge-SacNotifyDetails -Details $Details -TelegramVia 'sac'
-            return (Send-SacEvent -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $merged -OccurredAt $OccurredAt)
+            return (Send-SacEvent @ (Get-SacEventInvokeArgs -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $merged -OccurredAt $OccurredAt))
         }
         'dual' {
             $merged = Merge-SacNotifyDetails -Details $Details -TelegramVia 'agent'
-            Send-SacEvent -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $merged -OccurredAt $OccurredAt | Out-Null
+            Send-SacEvent @ (Get-SacEventInvokeArgs -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $merged -OccurredAt $OccurredAt) | Out-Null
             return (Send-SacLocalChannels -TelegramMessage $TelegramMessage -EmailSubject $EmailSubject)
         }
         'fallback' {
             $merged = Merge-SacNotifyDetails -Details $Details -TelegramVia 'sac'
-            if (Send-SacEvent -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $merged -OccurredAt $OccurredAt) {
+            if (Send-SacEvent @ (Get-SacEventInvokeArgs -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $merged -OccurredAt $OccurredAt)) {
                 return $true
             }
             return (Send-SacLocalChannels -TelegramMessage $TelegramMessage -EmailSubject $EmailSubject)
