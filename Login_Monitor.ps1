@@ -89,7 +89,7 @@ $script:SkipLogDetailLimit = 15
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "2.0.17-SAC"
+$ScriptVersion = "2.0.18-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -1831,23 +1831,49 @@ function Expand-DailyReportActiveUserEntries {
     return ,@($out)
 }
 
+function Test-QuserEmptySessionsMessage {
+    param([string]$Line)
+    if ([string]::IsNullOrWhiteSpace($Line)) { return $false }
+    $t = $Line.Trim()
+    if ($t -match '(?i)No user(s)? exist(s)? for \*') { return $true }
+    if ($t -match '(?i)Не существуют пользователи для \*') { return $true }
+    if ($t -match '(?i)Пользователи отсутствуют') { return $true }
+    return $false
+}
+
 function Get-DailyReportActiveUsersFromQuser {
     $lines = [System.Collections.Generic.List[string]]::new()
     $quserExe = Join-Path $env:SystemRoot 'System32\quser.exe'
     if (-not (Test-Path -LiteralPath $quserExe)) {
         return ,$lines
     }
-    $quserOutput = @(& $quserExe 2>$null)
-    if (-not $quserOutput -or $quserOutput.Count -le 1) {
+    $prevEa = $ErrorActionPreference
+    $quserOutput = @()
+    try {
+        $ErrorActionPreference = 'SilentlyContinue'
+        # quser пишет «No users exist for *» в stderr; при $ErrorActionPreference Stop это рвало отчёт.
+        $quserOutput = @(& $quserExe 2>&1)
+    } catch {
+        Write-Log "Daily report: quser failed (ignored): $($_.Exception.Message)"
+        return ,$lines
+    } finally {
+        $ErrorActionPreference = $prevEa
+    }
+    $dataLines = @(
+        $quserOutput | ForEach-Object { [string]$_ } | Where-Object {
+            -not [string]::IsNullOrWhiteSpace($_) -and -not (Test-QuserEmptySessionsMessage -Line $_)
+        }
+    )
+    if ($dataLines.Count -le 1) {
         return ,$lines
     }
-    foreach ($raw in @($quserOutput | Select-Object -Skip 1)) {
+    foreach ($raw in @($dataLines | Select-Object -Skip 1)) {
         $line = ($raw -replace '\s+', ' ').Trim()
         if ([string]::IsNullOrWhiteSpace($line)) { continue }
         $parts = $line -split ' ', 2
         if ($parts.Count -lt 1) { continue }
-        $u = $parts[0].Trim()
-        if ([string]::IsNullOrWhiteSpace($u) -or $u -eq 'USERNAME') { continue }
+        $u = $parts[0].Trim().TrimStart('>')
+        if ([string]::IsNullOrWhiteSpace($u) -or $u -eq 'USERNAME' -or $u -eq 'ИМЯ') { continue }
         $lines.Add(('👤 {0}' -f $u)) | Out-Null
     }
     return ,$lines
@@ -1888,7 +1914,7 @@ function Build-DailyReportPlainBodyWindows {
     if ($userCount -gt 0) {
         foreach ($u in $ActiveUsers) { [void]$sb.AppendLine(" $u") }
     } else {
-        [void]$sb.AppendLine(' (нет данных)')
+        [void]$sb.AppendLine(' (нет активных пользователей / RDP-сессий)')
     }
     [void]$sb.AppendLine('')
     [void]$sb.AppendLine((Get-AgentNotificationSourcePlainLine))
@@ -3321,8 +3347,8 @@ function Format-RDGatewayEvent {
 }
 
 function Send-DailyReport {
+    $reportTime = Get-Date
     try {
-        $reportTime = Get-Date
         $stats = Get-DailyReportAuthStats24h
         $activeUsers = Expand-DailyReportActiveUserEntries -Entries @(Get-DailyReportActiveUsersFromQuser)
         $plainBody = Build-DailyReportPlainBodyWindows -Stats $stats -ActiveUsers $activeUsers -ReportTime $reportTime
@@ -3360,7 +3386,7 @@ function Send-DailyReport {
             -SacSummary "RDP 24ч: успех $($stats.rdp_success), неудач $($stats.rdp_failed), банов $($stats.active_bans)" `
             -SacDetails $rdpReportDetails | Out-Null
         Write-TextFileUtf8Bom -Path $LastReportFile -Text ($reportTime.ToString('yyyy-MM-dd HH:mm:ss'))
-        Write-Log "Ежедневный отчет отправлен"
+        Write-Log "Ежедневный отчет отправлен (активных сессий: $($activeUsers.Count))"
         return $true
     } catch {
         Write-Log "Ошибка ежедневного отчета: $($_.Exception.Message)"
@@ -3395,8 +3421,21 @@ function Read-LastDailyReportSentDate {
     }
 }
 
-function Try-ClaimDailyReportSlotToday {
-    param([datetime]$Now)
+function Check-AndSendDailyReport {
+    if (-not (Test-DailyReportEnabledFlag)) {
+        return (Get-NextLocalSlotBoundary -Hour $DailyReportHour -Minute $DailyReportMinute)
+    }
+
+    $now = Get-Date
+    $reportSlotToday = Get-Date -Year $now.Year -Month $now.Month -Day $now.Day -Hour $DailyReportHour -Minute $DailyReportMinute -Second 0
+    if ($now -lt $reportSlotToday) {
+        return (Get-NextLocalSlotBoundary -Hour $DailyReportHour -Minute $DailyReportMinute)
+    }
+
+    $lastDate = Read-LastDailyReportSentDate
+    if ($null -ne $lastDate -and $lastDate -ge $now.Date) {
+        return (Get-NextLocalSlotBoundary -Hour $DailyReportHour -Minute $DailyReportMinute)
+    }
 
     $lockPath = Join-Path $script:InstallRoot 'Logs\.daily_report_claim.lock'
     $lockStream = $null
@@ -3409,40 +3448,24 @@ function Try-ClaimDailyReportSlotToday {
         )
     } catch {
         Write-Log 'Ежедневный отчёт: другой процесс уже отправляет (lock).'
-        return $false
+        return (Get-NextLocalSlotBoundary -Hour $DailyReportHour -Minute $DailyReportMinute)
     }
 
     try {
         $lastDate = Read-LastDailyReportSentDate
-        if ($null -ne $lastDate -and $lastDate -ge $Now.Date) {
-            return $false
+        if ($null -ne $lastDate -and $lastDate -ge $now.Date) {
+            return (Get-NextLocalSlotBoundary -Hour $DailyReportHour -Minute $DailyReportMinute)
         }
-        Write-TextFileUtf8Bom -Path $LastReportFile -Text ($Now.ToString('yyyy-MM-dd'))
-        return $true
+        if (-not (Send-DailyReport)) {
+            Write-Log 'Ежедневный отчёт: отправка не удалась, повтор на следующем цикле мониторинга.'
+        }
+    } catch {
+        Write-Log "Ежедневный отчёт: lock/send error: $($_.Exception.Message)"
     } finally {
         if ($null -ne $lockStream) {
             $lockStream.Dispose()
         }
         Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue
-    }
-}
-
-function Check-AndSendDailyReport {
-    if (-not (Test-DailyReportEnabledFlag)) {
-        return (Get-NextLocalSlotBoundary -Hour $DailyReportHour -Minute $DailyReportMinute)
-    }
-
-    $now = Get-Date
-    $reportSlotToday = Get-Date -Year $now.Year -Month $now.Month -Day $now.Day -Hour $DailyReportHour -Minute $DailyReportMinute -Second 0
-    $shouldSend = $false
-    if ($now -ge $reportSlotToday) {
-        $lastDate = Read-LastDailyReportSentDate
-        if ($null -eq $lastDate -or $lastDate -lt $now.Date) {
-            $shouldSend = $true
-        }
-    }
-    if ($shouldSend -and (Try-ClaimDailyReportSlotToday -Now $now)) {
-        Send-DailyReport | Out-Null
     }
 
     return (Get-NextLocalSlotBoundary -Hour $DailyReportHour -Minute $DailyReportMinute)
