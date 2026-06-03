@@ -64,7 +64,7 @@ ${Ignore4624-LT3-EmptyIP-Event} = $false
 # --- Ротация login_monitor.log и хранение бэкапов (Logs\Backup\LoginLog_*.bak) ---
 # $LogRotationHour = 0
 # $LogRotationMinute = 0
-# $MaxBackupDays = 31
+$MaxBackupDays = 31
 
 # --- Блокировка учётной записи AD (4740) + IP из IIS ActiveSync ---
 # Мониторинг включается только на КД с именем $LockoutMonitorDomainController.

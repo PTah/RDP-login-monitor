@@ -634,7 +634,53 @@ function Invoke-RdpMonitorSettingsPostPatches {
     if (Sync-RdpMonitorSettingsExchangeNoisePatches -LocalSettings $LocalSettings) { $changed = $true }
     if (Repair-RdpMonitorSettingsWinRmLinesIfInvalid -LocalSettings $LocalSettings) { $changed = $true }
     if (Sync-RdpMonitorSettingsWinRmInboundBlock -LocalSettings $LocalSettings) { $changed = $true }
+    if (Sync-RdpMonitorSettingsMaxBackupDaysIfMissing -LocalSettings $LocalSettings) { $changed = $true }
     return $changed
+}
+
+function Test-RdpMonitorSettingsNeedsMaxBackupDays {
+    param([string]$SettingsPath)
+    if (-not (Test-Path -LiteralPath $SettingsPath)) { return $false }
+    $c = Get-RdpMonitorSettingsRaw -Path $SettingsPath
+    if ([string]::IsNullOrWhiteSpace($c)) { return $true }
+    return ($c -notmatch '(?m)^\s*\$MaxBackupDays\s*=')
+}
+
+function Sync-RdpMonitorSettingsMaxBackupDaysIfMissing {
+    param([string]$LocalSettings)
+
+    if (-not (Test-RdpMonitorSettingsNeedsMaxBackupDays -SettingsPath $LocalSettings)) {
+        return $false
+    }
+
+    $c = Get-RdpMonitorSettingsRaw -Path $LocalSettings
+    $block = @(
+        '# --- Ротация login_monitor.log и хранение бэкапов (Logs\Backup\LoginLog_*.bak) ---'
+        '# $LogRotationHour = 0'
+        '# $LogRotationMinute = 0'
+        '$MaxBackupDays = 31'
+    ) -join "`r`n"
+
+    $bak = "$LocalSettings.bak.$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+    if (Test-Path -LiteralPath $LocalSettings) {
+        Copy-Item -LiteralPath $LocalSettings -Destination $bak -Force
+        Write-DeployLog "Добавление `$MaxBackupDays в login_monitor.settings.ps1; резервная копия: $bak"
+    } else {
+        Write-DeployLog "Создание login_monitor.settings.ps1 с `$MaxBackupDays = 31"
+    }
+
+    $insertBefore4740 = '(?m)^\s*#\s*---\s*Блокировка учётной записи AD'
+    if (-not [string]::IsNullOrWhiteSpace($c) -and $c -match $insertBefore4740) {
+        $newContent = [regex]::Replace($c, $insertBefore4740, ($block + "`r`n`r`n" + '$0'), 1)
+    } elseif (-not [string]::IsNullOrWhiteSpace($c)) {
+        $newContent = ($c.TrimEnd() + "`r`n`r`n" + $block + "`r`n")
+    } else {
+        $newContent = ($block + "`r`n")
+    }
+
+    [System.IO.File]::WriteAllText($LocalSettings, $newContent.TrimEnd() + "`r`n", $Utf8Bom)
+    Write-DeployLog "login_monitor.settings.ps1: добавлен `$MaxBackupDays = 31"
+    return $true
 }
 
 function Update-RdpMonitorSettingsServerDisplayNameHintIfMissing {

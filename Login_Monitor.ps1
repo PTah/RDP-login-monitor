@@ -89,12 +89,11 @@ $script:SkipLogDetailLimit = 15
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "2.0.12-SAC"
+$ScriptVersion = "2.0.13-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
 $LogBackupFolder = Join-Path $script:InstallRoot "Logs\Backup"
-$MaxBackupDays = 31
 
 # Ротация login_monitor.log (ежедневно в указанное локальное время) и срок хранения бэкапов LoginLog_*.bak
 $LogRotationHour = 0
