@@ -82,7 +82,7 @@ $script:MonitorStopRequested = $false
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "2.0.7-SAC"
+$ScriptVersion = "2.0.8-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -2884,17 +2884,111 @@ function Test-RdpMonitorStringLooksLikeIPv4 {
     return [bool]($t -match '^(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)$')
 }
 
+function Get-RdpMonitorNormalizedClientIp {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $Value }
+    $v = $Value.Trim()
+    if ($v -match '^(?<ip>(?:\d{1,3}\.){3}\d{1,3}):\d+$') {
+        return $Matches['ip']
+    }
+    return $v
+}
+
+function Get-RDGatewayUserDataEventInfoMap {
+    param($Event)
+
+    $map = @{}
+    try {
+        $xml = [xml]$Event.ToXml()
+        $userData = $xml.Event.UserData
+        if ($null -eq $userData) { return $map }
+
+        $eventInfo = $userData.EventInfo
+        if ($null -eq $eventInfo) {
+            foreach ($child in @($userData.ChildNodes)) {
+                if ($null -ne $child -and $child.LocalName -eq 'EventInfo') {
+                    $eventInfo = $child
+                    break
+                }
+            }
+        }
+        if ($null -eq $eventInfo) { return $map }
+
+        foreach ($node in @($eventInfo.ChildNodes)) {
+            if ($null -eq $node -or $node.NodeType -ne [System.Xml.XmlNodeType]::Element) { continue }
+            $map[$node.LocalName] = [string]$node.InnerText
+        }
+    } catch { }
+    return $map
+}
+
+function Get-RDGatewayEventInfoMapValue {
+    param(
+        [hashtable]$Map,
+        [string[]]$Keys
+    )
+    foreach ($key in $Keys) {
+        foreach ($mapKey in $Map.Keys) {
+            if ($mapKey -ieq $key) {
+                $v = [string]$Map[$mapKey]
+                if (-not [string]::IsNullOrWhiteSpace($v)) { return $v.Trim() }
+            }
+        }
+    }
+    return $null
+}
+
+function Test-Rdg303ShouldSkipNotify {
+    param([hashtable]$EventInfo)
+
+    if ($EventInfo.EventId -ne 303) { return $false }
+    $dur = [int]$EventInfo.SessionDurationSec
+    if ($dur -le 0) {
+        return $true
+    }
+    return $false
+}
+
 function Get-RDGatewayEventInfo {
     param($Event)
     $eventData = @{
+        EventId = [int]$Event.Id
         TimeCreated = $Event.TimeCreated
         Username = "N/A"
         ExternalIP = "N/A"
         InternalIP = "N/A"
         Protocol = "N/A"
         ErrorCode = "N/A"
+        SessionDurationSec = 0
+        BytesReceived = 0
+        BytesTransferred = 0
     }
     try {
+        $infoMap = Get-RDGatewayUserDataEventInfoMap -Event $Event
+        if ($infoMap.Count -gt 0) {
+            $u = Get-RDGatewayEventInfoMapValue -Map $infoMap -Keys @('Username', 'User')
+            $ext = Get-RDGatewayEventInfoMapValue -Map $infoMap -Keys @('IpAddress', 'ClientAddress', 'ClientIP')
+            $int = Get-RDGatewayEventInfoMapValue -Map $infoMap -Keys @('Resource', 'TargetServer', 'TargetName')
+            $proto = Get-RDGatewayEventInfoMapValue -Map $infoMap -Keys @('ConnectionProtocol', 'Protocol', 'Transport')
+            $err = Get-RDGatewayEventInfoMapValue -Map $infoMap -Keys @('ErrorCode', 'StatusCode', 'Error')
+
+            if ($u) { $eventData.Username = $u }
+            if ($ext) { $eventData.ExternalIP = (Get-RdpMonitorNormalizedClientIp -Value $ext) }
+            if ($int) { $eventData.InternalIP = $int }
+            if ($proto) { $eventData.Protocol = $proto }
+            if ($err) { $eventData.ErrorCode = $err }
+            elseif ($Event.Id -eq 302) { $eventData.ErrorCode = '0' }
+
+            $bytesRx = Get-RDGatewayEventInfoMapValue -Map $infoMap -Keys @('BytesReceived')
+            $bytesTx = Get-RDGatewayEventInfoMapValue -Map $infoMap -Keys @('BytesTransfered', 'BytesTransferred')
+            $dur = Get-RDGatewayEventInfoMapValue -Map $infoMap -Keys @('SessionDuration', 'SessionDurationSec')
+            if ($bytesRx) { $eventData.BytesReceived = (Convert-ToIntSafe -Value $bytesRx) }
+            if ($bytesTx) { $eventData.BytesTransferred = (Convert-ToIntSafe -Value $bytesTx) }
+            if ($dur) { $eventData.SessionDurationSec = (Convert-ToIntSafe -Value $dur) }
+
+            return $eventData
+        }
+
         $map = Get-EventDataMap -Event $Event
         $lc = @{}
         foreach ($k in $map.Keys) {
@@ -2917,64 +3011,11 @@ function Get-RDGatewayEventInfo {
         $err = Get-RdpGwMapVal @('errorcode','statuscode','error','resultcode','status')
 
         if ($u) { $eventData.Username = $u }
-        if ($ext) { $eventData.ExternalIP = $ext }
+        if ($ext) { $eventData.ExternalIP = (Get-RdpMonitorNormalizedClientIp -Value $ext) }
         if ($int) { $eventData.InternalIP = $int }
         if ($proto) { $eventData.Protocol = $proto }
         if ($err) { $eventData.ErrorCode = $err }
-
-        $fillFromProps = ($lc.Count -eq 0) -or (
-            (($eventData.InternalIP -eq 'N/A' -or [string]::IsNullOrWhiteSpace($eventData.InternalIP)) -and (
-                    ($eventData.Protocol -eq 'N/A' -or [string]::IsNullOrWhiteSpace($eventData.Protocol)) -or
-                    (Test-RdpMonitorStringLooksLikeIPv4 $eventData.Protocol)
-                ))
-        )
-
-        if ($fillFromProps) {
-            switch ($Event.Id) {
-                302 {
-                    if ($Event.Properties.Count -gt 0) { $eventData.Username = [string]$Event.Properties[0].Value }
-                    if ($Event.Properties.Count -gt 1) { $eventData.ExternalIP = [string]$Event.Properties[1].Value }
-                    if ($Event.Properties.Count -gt 2) {
-                        $p2 = [string]$Event.Properties[2].Value
-                        $p3 = if ($Event.Properties.Count -gt 3) { [string]$Event.Properties[3].Value } else { '' }
-                        $p4 = if ($Event.Properties.Count -gt 4) { [string]$Event.Properties[4].Value } else { '' }
-                        if ([string]::IsNullOrWhiteSpace($p2) -and (Test-RdpMonitorStringLooksLikeIPv4 $p3)) {
-                            $eventData.InternalIP = $p3.Trim()
-                            if (-not [string]::IsNullOrWhiteSpace($p4)) {
-                                $eventData.Protocol = $p4.Trim()
-                            }
-                        } else {
-                            $eventData.InternalIP = $p2.Trim()
-                            if (-not [string]::IsNullOrWhiteSpace($p3)) { $eventData.Protocol = $p3.Trim() }
-                        }
-                    }
-                    $eventData.ErrorCode = "0"
-                }
-                303 {
-                    if ($Event.Properties.Count -gt 0) { $eventData.Username = [string]$Event.Properties[0].Value }
-                    if ($Event.Properties.Count -gt 1) { $eventData.ExternalIP = [string]$Event.Properties[1].Value }
-                    if ($Event.Properties.Count -gt 2) {
-                        $p2 = [string]$Event.Properties[2].Value
-                        $p3 = if ($Event.Properties.Count -gt 3) { [string]$Event.Properties[3].Value } else { '' }
-                        if ([string]::IsNullOrWhiteSpace($p2) -and (Test-RdpMonitorStringLooksLikeIPv4 $p3)) {
-                            $eventData.InternalIP = $p3.Trim()
-                            if ($Event.Properties.Count -gt 4) { $eventData.ErrorCode = [string]$Event.Properties[4].Value }
-                            if ($Event.Properties.Count -gt 5) { $eventData.Protocol = [string]$Event.Properties[5].Value }
-                        } else {
-                            $eventData.InternalIP = $p2.Trim()
-                            if (-not [string]::IsNullOrWhiteSpace($p3)) { $eventData.Protocol = $p3.Trim() }
-                            if ($Event.Properties.Count -gt 4) { $eventData.ErrorCode = [string]$Event.Properties[4].Value }
-                        }
-                    }
-                }
-            }
-        } elseif ($Event.Id -eq 302 -and $eventData.ErrorCode -eq 'N/A') {
-            $eventData.ErrorCode = "0"
-        }
-
-        if ($Event.Id -eq 303 -and ($eventData.ErrorCode -eq 'N/A' -or [string]::IsNullOrWhiteSpace($eventData.ErrorCode)) -and $Event.Properties.Count -gt 4) {
-            $eventData.ErrorCode = [string]$Event.Properties[4].Value
-        }
+        elseif ($Event.Id -eq 302) { $eventData.ErrorCode = '0' }
 
         if (($eventData.InternalIP -eq 'N/A' -or [string]::IsNullOrWhiteSpace($eventData.InternalIP)) -and
             (Test-RdpMonitorStringLooksLikeIPv4 $eventData.Protocol)) {
@@ -2992,7 +3033,7 @@ function Get-RDGatewayEventInfo {
                     $eventData.Username = [string]$fb.Username
                 }
                 if (($eventData.ExternalIP -eq 'N/A' -or [string]::IsNullOrWhiteSpace($eventData.ExternalIP)) -and $fb.ExternalIP) {
-                    $eventData.ExternalIP = [string]$fb.ExternalIP
+                    $eventData.ExternalIP = (Get-RdpMonitorNormalizedClientIp -Value ([string]$fb.ExternalIP))
                 }
                 if (($eventData.InternalIP -eq 'N/A' -or [string]::IsNullOrWhiteSpace($eventData.InternalIP)) -and $fb.InternalIP) {
                     $eventData.InternalIP = [string]$fb.InternalIP
@@ -3016,7 +3057,8 @@ function Format-RDGatewayEvent {
         [string]$InternalIP,
         [string]$Protocol,
         [string]$ErrorCode,
-        [datetime]$TimeCreated
+        [datetime]$TimeCreated,
+        [int]$SessionDurationSec = 0
     )
 
     $hUser = (ConvertTo-TelegramHtml $Username)
@@ -3041,7 +3083,10 @@ function Format-RDGatewayEvent {
     $message += "🌐 IP пользователя (внешний): $hExt`r`n"
     $message += "🖥️ IP внутренний: $hInt`r`n"
     $message += "🔌 Протокол: $hProto`r`n"
-    if ($EventID -eq 303 -and $ErrorCode -ne "0" -and $ErrorCode -ne "N/A") {
+    if ($EventID -eq 303 -and $SessionDurationSec -gt 0) {
+        $message += "⏱️ Длительность сессии: $(ConvertTo-TelegramHtml ([string]$SessionDurationSec)) с`r`n"
+    }
+    if ($EventID -eq 303 -and $ErrorCode -ne "0" -and $ErrorCode -ne "N/A" -and -not [string]::IsNullOrWhiteSpace($ErrorCode)) {
         $message += "⚠️ Код ошибки: $(ConvertTo-TelegramHtml $ErrorCode)`r`n"
     }
     $message += "🕐 Время: $hTime`r`n"
@@ -3604,13 +3649,18 @@ function Start-LoginMonitor {
                             Write-Log "Skip RDG $($event.Id): machine account $($ei.Username)"
                             continue
                         }
+                        if (Test-Rdg303ShouldSkipNotify -EventInfo $ei) {
+                            Write-Log "Skip RDG 303: ephemeral channel (SessionDuration=0, User=$($ei.Username), Target=$($ei.InternalIP), ErrorCode=$($ei.ErrorCode))"
+                            continue
+                        }
                         $msg = Format-RDGatewayEvent -EventID $event.Id `
                             -Username $ei.Username `
                             -ExternalIP $ei.ExternalIP `
                             -InternalIP $ei.InternalIP `
                             -Protocol $ei.Protocol `
                             -ErrorCode $ei.ErrorCode `
-                            -TimeCreated $ei.TimeCreated
+                            -TimeCreated $ei.TimeCreated `
+                            -SessionDurationSec $ei.SessionDurationSec
                         $hasRdgError = ($ei.ErrorCode -ne '0' -and $ei.ErrorCode -ne 'N/A' -and -not [string]::IsNullOrWhiteSpace($ei.ErrorCode))
                         if ($event.Id -eq 302) {
                             $rdgType = 'rdg.connection.success'
@@ -3634,6 +3684,9 @@ function Start-LoginMonitor {
                                 internal_ip = $ei.InternalIP
                                 protocol = $ei.Protocol
                                 gateway_error_code = $ei.ErrorCode
+                                session_duration_sec = [int]$ei.SessionDurationSec
+                                bytes_received = [int]$ei.BytesReceived
+                                bytes_transferred = [int]$ei.BytesTransferred
                                 event_id_windows = [int]$event.Id
                             } | Out-Null
                         $gatewayNotified++
