@@ -788,7 +788,8 @@ function Send-NotifyOrSac {
             return $false
         }
         $hbDetails = Merge-SacNotifyDetails -Details $Details -TelegramVia 'sac'
-        return (Send-SacEvent @ (Get-SacEventInvokeArgs -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $hbDetails -OccurredAt $OccurredAt))
+        $sacEventArgs = Get-SacEventInvokeArgs -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $hbDetails -OccurredAt $OccurredAt
+        return (Send-SacEvent @sacEventArgs)
     }
 
     switch ($mode) {
@@ -797,16 +798,19 @@ function Send-NotifyOrSac {
         }
         'exclusive' {
             $merged = Merge-SacNotifyDetails -Details $Details -TelegramVia 'sac'
-            return (Send-SacEvent @ (Get-SacEventInvokeArgs -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $merged -OccurredAt $OccurredAt))
+            $sacEventArgs = Get-SacEventInvokeArgs -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $merged -OccurredAt $OccurredAt
+            return (Send-SacEvent @sacEventArgs)
         }
         'dual' {
             $merged = Merge-SacNotifyDetails -Details $Details -TelegramVia 'agent'
-            Send-SacEvent @ (Get-SacEventInvokeArgs -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $merged -OccurredAt $OccurredAt) | Out-Null
+            $sacEventArgs = Get-SacEventInvokeArgs -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $merged -OccurredAt $OccurredAt
+            Send-SacEvent @sacEventArgs | Out-Null
             return (Send-SacLocalChannels -TelegramMessage $TelegramMessage -EmailSubject $EmailSubject)
         }
         'fallback' {
             $merged = Merge-SacNotifyDetails -Details $Details -TelegramVia 'sac'
-            if (Send-SacEvent @ (Get-SacEventInvokeArgs -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $merged -OccurredAt $OccurredAt)) {
+            $sacEventArgs = Get-SacEventInvokeArgs -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $merged -OccurredAt $OccurredAt
+            if (Send-SacEvent @sacEventArgs) {
                 return $true
             }
             return (Send-SacLocalChannels -TelegramMessage $TelegramMessage -EmailSubject $EmailSubject)
