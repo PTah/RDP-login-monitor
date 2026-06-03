@@ -500,6 +500,41 @@ function Test-RdpMonitorSettingsNeedsWinRmInboundBlock {
     return $false
 }
 
+function Repair-RdpMonitorSettingsWinRmLinesIfInvalid {
+    param([string]$LocalSettings)
+    if (-not (Test-Path -LiteralPath $LocalSettings)) { return $false }
+
+    $c = Get-RdpMonitorSettingsRaw -Path $LocalSettings
+    if ([string]::IsNullOrWhiteSpace($c)) { return $false }
+
+    $winRmNames = @(
+        'EnableWinRmInboundMonitoring',
+        'WinRmLogName',
+        'WinRmInboundShellEventIds',
+        'WinRmCorrelateSecurity4624',
+        'WinRm4624CorrelationWindowSeconds',
+        'WinRmIgnoreLocalSource',
+        'WinRmIgnoreMachineAccounts'
+    )
+    $newContent = $c
+    $fixed = $false
+    foreach ($name in $winRmNames) {
+        $escaped = [regex]::Escape($name)
+        $pattern = "(?m)^(\s*)(?<![\$])$escaped(\s*=)"
+        if ($newContent -match $pattern) {
+            $newContent = [regex]::Replace($newContent, $pattern, ('${1}$' + $name + '${2}'))
+            $fixed = $true
+        }
+    }
+    if (-not $fixed) { return $false }
+
+    $bak = "$LocalSettings.bak.$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+    Copy-Item -LiteralPath $LocalSettings -Destination $bak -Force
+    [System.IO.File]::WriteAllText($LocalSettings, $newContent.TrimEnd() + "`r`n", $Utf8Bom)
+    Write-DeployLog "login_monitor.settings.ps1: исправлены WinRM-строки без `$ (резервная копия: $bak)"
+    return $true
+}
+
 function Sync-RdpMonitorSettingsWinRmInboundBlock {
     param([string]$LocalSettings)
     if (-not (Test-Path -LiteralPath $LocalSettings)) { return $false }
@@ -597,6 +632,7 @@ function Invoke-RdpMonitorSettingsPostPatches {
     if (Update-RdpMonitorSettingsServerDisplayNameHintIfMissing -LocalSettings $LocalSettings) { $changed = $true }
     if (Sync-RdpMonitorSettingsDailyReportPatches -LocalSettings $LocalSettings) { $changed = $true }
     if (Sync-RdpMonitorSettingsExchangeNoisePatches -LocalSettings $LocalSettings) { $changed = $true }
+    if (Repair-RdpMonitorSettingsWinRmLinesIfInvalid -LocalSettings $LocalSettings) { $changed = $true }
     if (Sync-RdpMonitorSettingsWinRmInboundBlock -LocalSettings $LocalSettings) { $changed = $true }
     return $changed
 }

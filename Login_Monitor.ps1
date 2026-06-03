@@ -82,7 +82,7 @@ $script:MonitorStopRequested = $false
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "2.0.8-SAC"
+$ScriptVersion = "2.0.9-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -230,10 +230,6 @@ $SacFallbackFailures = 5
 
 $script:LoginMonitorSettingsFile = Join-Path $script:InstallRoot 'login_monitor.settings.ps1'
 $script:LoginMonitorSettingsLoaded = $false
-if (Test-Path -LiteralPath $script:LoginMonitorSettingsFile) {
-    . $script:LoginMonitorSettingsFile
-    $script:LoginMonitorSettingsLoaded = $true
-}
 
 # ============================================
 # ИНИЦИАЛИЗАЦИЯ
@@ -655,6 +651,24 @@ if ($InstallTasks) {
     exit 0
 }
 
+function Import-LoginMonitorSettingsFile {
+    if ($script:LoginMonitorSettingsLoaded) { return $true }
+    if (-not (Test-Path -LiteralPath $script:LoginMonitorSettingsFile)) { return $false }
+    try {
+        . $script:LoginMonitorSettingsFile
+        $script:LoginMonitorSettingsLoaded = $true
+        return $true
+    } catch {
+        $msg = $_.Exception.Message
+        if (Get-Command Write-Log -ErrorAction SilentlyContinue) {
+            Write-Log "ОШИБКА: login_monitor.settings.ps1 — $msg"
+        } else {
+            Write-Host "ОШИБКА: login_monitor.settings.ps1 — $msg"
+        }
+        exit 1
+    }
+}
+
 # Только запись restart.request — без проверки администратора (Deploy/GPO может вызывать из SYSTEM).
 if ($RequestRestart) {
     $restartMode = if ($Recycle) { 'recycle' } else { 'settings' }
@@ -662,6 +676,8 @@ if ($RequestRestart) {
     Write-Log "Запрошен graceful restart (mode=$restartMode, файл restart.request). Активный монитор обработает запрос без Stop-Process."
     exit 0
 }
+
+Import-LoginMonitorSettingsFile | Out-Null
 
 # --- Учётные данные Telegram (открытый текст или DPAPI Base64) ---
 if (-not [string]::IsNullOrWhiteSpace($TelegramBotTokenProtectedB64)) {
