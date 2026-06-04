@@ -26,7 +26,7 @@ Get-Content "C:\ProgramData\RDP-login-monitor\Logs\login_monitor.log" -Tail 60
 ## Актуальная схема (рекомендуется)
 
 - Базовый путь установки: **`C:\ProgramData\RDP-login-monitor\`**.
-- Основной скрипт: **`Login_Monitor.ps1`** — журнал Security **`4624`/`4625`** (логика зависит от типа ОС: рабочая станция или сервер/КД), при всплеске **`4625`** — **агрегированные оповещения** (два порога: IP+пользователь и только IP), при наличии журнала — **Remote Connection Manager `1149`** (часто актуально для РС с RDP), **RDS Shadow Control** (`20506`/`20507`/`20510`, severity warning), **WinRM inbound / Enter-PSSession** (Operational `91`, severity warning), при роли **RD Gateway** — **`302`/`303`**, на **КД, где запущен монитор** (имя совпадает с **`$LockoutMonitorDomainController`**) — **`4740`** (блокировка УЗ + IP из IIS ActiveSync), **ежедневный отчёт** (активные сессии через `quser`), **heartbeat**, **ротация логов**, уведомления в Telegram и/или Email.
+- Основной скрипт: **`Login_Monitor.ps1`** — журнал Security **`4624`/`4625`** (логика зависит от типа ОС: рабочая станция или сервер/КД), при всплеске **`4625`** — **агрегированные оповещения** (два порога: IP+пользователь и только IP), при наличии журнала — **Remote Connection Manager `1149`** (часто актуально для РС с RDP), **RDS Shadow Control** (`20506`/`20507`/`20510`, severity warning), **WinRM inbound / Enter-PSSession** (Operational `91`, severity warning), **admin share `C$`/`ADMIN$`** (Security **5140**, severity warning), при роли **RD Gateway** — **`302`/`303`**, на **КД, где запущен монитор** (имя совпадает с **`$LockoutMonitorDomainController`**) — **`4740`** (блокировка УЗ + IP из IIS ActiveSync), **ежедневный отчёт** (активные сессии через `quser`), **heartbeat**, **ротация логов**, уведомления в Telegram и/или Email.
 - Установка задач: запуск **`Login_Monitor.ps1 -InstallTasks`** создаёт:
   - `RDP-Login-Monitor` (основной монитор),
   - `RDP-Login-Monitor-Watchdog` (контроль процесса каждые 5 минут).
@@ -34,7 +34,19 @@ Get-Content "C:\ProgramData\RDP-login-monitor\Logs\login_monitor.log" -Tail 60
 - Документация по развёртыванию: **[Docs/README.md](Docs/README.md)** (RDP-монитор, Exchange, NETLOGON).
 - **`Encrypt-DpapiForRdpMonitor.ps1`** — опционально для подготовки DPAPI-строк токена/chat id и пароля SMTP (`$MailSmtpPasswordProtectedB64` в файле настроек).
 - **Локальные настройки RDP-монитора:** **`login_monitor.settings.ps1`** в каталоге установки (образец **`login_monitor.settings.example.ps1`**). При автообновлении **`Login_Monitor.ps1`** с шары файл настроек **не перезаписывается** (как **`exchange_monitor.settings.ps1`** для Exchange).
-- **Security Alert Center (SAC):** модуль **`Sac-Client.ps1`** (копируется вместе с `Login_Monitor.ps1`). Режимы **`$UseSAC`**: `off` | `exclusive` | `dual` | `fallback` — контракт в репозитории **security-alert-center** (`docs/agent-integration.md`). Версия релиза: **`$ScriptVersion`** и **`version.txt`** (сейчас **2.0.6-SAC**); **`Sac-Client.ps1`** передаёт ту же версию в SAC (`product_version`).
+- **Security Alert Center (SAC):** модуль **`Sac-Client.ps1`** (копируется вместе с `Login_Monitor.ps1`). Режимы **`$UseSAC`**: `off` | `exclusive` | `dual` | `fallback` — контракт в репозитории **security-alert-center** (`docs/agent-integration.md`). Версия релиза: **`$ScriptVersion`** и **`version.txt`** (сейчас **2.0.19-SAC**); **`Sac-Client.ps1`** передаёт ту же версию в SAC (`product_version`).
+
+### Highlights (события в SAC / Telegram)
+
+| Источник | Что ловится | Тип SAC (пример) |
+|----------|-------------|------------------|
+| Security 4624/4625 | RDP/RDS входы | `rdp.login.success` / `rdp.login.failed` |
+| Security **5140** | Доступ к **`C$`**, **`ADMIN$`** | `smb.admin_share.access` |
+| WinRM Operational 91 | Enter-PSSession / PS Remoting | `winrm.session.started` |
+| RCM Operational | RDS Shadow Control | `rdp.shadow.control.*` |
+| RD Gateway | 302/303 | `rdg.connection.*` |
+| Security 4740 | Блокировка УЗ (на заданном КД) | `auth.account.locked` |
+| Агент | Heartbeat, отчёт, lifecycle | `agent.heartbeat`, `report.daily.rdp` |
 
 ## Что изменилось (важное)
 
@@ -45,6 +57,7 @@ Get-Content "C:\ProgramData\RDP-login-monitor\Logs\login_monitor.log" -Tail 60
 - **Стабильность**: `auditpol` вызывается по полному пути `%SystemRoot%\System32\auditpol.exe` (без зависимости от PATH), stdout+stderr объединяются через `ProcessStartInfo`.
 - **Агрегация 4625 (брутфорс)**: при включённом `$FailedLogonRateLimitEnabled` — уровень 1: **5** неудачных попыток за **60** с с одного источника для **одной** учётной записи (IP+user); уровень 2: **12** попыток за **60** с с одного IP (несколько логинов). Пока порог не достигнут — поштучные 4625; при всплеске — сводные алерты, одиночные подавляются. Параметры в начале `Login_Monitor.ps1`. Автоблокировка IP не выполняется.
 - **Exchange Mail Security** (`Exchange-MailSecurity.ps1`): на **сервере Exchange** — очереди, пересылка на внешние адреса, watchdog. Руководство: **[Docs/exchange-mail-security.md](Docs/exchange-mail-security.md)**. GPO **`Deploy-LoginMonitor.ps1`** на MailServer ставит тот же RDP-монитор и дописывает WinRM/4624 noise в **`login_monitor.settings.ps1`**; **`Deploy-DomainMonitors.ps1 -Target Exchange`** — отдельно.
+- **Admin share 5140 (2.0.19+):** Security **5140** для **`C$`/`ADMIN$`** (audit File Share); SAC `smb.admin_share.access`; подавление в `ignore.lst` (`smb:` / `5140:`).
 - **WinRM / Enter-PSSession (2.0.4+):** улучшен парсинг события `Microsoft-Windows-WinRM/Operational` (`ID=91`) — корректно извлекаются `user` и `clientIP` из EventData/Message fallback, событие отправляется в SAC как `winrm.session.started`.
 - **Deploy WinRM self-heal (2.0.3+):** `Deploy-LoginMonitor.ps1` проверяет/дописывает обязательный блок WinRM inbound в `login_monitor.settings.ps1`, диагностирует доступность канала `Microsoft-Windows-WinRM/Operational` и пытается включить его через `wevtutil`.
 - **Диагностика skip WinRM (2.0.5+):** в логах пишется точная причина `Skip WinRM 91` (`empty-user`, `excluded-user-pattern`, `machine-account`, `local-or-linklocal-ip`, `ignore-list-match`), что упрощает troubleshooting.
