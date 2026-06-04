@@ -34,7 +34,7 @@ Get-Content "C:\ProgramData\RDP-login-monitor\Logs\login_monitor.log" -Tail 60
 - Документация по развёртыванию: **[Docs/README.md](Docs/README.md)** (RDP-монитор, Exchange, NETLOGON).
 - **`Encrypt-DpapiForRdpMonitor.ps1`** — опционально для подготовки DPAPI-строк токена/chat id и пароля SMTP (`$MailSmtpPasswordProtectedB64` в файле настроек).
 - **Локальные настройки RDP-монитора:** **`login_monitor.settings.ps1`** в каталоге установки (образец **`login_monitor.settings.example.ps1`**). При автообновлении **`Login_Monitor.ps1`** с шары файл настроек **не перезаписывается** (как **`exchange_monitor.settings.ps1`** для Exchange).
-- **Security Alert Center (SAC):** модуль **`Sac-Client.ps1`** (копируется вместе с `Login_Monitor.ps1`). Режимы **`$UseSAC`**: `off` | `exclusive` | `dual` | `fallback` — контракт в репозитории **security-alert-center** (`docs/agent-integration.md`). Версия релиза: **`$ScriptVersion`** и **`version.txt`** (сейчас **2.0.19-SAC**); **`Sac-Client.ps1`** передаёт ту же версию в SAC (`product_version`).
+- **Security Alert Center (SAC):** модуль **`Sac-Client.ps1`** (копируется вместе с `Login_Monitor.ps1`). Режимы **`$UseSAC`**: `off` | `exclusive` | `dual` | `fallback` — контракт в репозитории **security-alert-center** (`docs/agent-integration.md`). Версия релиза: **`$ScriptVersion`** и **`version.txt`** (сейчас **2.0.20-SAC**); **`Sac-Client.ps1`** передаёт ту же версию в SAC (`product_version`).
 
 ### Highlights (события в SAC / Telegram)
 

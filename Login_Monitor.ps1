@@ -89,7 +89,7 @@ $script:SkipLogDetailLimit = 15
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "2.0.19-SAC"
+$ScriptVersion = "2.0.20-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -1311,12 +1311,12 @@ function Enable-SecurityAudit {
         $ruCategory = Uc @(0x0414,0x043E,0x0441,0x0442,0x0443,0x043F,0x0020,0x043A,0x0020,0x043E,0x0431,0x044A,0x0435,0x043A,0x0442,0x0430,0x043C)
         $ruSub = Uc @(0x041E,0x0431,0x0449,0x0438,0x0439,0x0020,0x0434,0x043E,0x0441,0x0442,0x0443,0x043F,0x0020,0x043A,0x0020,0x0444,0x0430,0x0439,0x043B,0x0430,0x043C)
         $attempts = @(
-            @{ Category = $ruCategory; Sub = $ruSub; Label = 'RU File Share' },
-            @{ Category = 'Object Access'; Sub = 'File Share'; Label = 'EN File Share' },
+            @{ Category = $ruCategory; Sub = $ruSub; Label = 'RU File Share'; UseGuid = $false },
+            @{ Category = 'Object Access'; Sub = 'File Share'; Label = 'EN File Share'; UseGuid = $false },
             @{ Category = $null; Sub = $guid; Label = 'GUID File Share'; UseGuid = $true }
         )
         foreach ($a in $attempts) {
-            if ($a.UseGuid) {
+            if ($a['UseGuid']) {
                 $setArgs = ('/set /subcategory:{{{0}}} /success:enable /failure:enable' -f $a.Sub)
                 $set = Invoke-AuditPol -Arguments $setArgs
                 if ($set.ExitCode -eq 0) {
