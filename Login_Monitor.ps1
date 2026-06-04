@@ -89,7 +89,7 @@ $script:SkipLogDetailLimit = 15
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "2.0.18-SAC"
+$ScriptVersion = "2.0.19-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -146,6 +146,14 @@ $WinRm4624CorrelationWindowSeconds = 15
 # Исключить шум Exchange/локальный WinRM: HealthMailbox*, учётки *$, ::1, fe80:, 127.0.0.1
 $WinRmIgnoreLocalSource = 1
 $WinRmIgnoreMachineAccounts = 1
+
+# Admin share (Security 5140): C$, ADMIN$ — рабочие станции и серверы; нужен audit File Share.
+$EnableAdminShareMonitoring = 1
+$AdminShareMonitorSuffixes = @('C$', 'ADMIN$')
+$AdminShareEventIds = @(5140)
+$AdminShareIgnoreMachineAccounts = 1
+$AdminShareIgnoreLocalSource = 1
+$AdminShareNotifyDedupSeconds = 120
 
 $ExcludedProcesses = @(
     "HTTP", "HTTP/*", "W3WP.EXE", "MSExchange", "SYSTEM", "LOCAL SERVICE",
@@ -1266,27 +1274,79 @@ function Enable-SecurityAudit {
     }
 
     $preferRu = Test-RussianUiPreferred
+    $logonConfigured = $false
 
     if ($preferRu) {
         if (Ensure-RuLogonLogoffSubcategories) {
             Write-Log "Audit policy (RU): enabled for Russian subcategory names (Logon/Logoff / Russian UI output)."
-            return
+            $logonConfigured = $true
+        } else {
+            Write-Log "Russian category names not accepted or failed; trying English Logon/Logoff (auditpol language can differ from OS UI)."
         }
-        Write-Log "Russian category names not accepted or failed; trying English Logon/Logoff (auditpol language can differ from OS UI)."
     }
 
-    if (Ensure-EnLogonLogoffSubcategories) {
+    if (-not $logonConfigured -and (Ensure-EnLogonLogoffSubcategories)) {
         Write-Log "Audit policy (EN): OK for Logon/Logoff (English auditpol output)."
+        $logonConfigured = $true
+    }
+
+    if (-not $logonConfigured) {
+        Write-Log "Trying Logon/Logoff subcategories via known GUIDs (locale-neutral fallback)..."
+        if (Ensure-LogonLogoffSubcategoriesByGuid) {
+            Write-Log "Audit policy (GUID): OK for Logon/Logoff subcategories."
+            $logonConfigured = $true
+        }
+    }
+
+    if (-not $logonConfigured) {
+        Write-Log "WARNING: could not configure logon/logoff auditing via auditpol automatically. The script will continue; check audit policy in local/domain GPO."
+    }
+
+    if (-not (Test-MonitorFeatureEnabled -Value $EnableAdminShareMonitoring)) {
         return
     }
 
-    Write-Log "Trying Logon/Logoff subcategories via known GUIDs (locale-neutral fallback)..."
-    if (Ensure-LogonLogoffSubcategoriesByGuid) {
-        Write-Log "Audit policy (GUID): OK for Logon/Logoff subcategories."
-        return
+    function Ensure-FileShareAuditSubcategory {
+        $guid = '0CCE9220-69AE-11D9-BED3-505054503030'
+        $ruCategory = Uc @(0x0414,0x043E,0x0441,0x0442,0x0443,0x043F,0x0020,0x043A,0x0020,0x043E,0x0431,0x044A,0x0435,0x043A,0x0442,0x0430,0x043C)
+        $ruSub = Uc @(0x041E,0x0431,0x0449,0x0438,0x0439,0x0020,0x0434,0x043E,0x0441,0x0442,0x0443,0x043F,0x0020,0x043A,0x0020,0x0444,0x0430,0x0439,0x043B,0x0430,0x043C)
+        $attempts = @(
+            @{ Category = $ruCategory; Sub = $ruSub; Label = 'RU File Share' },
+            @{ Category = 'Object Access'; Sub = 'File Share'; Label = 'EN File Share' },
+            @{ Category = $null; Sub = $guid; Label = 'GUID File Share'; UseGuid = $true }
+        )
+        foreach ($a in $attempts) {
+            if ($a.UseGuid) {
+                $setArgs = ('/set /subcategory:{{{0}}} /success:enable /failure:enable' -f $a.Sub)
+                $set = Invoke-AuditPol -Arguments $setArgs
+                if ($set.ExitCode -eq 0) {
+                    Write-Log "Audit policy ($($a.Label)): enabled (5140 admin share monitoring)."
+                    return $true
+                }
+                Write-Log ("auditpol File Share GUID SET FAIL (code {0}): {1}" -f $set.ExitCode, $set.Text)
+                continue
+            }
+            $cur = Get-CategorySettingLine -CategoryName $a.Category -SubcategoryLabel $a.Sub
+            if (-not $cur.Ok) { continue }
+            if ($null -eq $cur.Line) { continue }
+            if (Test-SuccessAndFailureText -Line $cur.Line) {
+                Write-Log "Audit policy ($($a.Label)): already Success+Failure."
+                return $true
+            }
+            $setArgs = ('/set /subcategory:"{0}" /success:enable /failure:enable' -f $a.Sub)
+            $set = Invoke-AuditPol -Arguments $setArgs
+            if ($set.ExitCode -ne 0) {
+                Write-Log ("auditpol File Share SET FAIL ($($a.Label), code {0}): {1}" -f $set.ExitCode, $set.Text)
+                continue
+            }
+            Write-Log "Audit policy ($($a.Label)): enabled for admin share monitoring (5140)."
+            return $true
+        }
+        Write-Log "WARNING: could not enable File Share audit (5140). Admin share alerts need Object Access — File Share in GPO/auditpol."
+        return $false
     }
 
-    Write-Log "WARNING: could not configure logon/logoff auditing via auditpol automatically. The script will continue; check audit policy in local/domain GPO."
+    [void](Ensure-FileShareAuditSubcategory)
 }
 
 function Test-RDSDeploymentPresent {
@@ -1732,6 +1792,102 @@ function Should-IgnoreWinRmSession {
         [string]$SourceIP
     )
     return -not [string]::IsNullOrWhiteSpace((Get-WinRmIgnoreReason -Username $Username -SourceIP $SourceIP))
+}
+
+function Test-IsMonitoredAdminShareName {
+    param([string]$ShareName)
+    if ([string]::IsNullOrWhiteSpace($ShareName)) { return $false }
+    $s = $ShareName.Trim().TrimEnd('\')
+    foreach ($suffix in @($AdminShareMonitorSuffixes)) {
+        if ([string]::IsNullOrWhiteSpace($suffix)) { continue }
+        $sfx = [string]$suffix
+        if ($s -like ('*{0}' -f $sfx)) { return $true }
+        if ($s -ieq $sfx) { return $true }
+    }
+    return $false
+}
+
+function Get-AdminShare5140EventInfo {
+    param($Event)
+    $info = [pscustomobject]@{
+        TimeCreated = $Event.TimeCreated
+        EventId     = [int]$Event.Id
+        Username    = '-'
+        Domain      = '-'
+        SourceIP    = '-'
+        ShareName   = '-'
+        SharePath   = '-'
+        RelativeTarget = '-'
+        AccessMask  = '-'
+    }
+    try {
+        $map = Get-EventDataMap -Event $Event
+        $user = Get-FirstNonEmptyMapValue -DataMap $map -Keys @('SubjectUserName', 'Subject User Name')
+        $domain = Get-FirstNonEmptyMapValue -DataMap $map -Keys @('SubjectDomainName', 'Subject Domain Name')
+        if (-not [string]::IsNullOrWhiteSpace($user) -and -not [string]::IsNullOrWhiteSpace($domain)) {
+            $info.Username = ('{0}\{1}' -f $domain, $user)
+        } elseif (-not [string]::IsNullOrWhiteSpace($user)) {
+            $info.Username = $user
+        }
+        $info.SourceIP = Get-FirstNonEmptyMapValue -DataMap $map -Keys @('IpAddress', 'Ip Address', 'ClientAddress', 'Client Address')
+        $info.ShareName = Get-FirstNonEmptyMapValue -DataMap $map -Keys @('ShareName', 'Share Name')
+        $info.SharePath = Get-FirstNonEmptyMapValue -DataMap $map -Keys @('ShareLocalPath', 'Share Local Path')
+        $info.RelativeTarget = Get-FirstNonEmptyMapValue -DataMap $map -Keys @('RelativeTargetName', 'Relative Target Name')
+        $info.AccessMask = Get-FirstNonEmptyMapValue -DataMap $map -Keys @('AccessMask', 'Access Mask')
+    } catch {
+        Write-Log "Ошибка разбора 5140: $($_.Exception.Message)"
+    }
+    foreach ($prop in @('Username', 'Domain', 'SourceIP', 'ShareName', 'SharePath', 'RelativeTarget', 'AccessMask')) {
+        if ([string]::IsNullOrWhiteSpace($info.$prop)) { $info.$prop = '-' }
+    }
+    return $info
+}
+
+function Format-AdminShare5140TelegramMessage {
+    param(
+        [Parameter(Mandatory = $true)]$Info,
+        [string]$SecurityLogComputerName
+    )
+    $hHost = (ConvertTo-TelegramHtml (Get-MonitorServerLabelWithIp))
+    $hUser = (ConvertTo-TelegramHtml $Info.Username)
+    $hIp = (ConvertTo-TelegramHtml $Info.SourceIP)
+    $hShare = (ConvertTo-TelegramHtml $Info.ShareName)
+    $hPath = (ConvertTo-TelegramHtml $Info.SharePath)
+    $hTarget = (ConvertTo-TelegramHtml $Info.RelativeTarget)
+    $hTime = (ConvertTo-TelegramHtml ($Info.TimeCreated.ToString('dd.MM.yyyy HH:mm:ss')))
+    $message = "<b>📁 Доступ к админ-шару (5140)</b>`r`n"
+    $message += "🏢 Сервер: $hHost`r`n"
+    $message += "👤 Пользователь: $hUser`r`n"
+    $message += "🌐 IP клиента: $hIp`r`n"
+    $message += "📂 Share: $hShare`r`n"
+    if ($Info.SharePath -ne '-') {
+        $message += "📍 Путь: $hPath`r`n"
+    }
+    if ($Info.RelativeTarget -ne '-') {
+        $message += "📄 Объект: $hTarget`r`n"
+    }
+    $message += "🕐 Время: $hTime`r`n"
+    $message += "🔢 Event ID: 5140 (File Share)"
+    return $message
+}
+
+function Get-AdminShare5140IgnoreReason {
+    param(
+        [string]$Username,
+        [string]$SourceIP
+    )
+    if ([string]::IsNullOrWhiteSpace($Username) -or $Username -eq '-') { return 'empty-user' }
+    if (Test-RdpMonitorUsernameExcludedByPattern -Username $Username) { return 'excluded-user-pattern' }
+    if (Test-MonitorFeatureEnabled -Value $AdminShareIgnoreMachineAccounts) {
+        if (Test-RdpMonitorIsMachineAccountName -Username $Username) { return 'machine-account' }
+    }
+    if (Test-MonitorFeatureEnabled -Value $AdminShareIgnoreLocalSource) {
+        if (Test-RdpMonitorIsLoopbackOrLinkLocalSourceIp -Ip $SourceIP) { return 'local-or-linklocal-ip' }
+    }
+    if (Test-RdpMonitorIgnoreListMatch -EventId '5140' -Username $Username -SourceIP $SourceIP) {
+        return 'ignore-list-match'
+    }
+    return ''
 }
 
 function Get-MonitorServerLabel {
@@ -2390,8 +2546,11 @@ function Parse-RdpMonitorIgnoreListLine {
     } elseif ($line -match '^(?i)(winrm|pssession|91)\s*:\s*(.+)$') {
         $scopes = @('winrm')
         $line = $Matches[2].Trim()
+    } elseif ($line -match '^(?i)(smb|5140|adminshare)\s*:\s*(.+)$') {
+        $scopes = @('5140')
+        $line = $Matches[2].Trim()
     } elseif ($line -match '^(?i)(all|\*)\s*:\s*(.+)$') {
-        $scopes = @('4624', '4625', '4740', '20506', '20507', '20510', 'winrm')
+        $scopes = @('4624', '4625', '4740', '20506', '20507', '20510', 'winrm', '5140')
         $line = $Matches[2].Trim()
     }
     if ([string]::IsNullOrWhiteSpace($line)) { return $null }
@@ -3634,6 +3793,9 @@ function Start-LoginMonitor {
     } else {
         Write-Log "Режим сервера: Security — LogonType 2, 3, 10"
     }
+    if (Test-MonitorFeatureEnabled -Value $EnableAdminShareMonitoring) {
+        Write-Log "Admin share: Security 5140 для $($AdminShareMonitorSuffixes -join ', ') (audit File Share; workstation + server)."
+    }
     Write-Log "========================================"
     Write-Log "Каналы уведомлений: $(Get-NotifyChainHuman)"
     Write-Log "Фильтр Exchange 4624 LT3 EmptyIP: ${Ignore4624-LT3-EmptyIP-Event}"
@@ -3691,6 +3853,7 @@ function Start-LoginMonitor {
 
         $rcmShadowMonitoringEnabled = (Test-MonitorFeatureEnabled -Value $EnableRcmShadowControlMonitoring) -and (Test-RcmLogAvailable)
         $winRmMonitoringEnabled = (Test-MonitorFeatureEnabled -Value $EnableWinRmInboundMonitoring) -and (Test-WinRmLogAvailable)
+        $adminShareMonitoringEnabled = Test-MonitorFeatureEnabled -Value $EnableAdminShareMonitoring
 
         $nextHeartbeatTime = (Get-Date).AddSeconds($HeartbeatInterval)
         $nextRotationCheck = Check-AndRotateLog
@@ -3708,6 +3871,7 @@ function Start-LoginMonitor {
         $lastRcmCheckTime = (Get-Date).AddSeconds(-10)
         $lastRcmShadowCheckTime = (Get-Date).AddSeconds(-10)
         $lastWinRmCheckTime = (Get-Date).AddSeconds(-10)
+        $lastAdminShare5140CheckTime = (Get-Date).AddSeconds(-10)
         $lastLockout4740CheckTime = (Get-Date).AddSeconds(-10)
         $monitorEvents = @(4624, 4625, 4648)
 
@@ -4094,6 +4258,54 @@ function Start-LoginMonitor {
                             } | Out-Null
                     }
                     $lastWinRmCheckTime = Update-MonitorPollCursor -CurrentCursor $lastWinRmCheckTime -Events @($winRmEvents)
+                }
+            }
+
+            if ($adminShareMonitoringEnabled) {
+                Set-MonitorLoopPhase -Phase 'poll_admin_share'
+                $adminShareEvents = Get-WinEvent -FilterHashtable @{
+                    LogName = 'Security'
+                    ID = $AdminShareEventIds
+                    StartTime = $lastAdminShare5140CheckTime
+                } -ErrorAction SilentlyContinue
+
+                if ($adminShareEvents) {
+                    foreach ($event in @($adminShareEvents | Sort-Object TimeCreated, RecordId)) {
+                        if ($event.TimeCreated -le $lastAdminShare5140CheckTime) { continue }
+                        $sh = Get-AdminShare5140EventInfo -Event $event
+                        if (-not (Test-IsMonitoredAdminShareName -ShareName $sh.ShareName)) {
+                            continue
+                        }
+                        $ignoreReason = Get-AdminShare5140IgnoreReason -Username $sh.Username -SourceIP $sh.SourceIP
+                        if (-not [string]::IsNullOrWhiteSpace($ignoreReason)) {
+                            Write-Log "Skip 5140: User=$($sh.Username) IP=$($sh.SourceIP) Share=$($sh.ShareName) — $ignoreReason"
+                            continue
+                        }
+                        $dedupKey = "5140|$($sh.Username)|$($sh.SourceIP)|$($sh.ShareName)|$($event.RecordId)"
+                        if (Test-RdpMonitorNotifyDedup -Key $dedupKey -WindowSeconds $AdminShareNotifyDedupSeconds) {
+                            Write-Log "Notify dedup 5140: $dedupKey"
+                            continue
+                        }
+                        $msg = Format-AdminShare5140TelegramMessage -Info $sh -SecurityLogComputerName $event.MachineName
+                        Write-Log "Notify 5140: User=$($sh.Username) IP=$($sh.SourceIP) Share=$($sh.ShareName)"
+                        Send-MonitorNotification -Message $msg `
+                            -EmailSubject "RDP Login Monitor: admin share $($sh.ShareName)" `
+                            -SacEventType 'smb.admin_share.access' -SacSeverity 'warning' `
+                            -SacTitle "Admin share access ($($sh.ShareName))" `
+                            -SacSummary "5140 $($sh.Username) from $($sh.SourceIP) share=$($sh.ShareName)" `
+                            -SacOccurredAt $sh.TimeCreated `
+                            -SacDetails @{
+                                event_id_windows = 5140
+                                user = $sh.Username
+                                source_ip = $sh.SourceIP
+                                ip_address = $sh.SourceIP
+                                share_name = $sh.ShareName
+                                share_path = $sh.SharePath
+                                relative_target = $sh.RelativeTarget
+                                access_mask = $sh.AccessMask
+                            } | Out-Null
+                    }
+                    $lastAdminShare5140CheckTime = Update-MonitorPollCursor -CurrentCursor $lastAdminShare5140CheckTime -Events @($adminShareEvents)
                 }
             }
 

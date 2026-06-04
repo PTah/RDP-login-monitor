@@ -48,6 +48,7 @@ $DailyReportEnabled = 1
 # --- RDS Shadow Control + WinRM inbound (Enter-PSSession), severity warning ---
 # $EnableRcmShadowControlMonitoring = 1   # RCM Operational 20506/20507/20510
 # $EnableWinRmInboundMonitoring = 1       # WinRM Operational 91 (+ correlate Security 4624)
+# $EnableAdminShareMonitoring = 1         # Security 5140 C$/ADMIN$ (audit File Share)
 # $WinRmIgnoreLocalSource = 1             # ::1, 127.0.0.1, fe80 (шум Exchange/локальный WinRM)
 # $WinRmIgnoreMachineAccounts = 1         # учётки, оканчивающиеся на $
 # HealthMailbox* уже в ExcludedUserPatterns скрипта
