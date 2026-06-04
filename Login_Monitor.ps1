@@ -89,7 +89,7 @@ $script:SkipLogDetailLimit = 15
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "2.0.20-SAC"
+$ScriptVersion = "2.0.21-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -102,6 +102,9 @@ $MaxBackupDays = 31
 
 # Heartbeat (файл; при отсутствии обновления > HeartbeatStaleAlertMultiplier × интервал — оповещение)
 $HeartbeatInterval = 3600
+# Инвентаризация железа/ПО для SAC (agent.inventory); интервал опроса, сек (12 ч).
+$InventoryIntervalSec = 43200
+$GetInventory = 1
 $HeartbeatStaleAlertMultiplier = 2
 # Один RDP-вход часто даёт 2+ события 4624 с одним временем — не слать дубли в Telegram/SAC.
 $LoginSuccessNotifyDedupSeconds = 90
@@ -2077,6 +2080,148 @@ function Build-DailyReportPlainBodyWindows {
     return $sb.ToString().TrimEnd()
 }
 
+function Get-HostInventorySnapshot {
+    $inv = [ordered]@{
+        schema_version = 1
+        collected_at   = (Get-Date).ToUniversalTime().ToString('o')
+        computer_name  = $env:COMPUTERNAME
+        processor      = @()
+        motherboard    = $null
+        memory_gb      = $null
+        disks          = @()
+        video          = @()
+        windows        = $null
+        ipv4           = @()
+    }
+
+    try {
+        Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop | ForEach-Object {
+            $inv.processor += @{
+                name               = [string]$_.Name
+                cores              = [int]$_.NumberOfCores
+                logical_processors = [int]$_.NumberOfLogicalProcessors
+            }
+        }
+    } catch {
+        Write-Log "Inventory: Win32_Processor — $($_.Exception.Message)"
+    }
+
+    try {
+        $bb = Get-CimInstance -ClassName Win32_BaseBoard -ErrorAction Stop | Select-Object -First 1
+        if ($null -ne $bb) {
+            $inv.motherboard = @{
+                product      = [string]$bb.Product
+                manufacturer = [string]$bb.Manufacturer
+            }
+        }
+    } catch {
+        Write-Log "Inventory: Win32_BaseBoard — $($_.Exception.Message)"
+    }
+
+    try {
+        $mem = Get-CimInstance -ClassName Win32_PhysicalMemory -ErrorAction Stop
+        if ($mem) {
+            $sum = ($mem | Measure-Object -Property Capacity -Sum).Sum
+            if ($sum) { $inv.memory_gb = [math]::Round([double]$sum / 1GB, 2) }
+        }
+    } catch {
+        Write-Log "Inventory: Win32_PhysicalMemory — $($_.Exception.Message)"
+    }
+
+    try {
+        Get-PhysicalDisk -ErrorAction Stop | ForEach-Object {
+            $inv.disks += @{
+                friendly_name = [string]$_.FriendlyName
+                media_type    = [string]$_.MediaType
+                size_gb       = [math]::Round([double]$_.Size / 1GB, 2)
+            }
+        }
+    } catch {
+        try {
+            Get-CimInstance -ClassName Win32_DiskDrive -ErrorAction Stop | ForEach-Object {
+                $sizeGb = if ($_.Size) { [math]::Round([double]$_.Size / 1GB, 2) } else { $null }
+                $inv.disks += @{
+                    friendly_name = [string]$_.Model
+                    media_type    = [string]$_.MediaType
+                    size_gb       = $sizeGb
+                }
+            }
+        } catch {
+            Write-Log "Inventory: disks — $($_.Exception.Message)"
+        }
+    }
+
+    try {
+        Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_.Name) } |
+            ForEach-Object {
+                $inv.video += @{ name = [string]$_.Name }
+            }
+    } catch {
+        Write-Log "Inventory: Win32_VideoController — $($_.Exception.Message)"
+    }
+
+    try {
+        $ci = Get-ComputerInfo -ErrorAction Stop
+        $inv.windows = @{
+            product_name                  = [string]$ci.WindowsProductName
+            version                       = [string]$ci.WindowsVersion
+            os_hardware_abstraction_layer = [string]$ci.OsHardwareAbstractionLayer
+        }
+    } catch {
+        try {
+            $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop | Select-Object -First 1
+            if ($null -ne $os) {
+                $inv.windows = @{
+                    product_name                  = [string]$os.Caption
+                    version                       = [string]$os.Version
+                    os_hardware_abstraction_layer = [string]$os.OSArchitecture
+                }
+            }
+        } catch {
+            Write-Log "Inventory: Windows version — $($_.Exception.Message)"
+        }
+    }
+
+    try {
+        $ips = @(
+            Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
+                Where-Object {
+                    $_.IPAddress -and
+                    $_.IPAddress -notlike '169.254*' -and
+                    $_.IPAddress -ne '127.0.0.1'
+                } |
+                ForEach-Object { [string]$_.IPAddress }
+        ) | Sort-Object -Unique
+        $inv.ipv4 = @($ips)
+    } catch {
+        Write-Log "Inventory: IPv4 — $($_.Exception.Message)"
+    }
+
+    return $inv
+}
+
+function Send-HostInventoryToSac {
+    if (-not (Test-MonitorFeatureEnabled -Value $GetInventory)) { return $false }
+    if (-not $script:SacClientLoaded) { return $false }
+    if (-not (Get-Command Send-SacEvent -ErrorAction SilentlyContinue)) { return $false }
+    if ((Get-SacNormalizedMode) -eq 'off') { return $false }
+    if (-not (Test-SacConfigured)) { return $false }
+
+    $inv = Get-HostInventorySnapshot
+    $label = Get-MonitorServerLabelWithIp
+    $summary = "Inventory snapshot for $label"
+    $title = "Host inventory: $label"
+    $ok = Send-SacEvent -EventType 'agent.inventory' -Severity 'info' -Title $title -Summary $summary `
+        -Details @{ inventory = $inv }
+    if ($ok) {
+        Write-Log "SAC: agent.inventory отправлен (RAM=$($inv.memory_gb) GB, CPU=$($inv.processor.Count), disks=$($inv.disks.Count))."
+    } else {
+        Write-Log "SAC: не удалось отправить agent.inventory."
+    }
+    return [bool]$ok
+}
+
 function Convert-DailyReportPlainToTelegramHtml {
     param([string]$PlainBody)
     $lines = $PlainBody -split "`r?`n"
@@ -3796,6 +3941,12 @@ function Start-LoginMonitor {
     if (Test-MonitorFeatureEnabled -Value $EnableAdminShareMonitoring) {
         Write-Log "Admin share: Security 5140 для $($AdminShareMonitorSuffixes -join ', ') (audit File Share; workstation + server)."
     }
+    if (Test-MonitorFeatureEnabled -Value $GetInventory) {
+        $invHours = [math]::Round($InventoryIntervalSec / 3600.0, 1)
+        Write-Log "Inventory: SAC agent.inventory включён, интервал ${invHours} ч ($InventoryIntervalSec с)."
+    } else {
+        Write-Log "Inventory: опрос железа/ПО отключён (`$GetInventory)."
+    }
     Write-Log "========================================"
     Write-Log "Каналы уведомлений: $(Get-NotifyChainHuman)"
     Write-Log "Фильтр Exchange 4624 LT3 EmptyIP: ${Ignore4624-LT3-EmptyIP-Event}"
@@ -3840,6 +3991,9 @@ function Start-LoginMonitor {
             Cleanup-OldLogs
             Send-Heartbeat -IsStartup
             Enable-SecurityAudit
+            if (Test-MonitorFeatureEnabled -Value $GetInventory) {
+                Send-HostInventoryToSac | Out-Null
+            }
             $script:MonitorLoopInitialized = $true
         }
 
@@ -3856,6 +4010,7 @@ function Start-LoginMonitor {
         $adminShareMonitoringEnabled = Test-MonitorFeatureEnabled -Value $EnableAdminShareMonitoring
 
         $nextHeartbeatTime = (Get-Date).AddSeconds($HeartbeatInterval)
+        $nextInventoryTime = (Get-Date).AddSeconds($InventoryIntervalSec)
         $nextRotationCheck = Check-AndRotateLog
         $nextReportCheck = Check-AndSendDailyReport
         $lastCheckTime = (Get-Date).AddSeconds(-10)
@@ -4355,6 +4510,12 @@ function Start-LoginMonitor {
             if ($now -ge $nextHeartbeatTime) {
                 Send-Heartbeat
                 $nextHeartbeatTime = $nextHeartbeatTime.AddSeconds($HeartbeatInterval)
+            }
+            if (Test-MonitorFeatureEnabled -Value $GetInventory) {
+                if ($now -ge $nextInventoryTime) {
+                    Send-HostInventoryToSac | Out-Null
+                    $nextInventoryTime = $nextInventoryTime.AddSeconds($InventoryIntervalSec)
+                }
             }
             if ($now -ge $nextRotationCheck) {
                 $nextRotationCheck = Check-AndRotateLog

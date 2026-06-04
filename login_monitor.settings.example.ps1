@@ -45,6 +45,9 @@ $SacApiKey = 'sac_UkOsAT3UWiQS54KK5OJPBDCSucysQDrKFju28wmYiz8'
 # В settings.ps1 используйте 1/0 или $true/$false — не пишите голое false без $
 $DailyReportEnabled = 1
 
+# --- Инвентаризация железа/ПО для SAC (agent.inventory, раз в 12 ч) ---
+$GetInventory = $true
+
 # --- RDS Shadow Control + WinRM inbound (Enter-PSSession), severity warning ---
 # $EnableRcmShadowControlMonitoring = 1   # RCM Operational 20506/20507/20510
 # $EnableWinRmInboundMonitoring = 1       # WinRM Operational 91 (+ correlate Security 4624)

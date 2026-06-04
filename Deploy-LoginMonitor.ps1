@@ -635,6 +635,7 @@ function Invoke-RdpMonitorSettingsPostPatches {
     if (Repair-RdpMonitorSettingsWinRmLinesIfInvalid -LocalSettings $LocalSettings) { $changed = $true }
     if (Sync-RdpMonitorSettingsWinRmInboundBlock -LocalSettings $LocalSettings) { $changed = $true }
     if (Sync-RdpMonitorSettingsMaxBackupDaysIfMissing -LocalSettings $LocalSettings) { $changed = $true }
+    if (Sync-RdpMonitorSettingsGetInventoryIfMissing -LocalSettings $LocalSettings) { $changed = $true }
     return $changed
 }
 
@@ -680,6 +681,49 @@ function Sync-RdpMonitorSettingsMaxBackupDaysIfMissing {
 
     [System.IO.File]::WriteAllText($LocalSettings, $newContent.TrimEnd() + "`r`n", $Utf8Bom)
     Write-DeployLog "login_monitor.settings.ps1: добавлен `$MaxBackupDays = 31"
+    return $true
+}
+
+function Test-RdpMonitorSettingsNeedsGetInventory {
+    param([string]$SettingsPath)
+    if (-not (Test-Path -LiteralPath $SettingsPath)) { return $false }
+    $c = Get-RdpMonitorSettingsRaw -Path $SettingsPath
+    if ([string]::IsNullOrWhiteSpace($c)) { return $true }
+    return ($c -notmatch '(?m)^\s*\$GetInventory\s*=')
+}
+
+function Sync-RdpMonitorSettingsGetInventoryIfMissing {
+    param([string]$LocalSettings)
+
+    if (-not (Test-RdpMonitorSettingsNeedsGetInventory -SettingsPath $LocalSettings)) {
+        return $false
+    }
+
+    $c = Get-RdpMonitorSettingsRaw -Path $LocalSettings
+    $block = @(
+        '# --- Инвентаризация железа/ПО для SAC (agent.inventory, раз в 12 ч) ---'
+        '$GetInventory = $true'
+    ) -join "`r`n"
+
+    $bak = "$LocalSettings.bak.$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+    if (Test-Path -LiteralPath $LocalSettings) {
+        Copy-Item -LiteralPath $LocalSettings -Destination $bak -Force
+        Write-DeployLog "Добавление `$GetInventory в login_monitor.settings.ps1; резервная копия: $bak"
+    } else {
+        Write-DeployLog "Создание login_monitor.settings.ps1 с `$GetInventory = `$true"
+    }
+
+    $insertAfterDaily = '(?m)^(\s*\$DailyReportEnabled\s*=.*)$'
+    if (-not [string]::IsNullOrWhiteSpace($c) -and $c -match $insertAfterDaily) {
+        $newContent = [regex]::Replace($c, $insertAfterDaily, ('$1' + "`r`n`r`n" + $block), 1)
+    } elseif (-not [string]::IsNullOrWhiteSpace($c)) {
+        $newContent = ($c.TrimEnd() + "`r`n`r`n" + $block + "`r`n")
+    } else {
+        $newContent = ($block + "`r`n")
+    }
+
+    [System.IO.File]::WriteAllText($LocalSettings, $newContent.TrimEnd() + "`r`n", $Utf8Bom)
+    Write-DeployLog 'login_monitor.settings.ps1: добавлен $GetInventory = $true'
     return $true
 }
 
