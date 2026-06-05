@@ -89,7 +89,7 @@ $script:SkipLogDetailLimit = 15
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "2.0.21-SAC"
+$ScriptVersion = "2.0.22-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -2212,8 +2212,12 @@ function Send-HostInventoryToSac {
     $label = Get-MonitorServerLabelWithIp
     $summary = "Inventory snapshot for $label"
     $title = "Host inventory: $label"
+    $details = @{ inventory = $inv }
+    if (Get-Command Convert-AnyToJsonSerializable -ErrorAction SilentlyContinue) {
+        $details = Convert-AnyToJsonSerializable @{ inventory = $inv }
+    }
     $ok = Send-SacEvent -EventType 'agent.inventory' -Severity 'info' -Title $title -Summary $summary `
-        -Details @{ inventory = $inv }
+        -Details $details
     if ($ok) {
         Write-Log "SAC: agent.inventory отправлен (RAM=$($inv.memory_gb) GB, CPU=$($inv.processor.Count), disks=$($inv.disks.Count))."
     } else {

@@ -187,13 +187,30 @@ function Convert-AnyToJsonSerializable {
     if ($Value.GetType().IsPrimitive) {
         return $Value
     }
-    if ($Value -is [datetime] -or $Value -is [datetimeoffset] -or $Value -is [guid]) {
+    if ($Value -is [enum]) {
+        return [string]$Value
+    }
+    if ($Value -is [decimal] -or $Value -is [single] -or $Value -is [double]) {
+        return [double]$Value
+    }
+    if ($Value -is [datetime] -or $Value -is [datetimeoffset] -or $Value -is [guid] -or $Value -is [version]) {
         return [string]$Value
     }
     if ($Value -is [System.Management.Automation.PSMethod] -or
         $Value -is [System.Management.Automation.ScriptBlock] -or
+        $Value -is [System.Management.Automation.PSMemberInfo] -or
         $Value -is [Delegate]) {
         return $null
+    }
+    $typeName = $Value.GetType().FullName
+    if ($typeName -like 'Microsoft.Management.Infrastructure.CimInstance*' -or
+        $typeName -like 'Microsoft.Management.Infrastructure.CimProperty*') {
+        $out = @{}
+        foreach ($prop in $Value.CimInstanceProperties) {
+            if ($null -eq $prop -or $null -eq $prop.Name) { continue }
+            $out[$prop.Name] = Convert-AnyToJsonSerializable $prop.Value
+        }
+        return $out
     }
     if ($Value -is [pscustomobject]) {
         $out = @{}
@@ -225,16 +242,7 @@ function Convert-AnyToJsonSerializable {
 function ConvertTo-SacJsonText {
     param([Parameter(Mandatory = $true)]$Payload)
     $serializable = Convert-AnyToJsonSerializable $Payload
-    try {
-        Add-Type -AssemblyName System.Web.Extensions -ErrorAction Stop
-        $ser = New-Object System.Web.Script.Serialization.JavaScriptSerializer
-        $ser.MaxJsonLength = 16777216
-        $ser.RecursionLimit = 32
-        return ,$ser.Serialize($serializable)
-    } catch {
-        Write-SacLog "WARN: JavaScriptSerializer unavailable, fallback ConvertTo-Json ($($_.Exception.Message))"
-        return ,($serializable | ConvertTo-Json -Depth 12 -Compress)
-    }
+    return ,($serializable | ConvertTo-Json -Depth 16 -Compress)
 }
 
 function Get-SacCategoryForType {
@@ -499,9 +507,7 @@ function Get-SacPostBodyBytes {
     }
     try {
         $text = [System.Text.Encoding]::UTF8.GetString($bytes)
-        Add-Type -AssemblyName System.Web.Extensions -ErrorAction Stop
-        $ser = New-Object System.Web.Script.Serialization.JavaScriptSerializer
-        $null = $ser.DeserializeObject($text)
+        $null = $text | ConvertFrom-Json -ErrorAction Stop
     } catch {
         Write-SacLog "WARN: SAC POST aborted: local JSON parse failed ($($_.Exception.Message))"
         return $null
