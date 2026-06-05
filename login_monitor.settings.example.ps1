@@ -54,6 +54,7 @@ $GetInventory = $true
 # $EnableAdminShareMonitoring = 1         # Security 5140 C$/ADMIN$ (audit File Share)
 # $WinRmIgnoreLocalSource = 1             # ::1, 127.0.0.1, fe80 (шум Exchange/локальный WinRM)
 # $WinRmIgnoreMachineAccounts = 1         # учётки, оканчивающиеся на $
+# $WinRmExchangeStrictMode = 1            # Exchange: user в Event 91 обязателен; 4624 только LogonProcess WinRM
 # HealthMailbox* уже в ExcludedUserPatterns скрипта
 # Проверка: powershell -File Login_Monitor.ps1 -CheckSac
 

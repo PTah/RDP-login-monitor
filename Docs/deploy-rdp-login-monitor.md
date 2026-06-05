@@ -76,8 +76,9 @@ flowchart TD
 - `${Ignore4624-LT3-EmptyIP-Event} = $true`
 - `$WinRmIgnoreLocalSource = 1`
 - `$WinRmIgnoreMachineAccounts = 1`
+- `$WinRmExchangeStrictMode = 1`
 
-Подавление шума WinRM (HealthMailbox, loopback) и лишних **4624 LT3**.
+Подавление шума WinRM (HealthMailbox, loopback), ложных WinRM 91↔4624 (Outlook/LT3) и лишних **4624 LT3**.
 
 **Мониторинг очередей транспорта и правил пересылки** — другой скрипт, **не** через GPO RDP-монитора:
 

@@ -61,6 +61,7 @@ Get-Content "C:\ProgramData\RDP-login-monitor\Logs\login_monitor.log" -Tail 60
 - **WinRM / Enter-PSSession (2.0.4+):** улучшен парсинг события `Microsoft-Windows-WinRM/Operational` (`ID=91`) — корректно извлекаются `user` и `clientIP` из EventData/Message fallback, событие отправляется в SAC как `winrm.session.started`.
 - **Deploy WinRM self-heal (2.0.3+):** `Deploy-LoginMonitor.ps1` проверяет/дописывает обязательный блок WinRM inbound в `login_monitor.settings.ps1`, диагностирует доступность канала `Microsoft-Windows-WinRM/Operational` и пытается включить его через `wevtutil`.
 - **Диагностика skip WinRM (2.0.5+):** в логах пишется точная причина `Skip WinRM 91` (`empty-user`, `excluded-user-pattern`, `machine-account`, `local-or-linklocal-ip`, `ignore-list-match`), что упрощает troubleshooting.
+- **WinRM Exchange strict (2.0.23+):** на сервере с ролью Exchange — WinRM **91** без user в EventData/Properties не алертится; корреляция Security **4624** только при `LogonProcess WinRM` (отсекает ложные связки с Outlook/почтовым LT3). Причины skip: `exchange-winrm-no-user-in-event`, `exchange-winrm-unresolved-uri-no-ip`. Deploy дописывает `$WinRmExchangeStrictMode = 1`.
 
 ## 1) Подготовка
 

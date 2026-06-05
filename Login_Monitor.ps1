@@ -89,7 +89,7 @@ $script:SkipLogDetailLimit = 15
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "2.0.22-SAC"
+$ScriptVersion = "2.0.23-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -149,6 +149,8 @@ $WinRm4624CorrelationWindowSeconds = 15
 # Исключить шум Exchange/локальный WinRM: HealthMailbox*, учётки *$, ::1, fe80:, 127.0.0.1
 $WinRmIgnoreLocalSource = 1
 $WinRmIgnoreMachineAccounts = 1
+# На сервере Exchange: не алертить WinRM 91 без user в EventData/Properties; 4624 только LogonProcess WinRM.
+$WinRmExchangeStrictMode = 1
 
 # Admin share (Security 5140): C$, ADMIN$ — рабочие станции и серверы; нужен audit File Share.
 $EnableAdminShareMonitoring = 1
@@ -1631,11 +1633,85 @@ function Get-WinRm91EventInfo {
     return $eventData
 }
 
+function Test-RdpMonitorExchangeServerRole {
+    if (-not [string]::IsNullOrWhiteSpace($env:ExchangeInstallPath)) {
+        if (Test-Path -LiteralPath $env:ExchangeInstallPath) { return $true }
+    }
+    foreach ($regPath in @(
+        'HKLM:\SOFTWARE\Microsoft\ExchangeServer\v15\Setup',
+        'HKLM:\SOFTWARE\Microsoft\ExchangeServer\v14\Setup'
+    )) {
+        try {
+            if ($null -ne (Get-ItemProperty -LiteralPath $regPath -ErrorAction Stop)) { return $true }
+        } catch { }
+    }
+    foreach ($root in @(
+        'C:\Program Files\Microsoft\Exchange Server\V15',
+        'C:\Program Files\Microsoft\Exchange Server\V14'
+    )) {
+        if (Test-Path -LiteralPath (Join-Path $root 'bin\RemoteExchange.ps1')) { return $true }
+    }
+    try {
+        $svc = Get-Service -Name 'MSExchangeIS', 'MSExchangeTransport' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Status -eq 'Running' } |
+            Select-Object -First 1
+        if ($null -ne $svc) { return $true }
+    } catch { }
+    return $false
+}
+
+function Test-WinRmExchangeStrictActive {
+    if (-not (Test-RdpMonitorExchangeServerRole)) { return $false }
+    return Test-MonitorFeatureEnabled -Value $WinRmExchangeStrictMode
+}
+
+function Test-WinRm91UserPresentInEventRecord {
+    param($Event)
+    try {
+        $map = Get-EventDataMap -Event $Event
+        $user = Get-FirstNonEmptyMapValue -DataMap $map -Keys @(
+            'user', 'User', 'UserName', 'AccountName', 'SubjectUserName'
+        )
+        if (-not [string]::IsNullOrWhiteSpace($user) -and $user -ne '-') {
+            return $true
+        }
+        if ($Event.Properties.Count -gt 0) {
+            $propUser = [string]$Event.Properties[0].Value
+            if (-not [string]::IsNullOrWhiteSpace($propUser) -and
+                $propUser -notmatch '(?i)https?://|ResourceUri|clientIP:') {
+                return $true
+            }
+        }
+    } catch { }
+    return $false
+}
+
+function Get-WinRmExchangeStrictSkipReason {
+    param(
+        [bool]$UserPresentInWinRmEvent,
+        [string]$Username,
+        [string]$SourceIP,
+        [string]$ResourceUri
+    )
+    if (-not $UserPresentInWinRmEvent) {
+        return 'exchange-winrm-no-user-in-event'
+    }
+    $uriBad = ([string]::IsNullOrWhiteSpace($ResourceUri) -or $ResourceUri -eq '-' -or $ResourceUri -like '*%1*')
+    if ($uriBad -and ([string]::IsNullOrWhiteSpace($SourceIP) -or $SourceIP -eq '-')) {
+        return 'exchange-winrm-unresolved-uri-no-ip'
+    }
+    if (Test-RdpMonitorUsernameExcludedByPattern -Username $Username) {
+        return 'excluded-user-pattern'
+    }
+    return ''
+}
+
 function Find-CorrelatedNetworkLogon4624 {
     param(
         [datetime]$AroundTime,
         [string]$UsernameHint = '',
-        [int]$WindowSeconds = 15
+        [int]$WindowSeconds = 15,
+        [switch]$RequireWinRmLogonProcess
     )
     $start = $AroundTime.AddSeconds(-1 * [Math]::Abs($WindowSeconds))
     $end = $AroundTime.AddSeconds([Math]::Abs($WindowSeconds))
@@ -1653,6 +1729,13 @@ function Find-CorrelatedNetworkLogon4624 {
         $info = Get-LoginEventInfo -Event $ev
         if ($info.LogonType -ne 3) { continue }
         if ($info.SourceIP -eq '-' -or [string]::IsNullOrWhiteSpace($info.SourceIP)) { continue }
+        if ($RequireWinRmLogonProcess) {
+            $logonProcess = [string]$info.ProcessName
+            if ([string]::IsNullOrWhiteSpace($logonProcess) -or $logonProcess -eq '-' -or
+                $logonProcess -notmatch '(?i)WinRM') {
+                continue
+            }
+        }
         if (-not [string]::IsNullOrWhiteSpace($UsernameHint) -and $UsernameHint -ne '-') {
             if (-not (Test-RdpMonitorUsernameMatchesToken -Username $info.Username -Token $UsernameHint)) {
                 continue
@@ -3978,6 +4061,9 @@ function Start-LoginMonitor {
     if (Test-MonitorFeatureEnabled -Value $EnableWinRmInboundMonitoring) {
         if (Test-WinRmLogAvailable) {
             Write-Log "WinRM inbound (Enter-PSSession): включён (Operational IDs: $($WinRmInboundShellEventIds -join ', '); correlate 4624=$WinRmCorrelateSecurity4624)."
+            if (Test-WinRmExchangeStrictActive) {
+                Write-Log "WinRM Exchange strict: user обязателен в Event 91; корреляция 4624 только LogonProcess WinRM."
+            }
         } else {
             Write-Log "WinRM inbound: включён в настройках, но журнал WinRM Operational недоступен."
         }
@@ -4378,14 +4464,28 @@ function Start-LoginMonitor {
                 if ($winRmEvents) {
                     foreach ($event in $winRmEvents) {
                         if ($event.TimeCreated -le $lastWinRmCheckTime) { continue }
+                        $exchangeWinRmStrict = Test-WinRmExchangeStrictActive
+                        $userInWinRmEvent = Test-WinRm91UserPresentInEventRecord -Event $event
                         $wr = Get-WinRm91EventInfo -Event $event
                         if (Test-MonitorFeatureEnabled -Value $WinRmCorrelateSecurity4624) {
                             $corr = Find-CorrelatedNetworkLogon4624 -AroundTime $wr.TimeCreated `
-                                -UsernameHint $wr.User -WindowSeconds $WinRm4624CorrelationWindowSeconds
+                                -UsernameHint $wr.User -WindowSeconds $WinRm4624CorrelationWindowSeconds `
+                                -RequireWinRmLogonProcess:$exchangeWinRmStrict
                             if ($null -ne $corr) {
-                                $wr.SourceIP = $corr.SourceIP
-                                if ($wr.User -eq '-' -and $corr.Username -ne '-') { $wr.User = $corr.Username }
+                                if ($wr.SourceIP -eq '-') { $wr.SourceIP = $corr.SourceIP }
+                                if ($wr.User -eq '-' -and $corr.Username -ne '-' -and -not $exchangeWinRmStrict) {
+                                    $wr.User = $corr.Username
+                                }
                                 $wr.LogonType = $corr.LogonType
+                            }
+                        }
+                        if ($exchangeWinRmStrict) {
+                            $exchangeSkip = Get-WinRmExchangeStrictSkipReason `
+                                -UserPresentInWinRmEvent:$userInWinRmEvent `
+                                -Username $wr.User -SourceIP $wr.SourceIP -ResourceUri $wr.ResourceUri
+                            if (-not [string]::IsNullOrWhiteSpace($exchangeSkip)) {
+                                Write-Log "Skip WinRM $($event.Id): User=$($wr.User) IP=$($wr.SourceIP) — reason=$exchangeSkip"
+                                continue
                             }
                         }
                         $winRmIgnoreReason = Get-WinRmIgnoreReason -Username $wr.User -SourceIP $wr.SourceIP

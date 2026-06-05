@@ -409,6 +409,10 @@ function Get-RdpMonitorExchangeNoiseSettingDefinitions {
         @{
             Pattern = '(?m)^\s*(\#\s*)?\$WinRmIgnoreMachineAccounts\s*='
             Line    = '$WinRmIgnoreMachineAccounts = 1'
+        },
+        @{
+            Pattern = '(?m)^\s*(\#\s*)?\$WinRmExchangeStrictMode\s*='
+            Line    = '$WinRmExchangeStrictMode = 1'
         }
     )
 }
@@ -514,7 +518,8 @@ function Repair-RdpMonitorSettingsWinRmLinesIfInvalid {
         'WinRmCorrelateSecurity4624',
         'WinRm4624CorrelationWindowSeconds',
         'WinRmIgnoreLocalSource',
-        'WinRmIgnoreMachineAccounts'
+        'WinRmIgnoreMachineAccounts',
+        'WinRmExchangeStrictMode'
     )
     $newContent = $c
     $fixed = $false
