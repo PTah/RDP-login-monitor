@@ -89,7 +89,7 @@ $script:SkipLogDetailLimit = 15
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "2.0.23-SAC"
+$ScriptVersion = "2.0.24-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -480,11 +480,49 @@ function Invoke-RdpMonitorReloadSettings {
     return $false
 }
 
+function Test-RdpMonitorScheduledTaskExecutionTimeLimitUnlimited {
+    param(
+        [Parameter(Mandatory = $true)][string]$TaskName
+    )
+    try {
+        $limit = (Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Select-Object -First 1).Settings.ExecutionTimeLimit
+        if ($null -eq $limit) { return $false }
+        if ($limit.Ticks -le 0) { return $true }
+        # Некоторые сборки Windows возвращают «безлимит» как очень большой интервал.
+        if ($limit.TotalDays -ge 999) { return $true }
+        return $false
+    } catch {
+        return $false
+    }
+}
+
+function Get-RdpMonitorScheduledTaskExecutionTimeLimitLabel {
+    param([Parameter(Mandatory = $true)][string]$TaskName)
+    try {
+        $limit = (Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Select-Object -First 1).Settings.ExecutionTimeLimit
+        if ($null -eq $limit) { return '(null)' }
+        if ($limit.Ticks -le 0) { return 'PT0S (без лимита)' }
+        return $limit.ToString()
+    } catch {
+        return '(задача не найдена)'
+    }
+}
+
+function New-RdpMonitorMainScheduledTaskSettings {
+    # ExecutionTimeLimit по умолчанию у Register-ScheduledTask = PT72H; монитор должен работать месяцами.
+    New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable `
+        -ExecutionTimeLimit ([TimeSpan]::Zero)
+}
+
 function Test-RdpMonitorScheduledTaskMatches {
     param(
         [Parameter(Mandatory = $true)][string]$TaskName,
         [Parameter(Mandatory = $true)][string]$ExpectedExe,
-        [Parameter(Mandatory = $true)][string]$ExpectedArguments
+        [Parameter(Mandatory = $true)][string]$ExpectedArguments,
+        [switch]$RequireUnlimitedExecutionTime
     )
     try {
         $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Select-Object -First 1
@@ -492,7 +530,13 @@ function Test-RdpMonitorScheduledTaskMatches {
         if ($null -eq $a) { return $false }
         $exe = [string]$a.Execute
         $arg = [string]$a.Arguments
-        return (($exe.Trim() -eq $ExpectedExe.Trim()) -and ($arg.Trim() -eq $ExpectedArguments.Trim()))
+        if (($exe.Trim() -ne $ExpectedExe.Trim()) -or ($arg.Trim() -ne $ExpectedArguments.Trim())) {
+            return $false
+        }
+        if ($RequireUnlimitedExecutionTime -and -not (Test-RdpMonitorScheduledTaskExecutionTimeLimitUnlimited -TaskName $TaskName)) {
+            return $false
+        }
+        return $true
     } catch {
         return $false
     }
@@ -501,7 +545,7 @@ function Test-RdpMonitorScheduledTaskMatches {
 function Register-RdpMonitorScheduledTasksCore {
     param([switch]$SkipImmediateMainRun)
 
-    Write-Log "Register-RdpMonitorScheduledTasksCore: ветка v$ScriptVersion (watchdog через schtasks /SC MINUTE, без CIM RepetitionInterval)."
+    Write-Log "Register-RdpMonitorScheduledTasksCore: v$ScriptVersion (main ExecutionTimeLimit=PT0S; watchdog schtasks /SC MINUTE)."
     $psExe = Get-RdpMonitorPowerShellExe
     $canonicalScript = [System.IO.Path]::GetFullPath((Join-Path $script:InstallRoot $script:CanonicalScriptName))
     if (-not (Test-Path -LiteralPath $canonicalScript)) {
@@ -515,11 +559,11 @@ function Register-RdpMonitorScheduledTasksCore {
     $actionMain = New-ScheduledTaskAction -Execute $psExe -Argument $argMain
     $triggerBoot = New-ScheduledTaskTrigger -AtStartup
     $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+    $settings = New-RdpMonitorMainScheduledTaskSettings
 
     Register-ScheduledTask -TaskName $script:ScheduledTaskNameMain -Action $actionMain -Trigger $triggerBoot `
         -Principal $principal -Settings $settings -Force | Out-Null
-    Write-Log "Задача планировщика: $($script:ScheduledTaskNameMain) (запуск при старте ОС)."
+    Write-Log "Задача планировщика: $($script:ScheduledTaskNameMain) (запуск при старте ОС, ExecutionTimeLimit=PT0S)."
 
     # Watchdog только через schtasks. /Delete при отсутствии задачи пишет в stderr — при $ErrorActionPreference Stop раньше рвал скрипт.
     $schtasksExe = Join-Path $env:SystemRoot 'System32\schtasks.exe'
@@ -583,15 +627,24 @@ function Ensure-RdpMonitorScheduledTasks {
     $argMain = "-NoProfile -ExecutionPolicy Bypass -File `"$canonicalScript`""
     $argWd = "-NoProfile -ExecutionPolicy Bypass -File `"$canonicalScript`" -Watchdog"
 
-    $needMain = -not (Test-RdpMonitorScheduledTaskMatches -TaskName $script:ScheduledTaskNameMain -ExpectedExe $psExe -ExpectedArguments $argMain)
+    $mainPathsOk = Test-RdpMonitorScheduledTaskMatches -TaskName $script:ScheduledTaskNameMain -ExpectedExe $psExe -ExpectedArguments $argMain
+    $mainLimitOk = Test-RdpMonitorScheduledTaskExecutionTimeLimitUnlimited -TaskName $script:ScheduledTaskNameMain
+    $needMain = (-not $mainPathsOk) -or (-not $mainLimitOk)
     $needWd = -not (Test-RdpMonitorScheduledTaskMatches -TaskName $script:ScheduledTaskNameWatchdog -ExpectedExe $psExe -ExpectedArguments $argWd)
 
     if (-not $needMain -and -not $needWd) {
-        Write-Log "Задачи планировщика ($($script:ScheduledTaskNameMain), $($script:ScheduledTaskNameWatchdog)) соответствуют каноническим путям."
+        Write-Log "Задачи планировщика ($($script:ScheduledTaskNameMain), $($script:ScheduledTaskNameWatchdog)) соответствуют каноническим путям и лимитам."
         return
     }
 
-    if ($needMain) { Write-Log "Требуется обновить или создать задачу: $($script:ScheduledTaskNameMain)" }
+    if ($needMain) {
+        if (-not $mainPathsOk) {
+            Write-Log "Требуется обновить или создать задачу: $($script:ScheduledTaskNameMain)"
+        } elseif (-not $mainLimitOk) {
+            $limitLabel = Get-RdpMonitorScheduledTaskExecutionTimeLimitLabel -TaskName $script:ScheduledTaskNameMain
+            Write-Log "Требуется обновить задачу: $($script:ScheduledTaskNameMain) (ExecutionTimeLimit=$limitLabel; нужен PT0S — иначе Task Scheduler останавливает монитор через 72 ч)."
+        }
+    }
     if ($needWd) { Write-Log "Требуется обновить или создать задачу: $($script:ScheduledTaskNameWatchdog)" }
 
     Register-RdpMonitorScheduledTasksCore

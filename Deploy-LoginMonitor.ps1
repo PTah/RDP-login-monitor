@@ -929,6 +929,42 @@ function Stop-RdpLoginMonitorMainProcesses {
     }
 }
 
+function Test-RdpMonitorDeployMainTaskNeedsUnlimitedExecutionTime {
+    param([string]$TaskName = 'RDP-Login-Monitor')
+    try {
+        $limit = (Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Select-Object -First 1).Settings.ExecutionTimeLimit
+        if ($null -eq $limit) { return $true }
+        if ($limit.Ticks -le 0) { return $false }
+        if ($limit.TotalDays -ge 999) { return $false }
+        return $true
+    } catch {
+        return $true
+    }
+}
+
+function Get-RdpMonitorDeployMainTaskExecutionTimeLimitLabel {
+    param([string]$TaskName = 'RDP-Login-Monitor')
+    try {
+        $limit = (Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Select-Object -First 1).Settings.ExecutionTimeLimit
+        if ($null -eq $limit) { return '(null)' }
+        if ($limit.Ticks -le 0) { return 'PT0S (без лимита)' }
+        return $limit.ToString()
+    } catch {
+        return '(задача не найдена)'
+    }
+}
+
+function Write-RdpMonitorDeployScheduledTaskVerification {
+    param([string]$TaskName = 'RDP-Login-Monitor')
+    if (Test-RdpMonitorDeployMainTaskNeedsUnlimitedExecutionTime -TaskName $TaskName) {
+        $label = Get-RdpMonitorDeployMainTaskExecutionTimeLimitLabel -TaskName $TaskName
+        Write-DeployLog "ПРЕДУПРЕЖДЕНИЕ: $TaskName ExecutionTimeLimit=$label — ожидался PT0S (без лимита). Проверьте InstallTasks и права администратора."
+        return $false
+    }
+    Write-DeployLog "Задача $TaskName: ExecutionTimeLimit=PT0S (без лимита) — OK."
+    return $true
+}
+
 # --- main ---
 try {
     $shareRoot = Resolve-SourceShareRoot
@@ -969,7 +1005,8 @@ try {
     $needsExchangeNoisePatch = Test-RdpMonitorSettingsNeedsExchangeNoisePatch -SettingsPath $settingsLocal
     $needsWinRmInboundBlock = Test-RdpMonitorSettingsNeedsWinRmInboundBlock -SettingsPath $settingsLocal
     $needsBundleSync = Test-RdpMonitorDeployBundleNeedsSync -ShareRoot $shareRoot
-    $needsSacBootstrap = $needsSettingsBootstrap -or $needsBundleSync -or $needsDisplayNameHint -or $needsDailyReportHint -or $needsDailyReportRepair -or $needsExchangeNoisePatch -or $needsWinRmInboundBlock
+    $needsTaskExecutionLimitFix = Test-RdpMonitorDeployMainTaskNeedsUnlimitedExecutionTime
+    $needsSacBootstrap = $needsSettingsBootstrap -or $needsBundleSync -or $needsDisplayNameHint -or $needsDailyReportHint -or $needsDailyReportRepair -or $needsExchangeNoisePatch -or $needsWinRmInboundBlock -or $needsTaskExecutionLimitFix
 
     if (Test-RdpMonitorExchangeServerRole) {
         Write-DeployLog "Обнаружена роль Exchange — при необходимости допишем WinRM/4624 noise settings в login_monitor.settings.ps1."
@@ -1006,6 +1043,9 @@ try {
                 Write-DeployLog "Версия совпадает ($shareVerRaw), но на Exchange не хватает noise settings (WinRM/4624) — продолжаем деплой."
             } elseif ($needsWinRmInboundBlock) {
                 Write-DeployLog "Версия совпадает ($shareVerRaw), но в settings отсутствует обязательный блок WinRM inbound — продолжаем деплой."
+            } elseif ($needsTaskExecutionLimitFix) {
+                $limitLabel = Get-RdpMonitorDeployMainTaskExecutionTimeLimitLabel
+                Write-DeployLog "Версия совпадает ($shareVerRaw), но RDP-Login-Monitor имеет ExecutionTimeLimit=$limitLabel — перерегистрируем задачи (InstallTasks)."
             }
         }
         if ($cmp -lt 0 -and -not $AllowDowngrade) {
@@ -1071,6 +1111,8 @@ try {
     } else {
         Write-DeployLog "InstallTasks выполнен (код 0)."
     }
+
+    [void](Write-RdpMonitorDeployScheduledTaskVerification)
 
     [System.IO.File]::WriteAllText($VersionStampPath, "$shareVerRaw`r`n", $Utf8Bom)
     Write-DeployLog "Записана метка версии: $VersionStampPath"
