@@ -961,7 +961,7 @@ function Write-RdpMonitorDeployScheduledTaskVerification {
         Write-DeployLog "ПРЕДУПРЕЖДЕНИЕ: $TaskName ExecutionTimeLimit=$label — ожидался PT0S (без лимита). Проверьте InstallTasks и права администратора."
         return $false
     }
-    Write-DeployLog "Задача $TaskName: ExecutionTimeLimit=PT0S (без лимита) — OK."
+    Write-DeployLog "Задача ${TaskName}: ExecutionTimeLimit=PT0S (без лимита) — OK."
     return $true
 }
 
