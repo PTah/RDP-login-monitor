@@ -630,6 +630,48 @@ function Ensure-RdpMonitorWinRmOperationalLogEnabled {
     return $false
 }
 
+function Sync-RdpMonitorSettingsHeartbeatInterval {
+    param(
+        [string]$LocalSettings,
+        [int]$TargetSeconds = 14400
+    )
+
+    if (-not (Test-Path -LiteralPath $LocalSettings)) { return $false }
+
+    $c = Get-RdpMonitorSettingsRaw -Path $LocalSettings
+    if ([string]::IsNullOrWhiteSpace($c)) { return $false }
+
+    if ($c -match '(?m)^\s*\$HeartbeatInterval\s*=\s*(\d+)') {
+        $current = [int]$Matches[1]
+        if ($current -eq $TargetSeconds) { return $false }
+        $bak = "$LocalSettings.bak.$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+        Copy-Item -LiteralPath $LocalSettings -Destination $bak -Force
+        $newContent = [regex]::Replace(
+            $c,
+            '(?m)^(\s*\$HeartbeatInterval\s*=\s*)\d+',
+            "`${1}$TargetSeconds"
+        )
+        Write-DeployLog "login_monitor.settings.ps1: HeartbeatInterval $current → $TargetSeconds с (резервная копия: $bak)"
+    } else {
+        $bak = "$LocalSettings.bak.$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+        Copy-Item -LiteralPath $LocalSettings -Destination $bak -Force
+        $block = @(
+            '# --- Heartbeat SAC (agent.heartbeat): интервал в секундах; 14400 = 4 ч ---'
+            "`$HeartbeatInterval = $TargetSeconds"
+        ) -join "`r`n"
+        $insertBeforeInventory = '(?m)^\s*#\s*---\s*Инвентаризация железа'
+        if ($c -match $insertBeforeInventory) {
+            $newContent = [regex]::Replace($c, $insertBeforeInventory, ($block + "`r`n`r`n" + '$0'), 1)
+        } else {
+            $newContent = ($c.TrimEnd() + "`r`n`r`n" + $block + "`r`n")
+        }
+        Write-DeployLog "login_monitor.settings.ps1: добавлен `$HeartbeatInterval = $TargetSeconds (резервная копия: $bak)"
+    }
+
+    [System.IO.File]::WriteAllText($LocalSettings, $newContent.TrimEnd() + "`r`n", $Utf8Bom)
+    return $true
+}
+
 function Invoke-RdpMonitorSettingsPostPatches {
     param([string]$LocalSettings)
     if (-not (Test-Path -LiteralPath $LocalSettings)) { return $false }
@@ -1086,6 +1128,7 @@ try {
 
     if ($isScriptVersionUpgrade) {
         Sync-RdpMonitorUseSacFallbackMode -LocalSettings $settingsLocal | Out-Null
+        Sync-RdpMonitorSettingsHeartbeatInterval -LocalSettings $settingsLocal | Out-Null
     }
 
     $installArgs = @(

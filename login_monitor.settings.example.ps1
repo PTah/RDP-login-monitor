@@ -45,6 +45,9 @@ $SacApiKey = 'sac_UkOsAT3UWiQS54KK5OJPBDCSucysQDrKFju28wmYiz8'
 # В settings.ps1 используйте 1/0 или $true/$false — не пишите голое false без $
 $DailyReportEnabled = 1
 
+# --- Heartbeat SAC (agent.heartbeat): интервал в секундах; 14400 = 4 ч ---
+$HeartbeatInterval = 14400
+
 # --- Инвентаризация железа/ПО для SAC (agent.inventory, раз в 12 ч) ---
 $GetInventory = $true
 

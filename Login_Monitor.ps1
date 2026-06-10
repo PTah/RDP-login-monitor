@@ -89,7 +89,7 @@ $script:SkipLogDetailLimit = 15
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "2.0.25-SAC"
+$ScriptVersion = "2.0.27-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -101,7 +101,7 @@ $LogRotationMinute = 0
 $MaxBackupDays = 31
 
 # Heartbeat (файл; при отсутствии обновления > HeartbeatStaleAlertMultiplier × интервал — оповещение)
-$HeartbeatInterval = 3600
+$HeartbeatInterval = 14400
 # Инвентаризация железа/ПО для SAC (agent.inventory); интервал опроса, сек (12 ч).
 $InventoryIntervalSec = 43200
 $GetInventory = 1
