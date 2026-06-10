@@ -1126,9 +1126,11 @@ try {
 
     Sync-RdpMonitorSettingsFromShare -ExampleOnShare $settingsExampleShare -LocalSettings $settingsLocal
 
+    # При каждом deploy выравниваем HeartbeatInterval в settings (14400 с = 4 ч), не только при bump версии.
+    Sync-RdpMonitorSettingsHeartbeatInterval -LocalSettings $settingsLocal | Out-Null
+
     if ($isScriptVersionUpgrade) {
         Sync-RdpMonitorUseSacFallbackMode -LocalSettings $settingsLocal | Out-Null
-        Sync-RdpMonitorSettingsHeartbeatInterval -LocalSettings $settingsLocal | Out-Null
     }
 
     $installArgs = @(
