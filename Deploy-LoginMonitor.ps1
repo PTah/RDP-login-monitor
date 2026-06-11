@@ -973,12 +973,35 @@ function Stop-RdpLoginMonitorMainProcesses {
     }
 }
 
+function Convert-RdpMonitorDeployTaskExecutionTimeLimitValue {
+    param($Limit)
+
+    if ($null -eq $Limit) { return $null }
+    if ($Limit -is [TimeSpan]) { return $Limit }
+
+    $text = [string]$Limit
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+    $t = $text.Trim()
+    if ($t -eq 'PT0S') { return [TimeSpan]::Zero }
+
+    try {
+        return [System.Xml.XmlConvert]::ToTimeSpan($t)
+    } catch { }
+
+    try {
+        return [TimeSpan]::Parse($t)
+    } catch { }
+
+    return $null
+}
+
 function Test-RdpMonitorDeployTaskExecutionLimitUnlimitedValue {
     param($Limit)
 
-    if ($null -eq $Limit -or $Limit -isnot [TimeSpan]) { return $false }
-    if ($Limit.Ticks -le 0) { return $true }
-    if ($Limit.TotalDays -ge 999) { return $true }
+    $normalized = Convert-RdpMonitorDeployTaskExecutionTimeLimitValue -Limit $Limit
+    if ($null -eq $normalized) { return $false }
+    if ($normalized.Ticks -le 0) { return $true }
+    if ($normalized.TotalDays -ge 999) { return $true }
     return $false
 }
 
@@ -987,9 +1010,9 @@ function Get-RdpMonitorDeployTaskExecutionTimeLimitLabelFromResolved {
 
     if ($null -eq $Resolved) { return '(null)' }
     if ($Resolved.Source -eq 'missing') { return '(task missing)' }
-    $limit = $Resolved.Limit
+    $limit = Convert-RdpMonitorDeployTaskExecutionTimeLimitValue -Limit $Resolved.Limit
     if ($null -eq $limit) { return '(null)' }
-    if ($limit -is [TimeSpan] -and $limit.Ticks -le 0) { return 'PT0S' }
+    if ($limit.Ticks -le 0) { return 'PT0S' }
     return $limit.ToString()
 }
 
@@ -1019,33 +1042,63 @@ function Publish-RdpMonitorDeployTaskQueryFunctionsToScriptScope {
     }
 }
 
-function Import-RdpMonitorDeployTaskQueryModule {
-    param([string]$ShareRoot = '')
+function Import-RdpMonitorDeployTaskQueryModuleAtPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$Candidate
+    )
 
-    $candidates = [System.Collections.Generic.List[string]]::new()
-    if (-not [string]::IsNullOrWhiteSpace($ShareRoot)) {
-        $candidates.Add((Join-Path $ShareRoot 'RdpMonitor-TaskQuery.ps1')) | Out-Null
-    }
-    $deployScriptPath = $PSCommandPath
-    if ([string]::IsNullOrWhiteSpace($deployScriptPath)) { $deployScriptPath = $MyInvocation.MyCommand.Path }
-    if (-not [string]::IsNullOrWhiteSpace($deployScriptPath)) {
-        $candidates.Add((Join-Path (Split-Path -Parent $deployScriptPath) 'RdpMonitor-TaskQuery.ps1')) | Out-Null
-    }
-    $candidates.Add((Join-Path $InstallRoot 'RdpMonitor-TaskQuery.ps1')) | Out-Null
+    if (-not (Test-Path -LiteralPath $Candidate)) { return $false }
 
-    foreach ($candidate in @($candidates)) {
-        if (-not (Test-Path -LiteralPath $candidate)) { continue }
-        try {
-            . $candidate
-        } catch {
-            Write-DeployLog "Предупреждение: не удалось загрузить $candidate — $($_.Exception.Message)"
-            continue
+    $loadPath = $Candidate
+    $tempCopy = $null
+    try {
+        if ($Candidate.StartsWith('\\')) {
+            $tempCopy = Join-Path $env:TEMP ("rdp-taskquery-{0}.ps1" -f [guid]::NewGuid().ToString('N'))
+            Copy-Item -LiteralPath $Candidate -Destination $tempCopy -Force
+            $loadPath = $tempCopy
         }
+        . $loadPath
         if (Test-RdpMonitorDeployTaskQueryReady) {
             Publish-RdpMonitorDeployTaskQueryFunctionsToScriptScope
             return $true
         }
-        Write-DeployLog "Предупреждение: $candidate загружен, но функции TaskQuery недоступны — пробуем следующий источник."
+        Write-DeployLog "Предупреждение: $Candidate загружен, но функции TaskQuery недоступны — пробуем следующий источник."
+    } catch {
+        Write-DeployLog "Предупреждение: не удалось загрузить $Candidate — $($_.Exception.Message)"
+    } finally {
+        if ($null -ne $tempCopy -and (Test-Path -LiteralPath $tempCopy)) {
+            Remove-Item -LiteralPath $tempCopy -Force -ErrorAction SilentlyContinue
+        }
+    }
+    return $false
+}
+
+function Import-RdpMonitorDeployTaskQueryModule {
+    param([string]$ShareRoot = '')
+
+    $candidates = [System.Collections.Generic.List[string]]::new()
+    $installCandidate = Join-Path $InstallRoot 'RdpMonitor-TaskQuery.ps1'
+    $candidates.Add($installCandidate) | Out-Null
+
+    $deployScriptPath = $PSCommandPath
+    if ([string]::IsNullOrWhiteSpace($deployScriptPath)) { $deployScriptPath = $MyInvocation.MyCommand.Path }
+    if (-not [string]::IsNullOrWhiteSpace($deployScriptPath)) {
+        $deployCandidate = Join-Path (Split-Path -Parent $deployScriptPath) 'RdpMonitor-TaskQuery.ps1'
+        if ($deployCandidate -ne $installCandidate) {
+            $candidates.Add($deployCandidate) | Out-Null
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ShareRoot)) {
+        $shareCandidate = Join-Path $ShareRoot 'RdpMonitor-TaskQuery.ps1'
+        if ($shareCandidate -ne $installCandidate -and -not ($candidates -contains $shareCandidate)) {
+            $candidates.Add($shareCandidate) | Out-Null
+        }
+    }
+
+    foreach ($candidate in @($candidates)) {
+        if (Import-RdpMonitorDeployTaskQueryModuleAtPath -Candidate $candidate) {
+            return $true
+        }
     }
     return $false
 }
