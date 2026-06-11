@@ -250,6 +250,8 @@ function Copy-RdpMonitorDeployBundle {
         if (-not (Test-Path -LiteralPath $src)) {
             if ($rel -eq $SacClientName) {
                 Write-DeployLog "Предупреждение: на шаре нет $SacClientName — SAC недоступен до публикации файла на шару."
+            } elseif ($rel -eq 'RdpMonitor-TaskQuery.ps1') {
+                Write-DeployLog "Предупреждение: на шаре нет RdpMonitor-TaskQuery.ps1 — выполните update-rdp-monitor.ps1 на сервере публикации."
             }
             continue
         }
@@ -978,6 +980,11 @@ function Import-RdpMonitorDeployTaskQueryModule {
     $candidates.Add((Join-Path $InstallRoot 'RdpMonitor-TaskQuery.ps1')) | Out-Null
     if (-not [string]::IsNullOrWhiteSpace($ShareRoot)) {
         $candidates.Add((Join-Path $ShareRoot 'RdpMonitor-TaskQuery.ps1')) | Out-Null
+    }
+    $deployScriptPath = $PSCommandPath
+    if ([string]::IsNullOrWhiteSpace($deployScriptPath)) { $deployScriptPath = $MyInvocation.MyCommand.Path }
+    if (-not [string]::IsNullOrWhiteSpace($deployScriptPath)) {
+        $candidates.Add((Join-Path (Split-Path -Parent $deployScriptPath) 'RdpMonitor-TaskQuery.ps1')) | Out-Null
     } else {
         try {
             $candidates.Add((Join-Path (Resolve-SourceShareRoot) 'RdpMonitor-TaskQuery.ps1')) | Out-Null
@@ -993,10 +1000,110 @@ function Import-RdpMonitorDeployTaskQueryModule {
     return $false
 }
 
+function Initialize-RdpMonitorDeployTaskQuery {
+    param([string]$ShareRoot = '')
+
+    if (Get-Command Test-RdpMonitorScheduledTaskNeedsUnlimitedExecutionTimeLimit -ErrorAction SilentlyContinue) {
+        return $true
+    }
+    if (Import-RdpMonitorDeployTaskQueryModule -ShareRoot $ShareRoot) {
+        return $true
+    }
+
+    Write-DeployLog "RdpMonitor-TaskQuery.ps1 не найден — deploy использует встроенную проверку schtasks /XML."
+    . $script:RdpMonitorDeployTaskQueryInlineScript
+    return $true
+}
+
+$script:RdpMonitorDeployTaskQueryInlineScript = {
+    function Get-RdpMonitorSchtasksExe {
+        return Join-Path $env:SystemRoot 'System32\schtasks.exe'
+    }
+
+    function Get-RdpMonitorScheduledTaskXmlDocument {
+        param([Parameter(Mandatory = $true)][string]$TaskName)
+        $exe = Get-RdpMonitorSchtasksExe
+        $prevEa = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'SilentlyContinue'
+            $raw = & $exe /Query /TN $TaskName /XML 2>&1
+            if ($LASTEXITCODE -ne 0) { return $null }
+            $text = ($raw | Out-String).Trim()
+            if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+            if ($text -notmatch '(?s)<Task\b') { return $null }
+            return [xml]$text
+        } catch {
+            return $null
+        } finally {
+            $ErrorActionPreference = $prevEa
+        }
+    }
+
+    function Convert-RdpMonitorScheduledTaskExecutionTimeLimitText {
+        param([string]$LimitText)
+        if ([string]::IsNullOrWhiteSpace($LimitText)) { return $null }
+        $t = $LimitText.Trim()
+        if ($t -eq 'PT0S') { return [TimeSpan]::Zero }
+        try { return [System.Xml.XmlConvert]::ToTimeSpan($t) } catch { return $null }
+    }
+
+    function Get-RdpMonitorScheduledTaskExecutionTimeLimitFromDocument {
+        param([xml]$Doc)
+        if ($null -eq $Doc) { return $null }
+        $ns = New-Object System.Xml.XmlNamespaceManager($Doc.NameTable)
+        $ns.AddNamespace('t', 'http://schemas.microsoft.com/windows/2004/02/mit/task')
+        $node = $Doc.SelectSingleNode('//t:Settings/t:ExecutionTimeLimit', $ns)
+        if ($null -eq $node) {
+            $node = $Doc.SelectSingleNode('//*[local-name()="Settings"]/*[local-name()="ExecutionTimeLimit"]')
+        }
+        if ($null -eq $node -or [string]::IsNullOrWhiteSpace($node.InnerText)) { return $null }
+        return Convert-RdpMonitorScheduledTaskExecutionTimeLimitText -LimitText $node.InnerText.Trim()
+    }
+
+    function Test-RdpMonitorScheduledTaskExecutionTimeLimitUnlimitedValue {
+        param($Limit)
+        if ($null -eq $Limit -or $Limit -isnot [TimeSpan]) { return $false }
+        if ($Limit.Ticks -le 0) { return $true }
+        if ($Limit.TotalDays -ge 999) { return $true }
+        return $false
+    }
+
+    function Get-RdpMonitorScheduledTaskExecutionTimeLimitResolved {
+        param([Parameter(Mandatory = $true)][string]$TaskName)
+        try {
+            $limit = (Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Select-Object -First 1).Settings.ExecutionTimeLimit
+            return [pscustomobject]@{ Limit = $limit; Source = 'Get-ScheduledTask' }
+        } catch { }
+        $doc = Get-RdpMonitorScheduledTaskXmlDocument -TaskName $TaskName
+        if ($null -eq $doc) {
+            return [pscustomobject]@{ Limit = $null; Source = 'missing' }
+        }
+        $limit = Get-RdpMonitorScheduledTaskExecutionTimeLimitFromDocument -Doc $doc
+        return [pscustomobject]@{ Limit = $limit; Source = 'schtasks-xml' }
+    }
+
+    function Test-RdpMonitorScheduledTaskNeedsUnlimitedExecutionTimeLimit {
+        param([Parameter(Mandatory = $true)][string]$TaskName)
+        $resolved = Get-RdpMonitorScheduledTaskExecutionTimeLimitResolved -TaskName $TaskName
+        if ($resolved.Source -eq 'missing') { return $true }
+        return (-not (Test-RdpMonitorScheduledTaskExecutionTimeLimitUnlimitedValue -Limit $resolved.Limit))
+    }
+
+    function Get-RdpMonitorScheduledTaskExecutionTimeLimitLabel {
+        param([Parameter(Mandatory = $true)][string]$TaskName)
+        $resolved = Get-RdpMonitorScheduledTaskExecutionTimeLimitResolved -TaskName $TaskName
+        if ($resolved.Source -eq 'missing') { return '(task missing)' }
+        $limit = $resolved.Limit
+        if ($null -eq $limit) { return '(null)' }
+        if ($limit -is [TimeSpan] -and $limit.Ticks -le 0) { return 'PT0S' }
+        return $limit.ToString()
+    }
+}
+
 function Test-RdpMonitorDeployMainTaskNeedsUnlimitedExecutionTime {
     param([string]$TaskName = 'RDP-Login-Monitor')
     if (-not (Get-Command Test-RdpMonitorScheduledTaskNeedsUnlimitedExecutionTimeLimit -ErrorAction SilentlyContinue)) {
-        if (-not (Import-RdpMonitorDeployTaskQueryModule)) { return $true }
+        return $true
     }
     return (Test-RdpMonitorScheduledTaskNeedsUnlimitedExecutionTimeLimit -TaskName $TaskName)
 }
@@ -1004,19 +1111,13 @@ function Test-RdpMonitorDeployMainTaskNeedsUnlimitedExecutionTime {
 function Get-RdpMonitorDeployMainTaskExecutionTimeLimitLabel {
     param([string]$TaskName = 'RDP-Login-Monitor')
     if (-not (Get-Command Get-RdpMonitorScheduledTaskExecutionTimeLimitLabel -ErrorAction SilentlyContinue)) {
-        if (-not (Import-RdpMonitorDeployTaskQueryModule)) { return '(модуль TaskQuery недоступен)' }
+        return '(TaskQuery not loaded)'
     }
     return (Get-RdpMonitorScheduledTaskExecutionTimeLimitLabel -TaskName $TaskName)
 }
 
 function Write-RdpMonitorDeployScheduledTaskVerification {
     param([string]$TaskName = 'RDP-Login-Monitor')
-    if (-not (Get-Command Test-RdpMonitorScheduledTaskNeedsUnlimitedExecutionTimeLimit -ErrorAction SilentlyContinue)) {
-        if (-not (Import-RdpMonitorDeployTaskQueryModule)) {
-            Write-DeployLog "ПРЕДУПРЕЖДЕНИЕ: RdpMonitor-TaskQuery.ps1 не найден — проверка ExecutionTimeLimit пропущена."
-            return $false
-        }
-    }
 
     $resolved = Get-RdpMonitorScheduledTaskExecutionTimeLimitResolved -TaskName $TaskName
     if ($resolved.Source -eq 'schtasks-xml') {
@@ -1101,7 +1202,7 @@ try {
         Write-DeployLog "ОШИБКА: на шаре отсутствует $SacClientName — выполните update-rdp-monitor.ps1 на сервере публикации."
     }
 
-    [void](Import-RdpMonitorDeployTaskQueryModule -ShareRoot $shareRoot)
+    [void](Initialize-RdpMonitorDeployTaskQuery -ShareRoot $shareRoot)
 
     $needsSettingsBootstrap = Test-RdpMonitorSettingsNeedsSacBootstrap -SettingsPath $settingsLocal
     $needsDisplayNameHint = Test-RdpMonitorSettingsNeedsServerDisplayNameHint -SettingsPath $settingsLocal
@@ -1220,6 +1321,7 @@ try {
         Write-DeployLog "InstallTasks выполнен (код 0)."
     }
 
+    [void](Initialize-RdpMonitorDeployTaskQuery -ShareRoot $shareRoot)
     [void](Write-RdpMonitorDeployScheduledTaskVerification)
 
     [System.IO.File]::WriteAllText($VersionStampPath, "$shareVerRaw`r`n", $Utf8Bom)

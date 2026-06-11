@@ -90,7 +90,7 @@ $script:SkipLogDetailLimit = 15
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "2.0.28-SAC"
+$ScriptVersion = "2.0.29-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -1153,9 +1153,12 @@ if ($SendDeploySacNotice) {
             [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
     } catch { }
 
-    $hostLabel = $env:COMPUTERNAME
-    if (-not [string]::IsNullOrWhiteSpace($ServerDisplayName)) {
-        $hostLabel = [string]$ServerDisplayName
+    $hostLabel = [string]$env:COMPUTERNAME
+    if (Get-Variable -Name ServerDisplayName -Scope Script -ErrorAction SilentlyContinue) {
+        $sdn = (Get-Variable -Name ServerDisplayName -Scope Script -ValueOnly)
+        if ($null -ne $sdn -and -not [string]::IsNullOrWhiteSpace([string]$sdn)) {
+            $hostLabel = [string]$sdn.Trim()
+        }
     }
     $updatedAt = $null
     if (Test-Path -LiteralPath $DeployUpdateMarkerFile) {
