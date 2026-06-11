@@ -997,6 +997,28 @@ function Test-RdpMonitorDeployTaskQueryReady {
     return [bool](Get-Command Get-RdpMonitorScheduledTaskExecutionTimeLimitResolved -ErrorAction SilentlyContinue)
 }
 
+function Publish-RdpMonitorDeployTaskQueryFunctionsToScriptScope {
+    foreach ($name in @(
+            'Get-RdpMonitorSchtasksExe',
+            'Get-RdpMonitorScheduledTaskXmlDocument',
+            'Test-RdpMonitorScheduledTaskExistsViaSchtasks',
+            'Convert-RdpMonitorScheduledTaskExecutionTimeLimitText',
+            'Get-RdpMonitorScheduledTaskExecutionTimeLimitFromDocument',
+            'Get-RdpMonitorScheduledTaskActionFromDocument',
+            'Test-RdpMonitorScheduledTaskExecutionTimeLimitUnlimitedValue',
+            'Get-RdpMonitorScheduledTaskExecutionTimeLimitResolved',
+            'Test-RdpMonitorScheduledTaskExecutionTimeLimitUnlimited',
+            'Test-RdpMonitorScheduledTaskNeedsUnlimitedExecutionTimeLimit',
+            'Get-RdpMonitorScheduledTaskExecutionTimeLimitLabel',
+            'Test-RdpMonitorScheduledTaskActionMatchesViaSchtasks'
+        )) {
+        $cmd = Get-Command -Name $name -ErrorAction SilentlyContinue
+        if ($null -ne $cmd -and $cmd.CommandType -eq 'Function') {
+            Set-Item -Path "function:script:$name" -Value $cmd.ScriptBlock
+        }
+    }
+}
+
 function Import-RdpMonitorDeployTaskQueryModule {
     param([string]$ShareRoot = '')
 
@@ -1020,6 +1042,7 @@ function Import-RdpMonitorDeployTaskQueryModule {
             continue
         }
         if (Test-RdpMonitorDeployTaskQueryReady) {
+            Publish-RdpMonitorDeployTaskQueryFunctionsToScriptScope
             return $true
         }
         Write-DeployLog "Предупреждение: $candidate загружен, но функции TaskQuery недоступны — пробуем следующий источник."
@@ -1033,13 +1056,20 @@ function Initialize-RdpMonitorDeployTaskQuery {
     if (Test-RdpMonitorDeployTaskQueryReady) {
         return $true
     }
+
+    $loaded = $false
     if (Import-RdpMonitorDeployTaskQueryModule -ShareRoot $ShareRoot) {
-        return $true
+        $loaded = $true
+    } else {
+        Write-DeployLog "RdpMonitor-TaskQuery.ps1 недоступен — deploy использует встроенную проверку schtasks /XML."
+        . $script:RdpMonitorDeployTaskQueryInlineScript
+        $loaded = (Test-RdpMonitorDeployTaskQueryReady)
     }
 
-    Write-DeployLog "RdpMonitor-TaskQuery.ps1 недоступен — deploy использует встроенную проверку schtasks /XML."
-    . $script:RdpMonitorDeployTaskQueryInlineScript
-    return (Test-RdpMonitorDeployTaskQueryReady)
+    if ($loaded) {
+        Publish-RdpMonitorDeployTaskQueryFunctionsToScriptScope
+    }
+    return $loaded
 }
 
 $script:RdpMonitorDeployTaskQueryInlineScript = {
@@ -1212,6 +1242,8 @@ function Invoke-RdpMonitorDeploySacVersionNotice {
 }
 
 # --- main ---
+if ($env:RDP_DEPLOY_FUNCTIONS_ONLY -eq '1') { return }
+
 try {
     $shareRoot = Resolve-SourceShareRoot
     $sourceScript = Join-Path $shareRoot $ScriptName
