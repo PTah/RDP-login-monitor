@@ -973,11 +973,14 @@ function Stop-RdpLoginMonitorMainProcesses {
     }
 }
 
+function Test-RdpMonitorDeployTaskQueryReady {
+    return [bool](Get-Command Get-RdpMonitorScheduledTaskExecutionTimeLimitResolved -ErrorAction SilentlyContinue)
+}
+
 function Import-RdpMonitorDeployTaskQueryModule {
     param([string]$ShareRoot = '')
 
     $candidates = [System.Collections.Generic.List[string]]::new()
-    $candidates.Add((Join-Path $InstallRoot 'RdpMonitor-TaskQuery.ps1')) | Out-Null
     if (-not [string]::IsNullOrWhiteSpace($ShareRoot)) {
         $candidates.Add((Join-Path $ShareRoot 'RdpMonitor-TaskQuery.ps1')) | Out-Null
     }
@@ -985,17 +988,21 @@ function Import-RdpMonitorDeployTaskQueryModule {
     if ([string]::IsNullOrWhiteSpace($deployScriptPath)) { $deployScriptPath = $MyInvocation.MyCommand.Path }
     if (-not [string]::IsNullOrWhiteSpace($deployScriptPath)) {
         $candidates.Add((Join-Path (Split-Path -Parent $deployScriptPath) 'RdpMonitor-TaskQuery.ps1')) | Out-Null
-    } else {
-        try {
-            $candidates.Add((Join-Path (Resolve-SourceShareRoot) 'RdpMonitor-TaskQuery.ps1')) | Out-Null
-        } catch { }
     }
+    $candidates.Add((Join-Path $InstallRoot 'RdpMonitor-TaskQuery.ps1')) | Out-Null
 
     foreach ($candidate in @($candidates)) {
-        if (Test-Path -LiteralPath $candidate) {
+        if (-not (Test-Path -LiteralPath $candidate)) { continue }
+        try {
             . $candidate
+        } catch {
+            Write-DeployLog "Предупреждение: не удалось загрузить $candidate — $($_.Exception.Message)"
+            continue
+        }
+        if (Test-RdpMonitorDeployTaskQueryReady) {
             return $true
         }
+        Write-DeployLog "Предупреждение: $candidate загружен, но функции TaskQuery недоступны — пробуем следующий источник."
     }
     return $false
 }
@@ -1003,16 +1010,16 @@ function Import-RdpMonitorDeployTaskQueryModule {
 function Initialize-RdpMonitorDeployTaskQuery {
     param([string]$ShareRoot = '')
 
-    if (Get-Command Test-RdpMonitorScheduledTaskNeedsUnlimitedExecutionTimeLimit -ErrorAction SilentlyContinue) {
+    if (Test-RdpMonitorDeployTaskQueryReady) {
         return $true
     }
     if (Import-RdpMonitorDeployTaskQueryModule -ShareRoot $ShareRoot) {
         return $true
     }
 
-    Write-DeployLog "RdpMonitor-TaskQuery.ps1 не найден — deploy использует встроенную проверку schtasks /XML."
+    Write-DeployLog "RdpMonitor-TaskQuery.ps1 недоступен — deploy использует встроенную проверку schtasks /XML."
     . $script:RdpMonitorDeployTaskQueryInlineScript
-    return $true
+    return (Test-RdpMonitorDeployTaskQueryReady)
 }
 
 $script:RdpMonitorDeployTaskQueryInlineScript = {
@@ -1101,9 +1108,12 @@ $script:RdpMonitorDeployTaskQueryInlineScript = {
 }
 
 function Test-RdpMonitorDeployMainTaskNeedsUnlimitedExecutionTime {
-    param([string]$TaskName = 'RDP-Login-Monitor')
-    if (-not (Get-Command Test-RdpMonitorScheduledTaskNeedsUnlimitedExecutionTimeLimit -ErrorAction SilentlyContinue)) {
-        return $true
+    param(
+        [string]$TaskName = 'RDP-Login-Monitor',
+        [string]$ShareRoot = ''
+    )
+    if (-not (Test-RdpMonitorDeployTaskQueryReady)) {
+        if (-not (Initialize-RdpMonitorDeployTaskQuery -ShareRoot $ShareRoot)) { return $true }
     }
     return (Test-RdpMonitorScheduledTaskNeedsUnlimitedExecutionTimeLimit -TaskName $TaskName)
 }
@@ -1117,7 +1127,15 @@ function Get-RdpMonitorDeployMainTaskExecutionTimeLimitLabel {
 }
 
 function Write-RdpMonitorDeployScheduledTaskVerification {
-    param([string]$TaskName = 'RDP-Login-Monitor')
+    param(
+        [string]$TaskName = 'RDP-Login-Monitor',
+        [string]$ShareRoot = ''
+    )
+
+    if (-not (Initialize-RdpMonitorDeployTaskQuery -ShareRoot $ShareRoot)) {
+        Write-DeployLog "ПРЕДУПРЕЖДЕНИЕ: проверка ExecutionTimeLimit недоступна (TaskQuery не инициализирован)."
+        return $false
+    }
 
     $resolved = Get-RdpMonitorScheduledTaskExecutionTimeLimitResolved -TaskName $TaskName
     if ($resolved.Source -eq 'schtasks-xml') {
@@ -1211,7 +1229,7 @@ try {
     $needsExchangeNoisePatch = Test-RdpMonitorSettingsNeedsExchangeNoisePatch -SettingsPath $settingsLocal
     $needsWinRmInboundBlock = Test-RdpMonitorSettingsNeedsWinRmInboundBlock -SettingsPath $settingsLocal
     $needsBundleSync = Test-RdpMonitorDeployBundleNeedsSync -ShareRoot $shareRoot
-    $needsTaskExecutionLimitFix = Test-RdpMonitorDeployMainTaskNeedsUnlimitedExecutionTime
+    $needsTaskExecutionLimitFix = Test-RdpMonitorDeployMainTaskNeedsUnlimitedExecutionTime -ShareRoot $shareRoot
     $needsSacBootstrap = $needsSettingsBootstrap -or $needsBundleSync -or $needsDisplayNameHint -or $needsDailyReportHint -or $needsDailyReportRepair -or $needsExchangeNoisePatch -or $needsWinRmInboundBlock -or $needsTaskExecutionLimitFix
 
     if (Test-RdpMonitorExchangeServerRole) {
@@ -1321,8 +1339,7 @@ try {
         Write-DeployLog "InstallTasks выполнен (код 0)."
     }
 
-    [void](Initialize-RdpMonitorDeployTaskQuery -ShareRoot $shareRoot)
-    [void](Write-RdpMonitorDeployScheduledTaskVerification)
+    [void](Write-RdpMonitorDeployScheduledTaskVerification -ShareRoot $shareRoot)
 
     [System.IO.File]::WriteAllText($VersionStampPath, "$shareVerRaw`r`n", $Utf8Bom)
     Write-DeployLog "Записана метка версии: $VersionStampPath"
