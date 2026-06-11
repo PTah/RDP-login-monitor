@@ -87,13 +87,21 @@ function Get-RdpMonitorScheduledTaskActionFromDocument {
     }
 }
 
+function Convert-RdpMonitorScheduledTaskExecutionTimeLimitValue {
+    param($Limit)
+
+    if ($null -eq $Limit) { return $null }
+    if ($Limit -is [TimeSpan]) { return $Limit }
+    return Convert-RdpMonitorScheduledTaskExecutionTimeLimitText -LimitText ([string]$Limit)
+}
+
 function Test-RdpMonitorScheduledTaskExecutionTimeLimitUnlimitedValue {
     param($Limit)
 
-    if ($null -eq $Limit) { return $false }
-    if ($Limit -isnot [TimeSpan]) { return $false }
-    if ($Limit.Ticks -le 0) { return $true }
-    if ($Limit.TotalDays -ge 999) { return $true }
+    $normalized = Convert-RdpMonitorScheduledTaskExecutionTimeLimitValue -Limit $Limit
+    if ($null -eq $normalized) { return $false }
+    if ($normalized.Ticks -le 0) { return $true }
+    if ($normalized.TotalDays -ge 999) { return $true }
     return $false
 }
 
@@ -153,9 +161,9 @@ function Get-RdpMonitorScheduledTaskExecutionTimeLimitLabel {
     $resolved = Get-RdpMonitorScheduledTaskExecutionTimeLimitResolved -TaskName $TaskName
     if ($resolved.Source -eq 'missing') { return '(task missing)' }
 
-    $limit = $resolved.Limit
+    $limit = Convert-RdpMonitorScheduledTaskExecutionTimeLimitValue -Limit $resolved.Limit
     if ($null -eq $limit) { return '(null)' }
-    if ($limit -is [TimeSpan] -and $limit.Ticks -le 0) { return 'PT0S' }
+    if ($limit.Ticks -le 0) { return 'PT0S' }
     return $limit.ToString()
 }
 
