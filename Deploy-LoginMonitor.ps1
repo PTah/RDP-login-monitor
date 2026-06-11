@@ -58,7 +58,7 @@ $DeployLogPath = Join-Path $InstallRoot "Logs\deploy.log"
 $ScriptName = "Login_Monitor.ps1"
 $SacClientName = "Sac-Client.ps1"
 $VersionFileName = "version.txt"
-$DeployBundleFiles = @($ScriptName, $SacClientName, 'Diagnose-RdpLoginMonitor.ps1')
+$DeployBundleFiles = @($ScriptName, $SacClientName, 'Diagnose-RdpLoginMonitor.ps1', 'RdpMonitor-TaskQuery.ps1')
 $PsExe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
 
 $Utf8Bom = New-Object System.Text.UTF8Encoding $true
@@ -971,40 +971,101 @@ function Stop-RdpLoginMonitorMainProcesses {
     }
 }
 
+function Import-RdpMonitorDeployTaskQueryModule {
+    param([string]$ShareRoot = '')
+
+    $candidates = [System.Collections.Generic.List[string]]::new()
+    $candidates.Add((Join-Path $InstallRoot 'RdpMonitor-TaskQuery.ps1')) | Out-Null
+    if (-not [string]::IsNullOrWhiteSpace($ShareRoot)) {
+        $candidates.Add((Join-Path $ShareRoot 'RdpMonitor-TaskQuery.ps1')) | Out-Null
+    } else {
+        try {
+            $candidates.Add((Join-Path (Resolve-SourceShareRoot) 'RdpMonitor-TaskQuery.ps1')) | Out-Null
+        } catch { }
+    }
+
+    foreach ($candidate in @($candidates)) {
+        if (Test-Path -LiteralPath $candidate) {
+            . $candidate
+            return $true
+        }
+    }
+    return $false
+}
+
 function Test-RdpMonitorDeployMainTaskNeedsUnlimitedExecutionTime {
     param([string]$TaskName = 'RDP-Login-Monitor')
-    try {
-        $limit = (Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Select-Object -First 1).Settings.ExecutionTimeLimit
-        if ($null -eq $limit) { return $true }
-        if ($limit.Ticks -le 0) { return $false }
-        if ($limit.TotalDays -ge 999) { return $false }
-        return $true
-    } catch {
-        return $true
+    if (-not (Get-Command Test-RdpMonitorScheduledTaskNeedsUnlimitedExecutionTimeLimit -ErrorAction SilentlyContinue)) {
+        if (-not (Import-RdpMonitorDeployTaskQueryModule)) { return $true }
     }
+    return (Test-RdpMonitorScheduledTaskNeedsUnlimitedExecutionTimeLimit -TaskName $TaskName)
 }
 
 function Get-RdpMonitorDeployMainTaskExecutionTimeLimitLabel {
     param([string]$TaskName = 'RDP-Login-Monitor')
-    try {
-        $limit = (Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Select-Object -First 1).Settings.ExecutionTimeLimit
-        if ($null -eq $limit) { return '(null)' }
-        if ($limit.Ticks -le 0) { return 'PT0S (без лимита)' }
-        return $limit.ToString()
-    } catch {
-        return '(задача не найдена)'
+    if (-not (Get-Command Get-RdpMonitorScheduledTaskExecutionTimeLimitLabel -ErrorAction SilentlyContinue)) {
+        if (-not (Import-RdpMonitorDeployTaskQueryModule)) { return '(модуль TaskQuery недоступен)' }
     }
+    return (Get-RdpMonitorScheduledTaskExecutionTimeLimitLabel -TaskName $TaskName)
 }
 
 function Write-RdpMonitorDeployScheduledTaskVerification {
     param([string]$TaskName = 'RDP-Login-Monitor')
-    if (Test-RdpMonitorDeployMainTaskNeedsUnlimitedExecutionTime -TaskName $TaskName) {
-        $label = Get-RdpMonitorDeployMainTaskExecutionTimeLimitLabel -TaskName $TaskName
+    if (-not (Get-Command Test-RdpMonitorScheduledTaskNeedsUnlimitedExecutionTimeLimit -ErrorAction SilentlyContinue)) {
+        if (-not (Import-RdpMonitorDeployTaskQueryModule)) {
+            Write-DeployLog "ПРЕДУПРЕЖДЕНИЕ: RdpMonitor-TaskQuery.ps1 не найден — проверка ExecutionTimeLimit пропущена."
+            return $false
+        }
+    }
+
+    $resolved = Get-RdpMonitorScheduledTaskExecutionTimeLimitResolved -TaskName $TaskName
+    if ($resolved.Source -eq 'schtasks-xml') {
+        Write-DeployLog "Задача ${TaskName}: ExecutionTimeLimit проверен через schtasks /XML (Get-ScheduledTask недоступен)."
+    }
+
+    if (Test-RdpMonitorScheduledTaskNeedsUnlimitedExecutionTimeLimit -TaskName $TaskName) {
+        $label = Get-RdpMonitorScheduledTaskExecutionTimeLimitLabel -TaskName $TaskName
         Write-DeployLog "ПРЕДУПРЕЖДЕНИЕ: $TaskName ExecutionTimeLimit=$label — ожидался PT0S (без лимита). Проверьте InstallTasks и права администратора."
         return $false
     }
     Write-DeployLog "Задача ${TaskName}: ExecutionTimeLimit=PT0S (без лимита) — OK."
     return $true
+}
+
+function Invoke-RdpMonitorDeploySacVersionNotice {
+    if (-not (Test-Path -LiteralPath $LocalScript)) {
+        Write-DeployLog "SAC deploy notice: Login_Monitor.ps1 не найден — пропуск."
+        return
+    }
+    $settingsLocal = Join-Path $InstallRoot 'login_monitor.settings.ps1'
+    if (-not (Test-Path -LiteralPath $settingsLocal)) {
+        Write-DeployLog "SAC deploy notice: login_monitor.settings.ps1 отсутствует — пропуск."
+        return
+    }
+
+    $outLog = Join-Path $InstallRoot 'Logs\deploy_sac_notice_stdout.log'
+    $errLog = Join-Path $InstallRoot 'Logs\deploy_sac_notice_stderr.log'
+    $noticeArgs = @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $LocalScript, '-SendDeploySacNotice'
+    )
+    $p = Start-Process -FilePath $PsExe -ArgumentList $noticeArgs -Wait -PassThru -WindowStyle Hidden `
+        -RedirectStandardOutput $outLog -RedirectStandardError $errLog
+    if ($p.ExitCode -eq 0) {
+        Write-DeployLog "SAC: версия агента передана сразу после деплоя (SendDeploySacNotice)."
+        return
+    }
+
+    Write-DeployLog "Предупреждение: SendDeploySacNotice завершился с кодом $($p.ExitCode) — SAC обновится при старте монитора (agent.lifecycle)."
+    foreach ($pair in @(@($outLog, 'stdout'), @($errLog, 'stderr'))) {
+        $lp = $pair[0]
+        $lbl = $pair[1]
+        if (Test-Path -LiteralPath $lp) {
+            $tail = Get-Content -LiteralPath $lp -Tail 20 -ErrorAction SilentlyContinue
+            if ($tail) {
+                Write-DeployLog "SendDeploySacNotice $lbl (хвост): $($tail -join ' | ')"
+            }
+        }
+    }
 }
 
 # --- main ---
@@ -1039,6 +1100,8 @@ try {
     if (-not (Test-Path -LiteralPath (Join-Path $shareRoot $SacClientName))) {
         Write-DeployLog "ОШИБКА: на шаре отсутствует $SacClientName — выполните update-rdp-monitor.ps1 на сервере публикации."
     }
+
+    [void](Import-RdpMonitorDeployTaskQueryModule -ShareRoot $shareRoot)
 
     $needsSettingsBootstrap = Test-RdpMonitorSettingsNeedsSacBootstrap -SettingsPath $settingsLocal
     $needsDisplayNameHint = Test-RdpMonitorSettingsNeedsServerDisplayNameHint -SettingsPath $settingsLocal
@@ -1170,6 +1233,8 @@ try {
     ) -join "`r`n"
     [System.IO.File]::WriteAllText($DeployUpdateMarkerPath, "$updMarker`r`n", $Utf8Bom)
     Write-DeployLog "Записана метка обновления: $DeployUpdateMarkerPath (Version=$shareVerRaw; UpdatedAt=$updStamp)."
+
+    Invoke-RdpMonitorDeploySacVersionNotice
 
     if (-not $SkipStartMonitorAfterUpdate) {
         $canonical = [System.IO.Path]::GetFullPath($LocalScript)

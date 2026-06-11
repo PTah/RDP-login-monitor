@@ -24,6 +24,7 @@ $ErrorActionPreference = 'Stop'
 $DistFiles = @(
     'Login_Monitor.ps1',
     'Sac-Client.ps1',
+    'RdpMonitor-TaskQuery.ps1',
     'version.txt',
     'Deploy-LoginMonitor.ps1',
     'Restart-RdpLoginMonitor.ps1',

@@ -38,6 +38,7 @@ param(
     [switch]$SkipImmediateMainRun,
     [switch]$SkipScheduledTaskMaintenance,
     [switch]$CheckSac,
+    [switch]$SendDeploySacNotice,
     [switch]$RequestRestart,
     [switch]$Recycle
 )
@@ -89,7 +90,7 @@ $script:SkipLogDetailLimit = 15
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "2.0.27-SAC"
+$ScriptVersion = "2.0.28-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -480,31 +481,13 @@ function Invoke-RdpMonitorReloadSettings {
     return $false
 }
 
-function Test-RdpMonitorScheduledTaskExecutionTimeLimitUnlimited {
-    param(
-        [Parameter(Mandatory = $true)][string]$TaskName
-    )
-    try {
-        $limit = (Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Select-Object -First 1).Settings.ExecutionTimeLimit
-        if ($null -eq $limit) { return $false }
-        if ($limit.Ticks -le 0) { return $true }
-        # Некоторые сборки Windows возвращают «безлимит» как очень большой интервал.
-        if ($limit.TotalDays -ge 999) { return $true }
-        return $false
-    } catch {
-        return $false
-    }
-}
-
-function Get-RdpMonitorScheduledTaskExecutionTimeLimitLabel {
-    param([Parameter(Mandatory = $true)][string]$TaskName)
-    try {
-        $limit = (Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Select-Object -First 1).Settings.ExecutionTimeLimit
-        if ($null -eq $limit) { return '(null)' }
-        if ($limit.Ticks -le 0) { return 'PT0S (без лимита)' }
-        return $limit.ToString()
-    } catch {
-        return '(задача не найдена)'
+foreach ($taskQueryPath in @(
+        (Join-Path $PSScriptRoot 'RdpMonitor-TaskQuery.ps1'),
+        (Join-Path $script:InstallRoot 'RdpMonitor-TaskQuery.ps1')
+    )) {
+    if (Test-Path -LiteralPath $taskQueryPath) {
+        . $taskQueryPath
+        break
     }
 }
 
@@ -537,9 +520,18 @@ function Test-RdpMonitorScheduledTaskMatches {
             return $false
         }
         return $true
-    } catch {
+    } catch { }
+
+    if (-not (Get-Command Test-RdpMonitorScheduledTaskActionMatchesViaSchtasks -ErrorAction SilentlyContinue)) {
         return $false
     }
+    if (-not (Test-RdpMonitorScheduledTaskActionMatchesViaSchtasks -TaskName $TaskName -ExpectedExe $ExpectedExe -ExpectedArguments $ExpectedArguments)) {
+        return $false
+    }
+    if ($RequireUnlimitedExecutionTime -and -not (Test-RdpMonitorScheduledTaskExecutionTimeLimitUnlimited -TaskName $TaskName)) {
+        return $false
+    }
+    return $true
 }
 
 function Register-RdpMonitorScheduledTasksCore {
@@ -647,7 +639,7 @@ function Ensure-RdpMonitorScheduledTasks {
     }
     if ($needWd) { Write-Log "Требуется обновить или создать задачу: $($script:ScheduledTaskNameWatchdog)" }
 
-    Register-RdpMonitorScheduledTasksCore
+    Register-RdpMonitorScheduledTasksCore -SkipImmediateMainRun
 }
 
 function Start-RdpMonitorWatchdogMain {
@@ -1141,6 +1133,61 @@ if ($CheckSac) {
     }
     $code = Test-SacConnection
     exit $code
+}
+
+if ($SendDeploySacNotice) {
+    if (-not $script:SacClientLoaded) {
+        Write-Log "SendDeploySacNotice: Sac-Client.ps1 не найден."
+        exit 1
+    }
+    if ((Get-SacNormalizedMode) -eq 'off') {
+        Write-Log "SendDeploySacNotice: UseSAC=off — уведомление SAC пропущено."
+        exit 0
+    }
+    if (-not (Test-SacConfigured)) {
+        Write-Log "SendDeploySacNotice: SAC не настроен (SacUrl / SacApiKey)."
+        exit 1
+    }
+    try {
+        [System.Net.ServicePointManager]::SecurityProtocol =
+            [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+    } catch { }
+
+    $hostLabel = $env:COMPUTERNAME
+    if (-not [string]::IsNullOrWhiteSpace($ServerDisplayName)) {
+        $hostLabel = [string]$ServerDisplayName
+    }
+    $updatedAt = $null
+    if (Test-Path -LiteralPath $DeployUpdateMarkerFile) {
+        try {
+            foreach ($ln in (Get-Content -LiteralPath $DeployUpdateMarkerFile -ErrorAction Stop)) {
+                if ($ln -match '^\s*UpdatedAt\s*=\s*(.+)\s*$') {
+                    $updatedAt = $Matches[1].Trim()
+                    break
+                }
+            }
+        } catch { }
+    }
+
+    $summary = "RDP login monitor deployed, version $ScriptVersion on $hostLabel"
+    if (-not [string]::IsNullOrWhiteSpace($updatedAt)) {
+        $summary += " ($updatedAt)"
+    }
+    $details = @{
+        lifecycle = 'updated'
+        trigger   = 'deploy'
+        version   = [string]$ScriptVersion
+    }
+    $ok = Send-SacEvent -EventType 'agent.lifecycle' -Severity 'info' `
+        -Title "RDP agent updated to $ScriptVersion" `
+        -Summary $summary `
+        -Details $details
+    if ($ok) {
+        Write-Log "SendDeploySacNotice: SAC agent.lifecycle отправлен (version=$ScriptVersion)."
+        exit 0
+    }
+    Write-Log "SendDeploySacNotice: не удалось отправить в SAC (см. sac_client.log / spool)."
+    exit 1
 }
 
 Invoke-RdpMonitorProcessMigrationAndRelaunch
