@@ -973,6 +973,26 @@ function Stop-RdpLoginMonitorMainProcesses {
     }
 }
 
+function Test-RdpMonitorDeployTaskExecutionLimitUnlimitedValue {
+    param($Limit)
+
+    if ($null -eq $Limit -or $Limit -isnot [TimeSpan]) { return $false }
+    if ($Limit.Ticks -le 0) { return $true }
+    if ($Limit.TotalDays -ge 999) { return $true }
+    return $false
+}
+
+function Get-RdpMonitorDeployTaskExecutionTimeLimitLabelFromResolved {
+    param($Resolved)
+
+    if ($null -eq $Resolved) { return '(null)' }
+    if ($Resolved.Source -eq 'missing') { return '(task missing)' }
+    $limit = $Resolved.Limit
+    if ($null -eq $limit) { return '(null)' }
+    if ($limit -is [TimeSpan] -and $limit.Ticks -le 0) { return 'PT0S' }
+    return $limit.ToString()
+}
+
 function Test-RdpMonitorDeployTaskQueryReady {
     return [bool](Get-Command Get-RdpMonitorScheduledTaskExecutionTimeLimitResolved -ErrorAction SilentlyContinue)
 }
@@ -1112,18 +1132,22 @@ function Test-RdpMonitorDeployMainTaskNeedsUnlimitedExecutionTime {
         [string]$TaskName = 'RDP-Login-Monitor',
         [string]$ShareRoot = ''
     )
-    if (-not (Test-RdpMonitorDeployTaskQueryReady)) {
-        if (-not (Initialize-RdpMonitorDeployTaskQuery -ShareRoot $ShareRoot)) { return $true }
-    }
-    return (Test-RdpMonitorScheduledTaskNeedsUnlimitedExecutionTimeLimit -TaskName $TaskName)
+    if (-not (Initialize-RdpMonitorDeployTaskQuery -ShareRoot $ShareRoot)) { return $true }
+    $resolved = Get-RdpMonitorScheduledTaskExecutionTimeLimitResolved -TaskName $TaskName
+    if ($resolved.Source -eq 'missing') { return $true }
+    return (-not (Test-RdpMonitorDeployTaskExecutionLimitUnlimitedValue -Limit $resolved.Limit))
 }
 
 function Get-RdpMonitorDeployMainTaskExecutionTimeLimitLabel {
-    param([string]$TaskName = 'RDP-Login-Monitor')
-    if (-not (Get-Command Get-RdpMonitorScheduledTaskExecutionTimeLimitLabel -ErrorAction SilentlyContinue)) {
+    param(
+        [string]$TaskName = 'RDP-Login-Monitor',
+        [string]$ShareRoot = ''
+    )
+    if (-not (Initialize-RdpMonitorDeployTaskQuery -ShareRoot $ShareRoot)) {
         return '(TaskQuery not loaded)'
     }
-    return (Get-RdpMonitorScheduledTaskExecutionTimeLimitLabel -TaskName $TaskName)
+    $resolved = Get-RdpMonitorScheduledTaskExecutionTimeLimitResolved -TaskName $TaskName
+    return (Get-RdpMonitorDeployTaskExecutionTimeLimitLabelFromResolved -Resolved $resolved)
 }
 
 function Write-RdpMonitorDeployScheduledTaskVerification {
@@ -1142,8 +1166,8 @@ function Write-RdpMonitorDeployScheduledTaskVerification {
         Write-DeployLog "Задача ${TaskName}: ExecutionTimeLimit проверен через schtasks /XML (Get-ScheduledTask недоступен)."
     }
 
-    if (Test-RdpMonitorScheduledTaskNeedsUnlimitedExecutionTimeLimit -TaskName $TaskName) {
-        $label = Get-RdpMonitorScheduledTaskExecutionTimeLimitLabel -TaskName $TaskName
+    if (-not (Test-RdpMonitorDeployTaskExecutionLimitUnlimitedValue -Limit $resolved.Limit)) {
+        $label = Get-RdpMonitorDeployTaskExecutionTimeLimitLabelFromResolved -Resolved $resolved
         Write-DeployLog "ПРЕДУПРЕЖДЕНИЕ: $TaskName ExecutionTimeLimit=$label — ожидался PT0S (без лимита). Проверьте InstallTasks и права администратора."
         return $false
     }
@@ -1268,7 +1292,7 @@ try {
             } elseif ($needsWinRmInboundBlock) {
                 Write-DeployLog "Версия совпадает ($shareVerRaw), но в settings отсутствует обязательный блок WinRM inbound — продолжаем деплой."
             } elseif ($needsTaskExecutionLimitFix) {
-                $limitLabel = Get-RdpMonitorDeployMainTaskExecutionTimeLimitLabel
+                $limitLabel = Get-RdpMonitorDeployMainTaskExecutionTimeLimitLabel -ShareRoot $shareRoot
                 Write-DeployLog "Версия совпадает ($shareVerRaw), но RDP-Login-Monitor имеет ExecutionTimeLimit=$limitLabel — перерегистрируем задачи (InstallTasks)."
             }
         }
