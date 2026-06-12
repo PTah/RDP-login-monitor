@@ -632,6 +632,14 @@ function Ensure-RdpMonitorWinRmOperationalLogEnabled {
     return $false
 }
 
+function Test-RdpMonitorSettingsNeedsHeartbeatInterval {
+    param([string]$SettingsPath)
+    if (-not (Test-Path -LiteralPath $SettingsPath)) { return $true }
+    $c = Get-RdpMonitorSettingsRaw -Path $SettingsPath
+    if ([string]::IsNullOrWhiteSpace($c)) { return $true }
+    return ($c -notmatch '(?m)^\s*\$HeartbeatInterval\s*=\s*\d+')
+}
+
 function Sync-RdpMonitorSettingsHeartbeatInterval {
     param(
         [string]$LocalSettings,
@@ -1337,9 +1345,10 @@ try {
     $needsDailyReportRepair = Test-RdpMonitorSettingsHasInvalidDailyReportAssignment -SettingsPath $settingsLocal
     $needsExchangeNoisePatch = Test-RdpMonitorSettingsNeedsExchangeNoisePatch -SettingsPath $settingsLocal
     $needsWinRmInboundBlock = Test-RdpMonitorSettingsNeedsWinRmInboundBlock -SettingsPath $settingsLocal
+    $needsHeartbeatInterval = Test-RdpMonitorSettingsNeedsHeartbeatInterval -SettingsPath $settingsLocal
     $needsBundleSync = Test-RdpMonitorDeployBundleNeedsSync -ShareRoot $shareRoot
     $needsTaskExecutionLimitFix = Test-RdpMonitorDeployMainTaskNeedsUnlimitedExecutionTime -ShareRoot $shareRoot
-    $needsSacBootstrap = $needsSettingsBootstrap -or $needsBundleSync -or $needsDisplayNameHint -or $needsDailyReportHint -or $needsDailyReportRepair -or $needsExchangeNoisePatch -or $needsWinRmInboundBlock -or $needsTaskExecutionLimitFix
+    $needsSacBootstrap = $needsSettingsBootstrap -or $needsBundleSync -or $needsDisplayNameHint -or $needsDailyReportHint -or $needsDailyReportRepair -or $needsExchangeNoisePatch -or $needsWinRmInboundBlock -or $needsHeartbeatInterval -or $needsTaskExecutionLimitFix
 
     if (Test-RdpMonitorExchangeServerRole) {
         Write-DeployLog "Обнаружена роль Exchange — при необходимости допишем WinRM/4624 noise settings в login_monitor.settings.ps1."
@@ -1379,6 +1388,8 @@ try {
             } elseif ($needsTaskExecutionLimitFix) {
                 $limitLabel = Get-RdpMonitorDeployMainTaskExecutionTimeLimitLabel -ShareRoot $shareRoot
                 Write-DeployLog "Версия совпадает ($shareVerRaw), но RDP-Login-Monitor имеет ExecutionTimeLimit=$limitLabel — перерегистрируем задачи (InstallTasks)."
+            } elseif ($needsHeartbeatInterval) {
+                Write-DeployLog "Версия совпадает ($shareVerRaw), но в settings нет `$HeartbeatInterval — допишем 14400 с (4 ч) и продолжим деплой."
             }
         }
         if ($cmp -lt 0 -and -not $AllowDowngrade) {
@@ -1417,8 +1428,15 @@ try {
 
     Sync-RdpMonitorSettingsFromShare -ExampleOnShare $settingsExampleShare -LocalSettings $settingsLocal
 
-    # При каждом deploy выравниваем HeartbeatInterval в settings (14400 с = 4 ч), не только при bump версии.
-    Sync-RdpMonitorSettingsHeartbeatInterval -LocalSettings $settingsLocal | Out-Null
+    # При каждом deploy проверяем HeartbeatInterval в settings (14400 с = 4 ч); если нет — дописываем.
+    $heartbeatIntervalChanged = Sync-RdpMonitorSettingsHeartbeatInterval -LocalSettings $settingsLocal
+    if ($heartbeatIntervalChanged) {
+        $canonicalHb = [System.IO.Path]::GetFullPath($LocalScript)
+        if (Test-RdpMonitorMainProcessRunning -CanonicalScript $canonicalHb) {
+            Set-RdpMonitorRestartRequestFromDeploy -Mode 'settings' -Reason 'heartbeat_interval_deploy'
+            Write-DeployLog "HeartbeatInterval изменён — запрошена перезагрузка settings у работающего монитора."
+        }
+    }
 
     if ($isScriptVersionUpgrade) {
         Sync-RdpMonitorUseSacFallbackMode -LocalSettings $settingsLocal | Out-Null
