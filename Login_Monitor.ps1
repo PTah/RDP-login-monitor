@@ -90,7 +90,7 @@ $script:SkipLogDetailLimit = 15
 # строки ниже, если правки «мелкие» и вы не хотите менять отображаемую версию в логах).
 # Рекомендация: при значимых релизах меняйте и $ScriptVersion, и version.txt одинаково; при только
 # исправлениях на шаре — достаточно поднять patch в version.txt (например 1.3.0.1).
-$ScriptVersion = "2.0.33-SAC"
+$ScriptVersion = "2.0.34-SAC"
 
 # Логи (все под InstallRoot)
 $LogFile = Join-Path $script:InstallRoot "Logs\login_monitor.log"
@@ -2428,6 +2428,22 @@ function Convert-DailyReportPlainToTelegramHtml {
     return ($out -join "`r`n")
 }
 
+function Send-RdpMonitorSacHeartbeat {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Timestamp
+    )
+    Write-TextFileUtf8Bom -Path $HeartbeatFile -Text $Timestamp
+    $script:HeartbeatStaleAlertActive = $false
+    if ($script:SacClientLoaded -and (Get-SacNormalizedMode) -ne 'off') {
+        Send-MonitorNotification -Message '' -EmailSubject 'RDP Login Monitor: heartbeat' `
+            -SacEventType 'agent.heartbeat' -SacSeverity 'info' `
+            -SacTitle 'RDP monitor heartbeat' `
+            -SacSummary "Heartbeat $(Get-MonitorServerLabel) $Timestamp" `
+            -SacDetails @{ host = $env:COMPUTERNAME } | Out-Null
+    }
+}
+
 function Send-Heartbeat {
     param([switch]$IsStartup = $false)
 
@@ -2540,16 +2556,9 @@ function Send-Heartbeat {
             -SacTitle 'RDP login monitor started' `
             -SacSummary "Мониторинг запущен на $(Get-MonitorServerLabelWithIp), версия $ScriptVersion"
         Write-Log "Отправлено уведомление о запуске скрипта (каналы: $notifyChain)"
+        Send-RdpMonitorSacHeartbeat -Timestamp $timestamp
     } else {
-        Write-TextFileUtf8Bom -Path $HeartbeatFile -Text $timestamp
-        $script:HeartbeatStaleAlertActive = $false
-        if ($script:SacClientLoaded -and (Get-SacNormalizedMode) -ne 'off') {
-            Send-MonitorNotification -Message '' -EmailSubject 'RDP Login Monitor: heartbeat' `
-                -SacEventType 'agent.heartbeat' -SacSeverity 'info' `
-                -SacTitle 'RDP monitor heartbeat' `
-                -SacSummary "Heartbeat $(Get-MonitorServerLabel) $timestamp" `
-                -SacDetails @{ host = $env:COMPUTERNAME } | Out-Null
-        }
+        Send-RdpMonitorSacHeartbeat -Timestamp $timestamp
     }
 }
 
