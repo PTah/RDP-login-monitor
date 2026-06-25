@@ -1,0 +1,6 @@
+# Local settings with secrets — never commit
+login_monitor.settings.ps1
+ignore.lst
+deploy_last_update.txt
+deployed_version.txt
+*.log

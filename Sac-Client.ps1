@@ -1,0 +1,1205 @@
+<#
+.SYNOPSIS
+    Клиент Security Alert Center для RDP-login-monitor.
+.DESCRIPTION
+    Dot-source после login_monitor.settings.ps1 и функции Write-Log.
+    Ожидает: $UseSAC, $SacUrl, $SacApiKey, $ScriptVersion, $script:InstallRoot.
+    Release: same as Login_Monitor.ps1 $ScriptVersion / version.txt (host.display_name via $ServerDisplayName).
+#>
+
+function Test-SacIngestAcceptedStatus {
+    param([int]$StatusCode)
+    return ($StatusCode -in 201, 409, 202)
+}
+
+function Complete-SacIngestSuccess {
+    param(
+        [string]$EventId,
+        [string]$EventType,
+        [int]$StatusCode
+    )
+    Remove-SacSpoolFile -EventId $EventId
+    Reset-SacFailCount
+    if ($StatusCode -eq 409) {
+        Write-SacLog "SAC: duplicate OK (HTTP 409) event_id=$EventId type=$EventType"
+    } else {
+        Write-SacLog "SAC: accepted event_id=$EventId type=$EventType (HTTP $StatusCode)"
+    }
+}
+
+function Remove-SacLeadingBomChar {
+    param([string]$Text)
+    $t = $Text
+    # Нельзя $t.StartsWith([char]0xFEFF): в PS нет StartsWith(char), char→string даёт ложные совпадения и срезает '{'.
+    while ($t.Length -gt 0 -and [int][char]$t[0] -eq 0xFEFF) {
+        Write-SacLog 'WARN: SAC stripped U+FEFF BOM character before JSON body'
+        $t = $t.Substring(1)
+    }
+    return $t
+}
+
+function Repair-SacJsonText {
+    param([string]$Text)
+    $t = Get-SacSingleString -Value $Text -Label 'json body'
+    $t = Remove-SacLeadingBomChar -Text $t
+    $t = $t.TrimStart()
+    if ($t.Length -gt 5 -and $t.StartsWith('null', [System.StringComparison]::Ordinal) -and $t[4] -eq '{') {
+        Write-SacLog 'WARN: SAC stripped accidental null prefix before JSON body'
+        $t = $t.Substring(4).TrimStart()
+    }
+    if ($t.Length -gt 0 -and $t[0] -ne '{') {
+        $brace = $t.IndexOf('{')
+        if ($brace -gt 0) {
+            Write-SacLog "WARN: SAC stripped $brace chars before first '{' in JSON body"
+            $t = $t.Substring($brace)
+        }
+    }
+    return $t
+}
+
+function Get-SacUtf8Bytes {
+    param([Parameter(Mandatory = $true)][string]$Text)
+    $t = Repair-SacJsonText -Text $Text
+    $enc = New-Object System.Text.UTF8Encoding $false
+    $bytes = $enc.GetBytes($t)
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        Write-SacLog 'WARN: SAC stripped UTF-8 BOM bytes before JSON body'
+        $bytes = $bytes[3..($bytes.Length - 1)]
+    }
+    return $bytes
+}
+
+function Write-SacLog {
+    param([string]$Message)
+    if (Get-Command Write-Log -ErrorAction SilentlyContinue) {
+        [void](Write-Log $Message)
+    } else {
+        Write-Host $Message
+    }
+}
+
+function Get-SacSingleString {
+    param($Value, [string]$Label)
+    if ($null -eq $Value) { return '' }
+    if ($Value -is [string]) { return $Value }
+    if ($Value -is [System.Array]) {
+        $parts = @($Value | Where-Object { $null -ne $_ -and $_ -is [string] -and $_.Length -gt 0 })
+        if ($parts.Count -gt 0) {
+            if ($parts.Count -gt 1) {
+                Write-SacLog "WARN: SAC $Label had $($parts.Count) string parts; using last"
+            }
+            return [string]$parts[-1]
+        }
+    }
+    return [string]$Value
+}
+
+function Get-SacNormalizedMode {
+    $m = if ($null -ne $UseSAC) { [string]$UseSAC } else { 'off' }
+    return $m.Trim().ToLowerInvariant()
+}
+
+function Test-SacConfigured {
+    return (-not [string]::IsNullOrWhiteSpace($SacUrl)) -and (-not [string]::IsNullOrWhiteSpace($SacApiKey))
+}
+
+function Get-SacBaseUrl {
+    if ([string]::IsNullOrWhiteSpace($SacUrl)) { return $null }
+    $url = $SacUrl.Trim().TrimEnd('/')
+    if ($url -match '/api/v1/events$') {
+        $url = $url -replace '/api/v1/events$', ''
+    }
+    return $url.TrimEnd('/')
+}
+
+function Get-SacIngestUrl {
+    $base = Get-SacBaseUrl
+    if ([string]::IsNullOrWhiteSpace($base)) { return $null }
+    return "$base/api/v1/events"
+}
+
+function Get-SacSpoolDirResolved {
+    if (-not [string]::IsNullOrWhiteSpace($SacSpoolDir)) {
+        return $SacSpoolDir.Trim()
+    }
+    return (Join-Path $script:InstallRoot 'sac-spool')
+}
+
+function Get-SacAgentIdFileResolved {
+    if (-not [string]::IsNullOrWhiteSpace($SacAgentIdFile)) {
+        return $SacAgentIdFile.Trim()
+    }
+    return (Join-Path $script:InstallRoot 'agent_instance_id')
+}
+
+function Get-SacFailCountFileResolved {
+    return (Join-Path $script:InstallRoot 'sac-fail.count')
+}
+
+function Get-SacAgentInstanceId {
+    $idFile = Get-SacAgentIdFileResolved
+    $dir = Split-Path -Parent $idFile
+    if (-not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+    if (Test-Path -LiteralPath $idFile) {
+        $existing = Read-SacAgentIdFileText -Path $idFile
+        if (-not [string]::IsNullOrWhiteSpace($existing)) {
+            $existing = Remove-SacLeadingBomChar -Text $existing.Trim()
+            return $existing.Trim()
+        }
+    }
+    $newId = [guid]::NewGuid().ToString()
+    try {
+        [System.IO.File]::WriteAllText($idFile, $newId, (New-Object System.Text.UTF8Encoding $false))
+    } catch { }
+    return $newId
+}
+
+function Read-SacAgentIdFileText {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    $enc = New-Object System.Text.UTF8Encoding $false
+    return [System.IO.File]::ReadAllText($Path, $enc).Trim()
+}
+
+function Get-SacOccurredAtIso {
+    return [DateTimeOffset]::Now.ToString('yyyy-MM-ddTHH:mm:ss.fffK')
+}
+
+function Get-SacOccurredAtIsoFromDateTime {
+    param([Parameter(Mandatory = $true)][datetime]$When)
+
+    $dt = $When
+    if ($dt.Kind -eq [DateTimeKind]::Unspecified) {
+        $dt = [datetime]::SpecifyKind($dt, [DateTimeKind]::Local)
+    }
+    return ([DateTimeOffset]$dt).ToString('yyyy-MM-ddTHH:mm:ss.fffK')
+}
+
+function Convert-AnyToJsonSerializable {
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [string] -or $Value -is [bool] -or $Value -is [char]) {
+        return $Value
+    }
+    # PS 5.1: нет алиасов [uint]/[ulong] — IsPrimitive покрывает все числовые типы.
+    if ($Value.GetType().IsPrimitive) {
+        return $Value
+    }
+    if ($Value -is [enum]) {
+        return [string]$Value
+    }
+    if ($Value -is [decimal] -or $Value -is [single] -or $Value -is [double]) {
+        return [double]$Value
+    }
+    if ($Value -is [datetime] -or $Value -is [datetimeoffset] -or $Value -is [guid] -or $Value -is [version]) {
+        return [string]$Value
+    }
+    if ($Value -is [System.Management.Automation.PSMethod] -or
+        $Value -is [System.Management.Automation.ScriptBlock] -or
+        $Value -is [System.Management.Automation.PSMemberInfo] -or
+        $Value -is [Delegate]) {
+        return $null
+    }
+    $typeName = $Value.GetType().FullName
+    if ($typeName -like 'Microsoft.Management.Infrastructure.CimInstance*' -or
+        $typeName -like 'Microsoft.Management.Infrastructure.CimProperty*') {
+        $out = @{}
+        foreach ($prop in $Value.CimInstanceProperties) {
+            if ($null -eq $prop -or $null -eq $prop.Name) { continue }
+            $out[$prop.Name] = Convert-AnyToJsonSerializable $prop.Value
+        }
+        return $out
+    }
+    if ($Value -is [pscustomobject]) {
+        $out = @{}
+        foreach ($prop in $Value.PSObject.Properties) {
+            if ($prop.MemberType -notin @('NoteProperty', 'Property', 'AliasProperty', 'CodeProperty', 'ScriptProperty')) {
+                continue
+            }
+            $out[$prop.Name] = Convert-AnyToJsonSerializable $prop.Value
+        }
+        return $out
+    }
+    if ($Value -is [hashtable] -or $Value -is [System.Collections.IDictionary]) {
+        $out = @{}
+        foreach ($key in $Value.Keys) {
+            $out[[string]$key] = Convert-AnyToJsonSerializable $Value[$key]
+        }
+        return $out
+    }
+    if ($Value -is [System.Collections.IEnumerable]) {
+        return ,@(
+            foreach ($item in $Value) {
+                Convert-AnyToJsonSerializable $item
+            }
+        )
+    }
+    return [string]$Value
+}
+
+function ConvertTo-SacJsonText {
+    param([Parameter(Mandatory = $true)]$Payload)
+    $serializable = Convert-AnyToJsonSerializable $Payload
+    return ,($serializable | ConvertTo-Json -Depth 16 -Compress)
+}
+
+function Get-SacCategoryForType {
+    param([string]$EventType)
+    if ($EventType -match '^agent\.') { return 'agent' }
+    if ($EventType -match '^(ssh\.|auth\.|rdp\.)') { return 'auth' }
+    if ($EventType -match '^privilege\.') { return 'privilege' }
+    if ($EventType -match '^session\.') { return 'session' }
+    if ($EventType -match '^report\.') { return 'report' }
+    if ($EventType -match '^rdg\.') { return 'network' }
+    return 'agent'
+}
+
+function Limit-SacString {
+    param(
+        [string]$Text,
+        [int]$MaxLen,
+        [string]$Label
+    )
+    if ([string]::IsNullOrEmpty($Text)) { return '' }
+    if ($Text.Length -le $MaxLen) { return $Text }
+    Write-SacLog "WARN: SAC truncate $Label $($Text.Length) -> $MaxLen chars (event schema limit)"
+    return $Text.Substring(0, $MaxLen)
+}
+
+function Get-SacHttpErrorBody {
+    param($ErrorRecord)
+    if ($null -ne $ErrorRecord -and $null -ne $ErrorRecord.ErrorDetails -and -not [string]::IsNullOrWhiteSpace($ErrorRecord.ErrorDetails.Message)) {
+        return [string]$ErrorRecord.ErrorDetails.Message
+    }
+    $ex = if ($null -ne $ErrorRecord) { $ErrorRecord.Exception } else { $null }
+    try {
+        if ($null -eq $ex -or $null -eq $ex.Response) { return '' }
+        $stream = $ex.Response.GetResponseStream()
+        if ($null -eq $stream) { return '' }
+        $reader = New-Object System.IO.StreamReader($stream)
+        $body = $reader.ReadToEnd()
+        $reader.Close()
+        return $body
+    } catch {
+        return ''
+    }
+}
+
+function Get-SacHostBlock {
+    $hostname = [string]$env:COMPUTERNAME
+    $hostBlock = [ordered]@{
+        hostname  = $hostname
+        os_family = 'windows'
+    }
+    $displayLabel = $hostname
+    if (Get-Command -Name Get-MonitorServerLabelWithIp -ErrorAction SilentlyContinue) {
+        $displayLabel = [string](Get-MonitorServerLabelWithIp)
+    } elseif (Get-Variable -Name ServerDisplayName -ErrorAction SilentlyContinue) {
+        $label = (Get-Variable -Name ServerDisplayName -ValueOnly)
+        if (-not [string]::IsNullOrWhiteSpace([string]$label)) {
+            $displayLabel = [string]$label.Trim()
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($displayLabel)) {
+        $hostBlock.display_name = $displayLabel
+    }
+    $ipv4 = Get-SacHostIPv4
+    if (-not [string]::IsNullOrWhiteSpace($ipv4)) {
+        $hostBlock.ipv4 = $ipv4
+    }
+    return $hostBlock
+}
+
+function Get-SacHostIPv4 {
+    # Явный override в login_monitor.settings.ps1 (опционально).
+    if (Get-Variable -Name ServerIPv4 -ErrorAction SilentlyContinue) {
+        $manual = [string](Get-Variable -Name ServerIPv4 -ValueOnly)
+        if (-not [string]::IsNullOrWhiteSpace($manual)) {
+            $m = $manual.Trim()
+            if ($m -match '^(?:\d{1,3}\.){3}\d{1,3}$') { return $m }
+            Write-SacLog "WARN: ServerIPv4='$m' не похож на IPv4, игнорирую override"
+        }
+    }
+
+    try {
+        $ips = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {
+            $_.IPAddress -and
+            $_.IPAddress -notmatch '^(127\.|169\.254\.)' -and
+            $_.PrefixOrigin -ne 'WellKnown'
+        } | Select-Object -ExpandProperty IPAddress)
+        if ($ips.Count -gt 0) { return [string]$ips[0] }
+    } catch {}
+
+    try {
+        $sock = New-Object System.Net.Sockets.Socket ([System.Net.Sockets.AddressFamily]::InterNetwork), ([System.Net.Sockets.SocketType]::Dgram), ([System.Net.Sockets.ProtocolType]::Udp)
+        $sock.Connect('1.1.1.1', 53)
+        $ip = [string]$sock.LocalEndPoint.Address
+        $sock.Dispose()
+        if ($ip -match '^(?:\d{1,3}\.){3}\d{1,3}$' -and $ip -notmatch '^(127\.|169\.254\.)') { return $ip }
+    } catch {}
+
+    return ''
+}
+
+function New-SacEventPayload {
+    param(
+        [Parameter(Mandatory = $true)][string]$EventType,
+        [Parameter(Mandatory = $true)][string]$Severity,
+        [Parameter(Mandatory = $true)][string]$Title,
+        [Parameter(Mandatory = $true)][string]$Summary,
+        [hashtable]$Details = $null,
+        $OccurredAt = $null
+    )
+
+    $Title = Limit-SacString -Text $Title -MaxLen 256 -Label 'title'
+    $Summary = Limit-SacString -Text $Summary -MaxLen 8192 -Label 'summary'
+
+    $payload = [ordered]@{
+        schema_version = '1.0'
+        event_id       = [guid]::NewGuid().ToString()
+        occurred_at    = if ($null -ne $OccurredAt) { (Get-SacOccurredAtIsoFromDateTime -When $OccurredAt) } else { (Get-SacOccurredAtIso) }
+        source         = [ordered]@{
+            product            = 'rdp-login-monitor'
+            product_version    = if ($ScriptVersion) { [string]$ScriptVersion } else { 'unknown' }
+            agent_instance_id  = Get-SacAgentInstanceId
+        }
+        host           = (Get-SacHostBlock)
+        category       = (Get-SacCategoryForType -EventType $EventType)
+        type           = $EventType
+        severity       = $Severity
+        title          = $Title
+        summary        = $Summary
+    }
+    if ($null -ne $Details -and $Details.Count -gt 0) {
+        $payload.details = $Details
+    }
+    return $payload
+}
+
+function Get-SacFailCount {
+    $f = Get-SacFailCountFileResolved
+    if (-not (Test-Path -LiteralPath $f)) { return 0 }
+    $raw = (Get-Content -LiteralPath $f -TotalCount 1 -ErrorAction SilentlyContinue) -replace '\D', ''
+    if ([string]::IsNullOrWhiteSpace($raw)) { return 0 }
+    return [int]$raw
+}
+
+function Set-SacFailCount {
+    param([int]$Count)
+    $f = Get-SacFailCountFileResolved
+    $dir = Split-Path -Parent $f
+    if (-not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+    Set-Content -LiteralPath $f -Value ([string]$Count) -Encoding UTF8 -NoNewline
+}
+
+function Reset-SacFailCount {
+    Set-SacFailCount -Count 0
+}
+
+function Test-SacShouldAttemptSend {
+    $mode = Get-SacNormalizedMode
+    if ($mode -ne 'fallback') { return $true }
+
+    $max = if ($SacFallbackFailures) { [int]$SacFallbackFailures } else { 5 }
+    $n = Get-SacFailCount
+    if ($n -lt $max) { return $true }
+
+    if (Test-SacHealth) {
+        Reset-SacFailCount
+        Write-SacLog 'SAC: /health OK, resuming POST (fallback)'
+        return $true
+    }
+    Write-SacLog "WARN: SAC fallback: skip POST ($n>=$max failures), local channels only"
+    return $false
+}
+
+function Invoke-SacTlsPrep {
+    if (-not $SacTlsSkipVerify) { return }
+    if (-not $script:SacTlsCallbackRegistered) {
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+        $script:SacTlsCallbackRegistered = $true
+    }
+}
+
+function Test-SacHealth {
+    if (-not (Test-SacConfigured)) { return $false }
+    $base = Get-SacBaseUrl
+    if ([string]::IsNullOrWhiteSpace($base)) { return $false }
+
+    $timeout = if ($SacTimeoutSec) { [int]$SacTimeoutSec } else { 12 }
+    try {
+        Invoke-SacTlsPrep
+        $resp = Invoke-WebRequest -Uri "$base/health" -Method Get -UseBasicParsing -TimeoutSec $timeout
+        return ($resp.StatusCode -eq 200)
+    } catch {
+        return $false
+    }
+}
+
+function Write-SacSpoolFile {
+    param(
+        [string]$EventId,
+        [string]$JsonBody
+    )
+    $dir = Get-SacSpoolDirResolved
+    if (-not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+    $path = Join-Path $dir "$EventId.json"
+    [System.IO.File]::WriteAllText($path, $JsonBody, (New-Object System.Text.UTF8Encoding $false))
+}
+
+function Remove-SacSpoolFile {
+    param([string]$EventId)
+    $path = Join-Path (Get-SacSpoolDirResolved) "$EventId.json"
+    if (Test-Path -LiteralPath $path) {
+        Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Move-SacSpoolToRejected {
+    param([string]$EventId)
+    $dir = Get-SacSpoolDirResolved
+    $src = Join-Path $dir "$EventId.json"
+    if (-not (Test-Path -LiteralPath $src)) { return }
+    $rejDir = Join-Path $dir 'rejected'
+    if (-not (Test-Path -LiteralPath $rejDir)) {
+        New-Item -ItemType Directory -Path $rejDir -Force | Out-Null
+    }
+    $dst = Join-Path $rejDir "$EventId.json"
+    Move-Item -LiteralPath $src -Destination $dst -Force -ErrorAction SilentlyContinue
+}
+
+function Test-SacGuidString {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    return ($Value.Trim() -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
+}
+
+function Get-SacEventIdFromSpoolFileName {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+    $base = [System.IO.Path]::GetFileNameWithoutExtension($Path)
+    if (Test-SacGuidString -Value $base) {
+        return $base.ToLowerInvariant()
+    }
+    return $null
+}
+
+function Get-SacEventIdFromJsonText {
+    param([string]$JsonText)
+    if ([string]::IsNullOrWhiteSpace($JsonText)) { return $null }
+    if ($JsonText -match '"event_id"\s*:\s*"([0-9a-fA-F-]{36})"') {
+        return $Matches[1].ToLowerInvariant()
+    }
+    return $null
+}
+
+function Test-SacSpoolBytesCorrupt {
+    param([byte[]]$Bytes)
+    if ($null -eq $Bytes -or $Bytes.Length -lt 2) { return $true }
+    # UTF-16/UTF-32 с нулевым стартом или «пустой» spool — не JSON (см. hex 00 00 00 00).
+    if ($Bytes[0] -eq 0 -and $Bytes[1] -eq 0) { return $true }
+    return $false
+}
+
+function Read-SacSpoolFileBytes {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    return [System.IO.File]::ReadAllBytes($Path)
+}
+
+function Read-SacSpoolFileText {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $bytes = Read-SacSpoolFileBytes -Path $Path
+    if (Test-SacSpoolBytesCorrupt -Bytes $bytes) { return $null }
+    if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) {
+        return [System.Text.Encoding]::Unicode.GetString($bytes)
+    }
+    if ($bytes.Length -ge 2 -and $bytes[0] -eq 0x7B -and $Bytes[1] -eq 0) {
+        return [System.Text.Encoding]::Unicode.GetString($bytes)
+    }
+    $utf8 = New-Object System.Text.UTF8Encoding $false
+    return $utf8.GetString($bytes)
+}
+
+function Move-SacSpoolFileToRejected {
+    param(
+        [Parameter(Mandatory = $true)][string]$SpoolFilePath,
+        [string]$Reason = ''
+    )
+    $eventId = Get-SacEventIdFromSpoolFileName -Path $SpoolFilePath
+    if ($Reason) {
+        $label = if ($eventId) { "$eventId.json" } else { [System.IO.Path]::GetFileName($SpoolFilePath) }
+        Write-SacLog "WARN: SAC spool → rejected ($Reason): $label"
+    }
+    if ($eventId) {
+        Move-SacSpoolToRejected -EventId $eventId
+        return
+    }
+    $dir = Get-SacSpoolDirResolved
+    $name = [System.IO.Path]::GetFileName($SpoolFilePath)
+    $src = Join-Path $dir $name
+    if (-not (Test-Path -LiteralPath $src)) { return }
+    $rejDir = Join-Path $dir 'rejected'
+    if (-not (Test-Path -LiteralPath $rejDir)) {
+        New-Item -ItemType Directory -Path $rejDir -Force | Out-Null
+    }
+    $dst = Join-Path $rejDir $name
+    Move-Item -LiteralPath $src -Destination $dst -Force -ErrorAction SilentlyContinue
+}
+
+function Get-SacPostBodyBytes {
+    param([string]$JsonText)
+    $bytes = Get-SacUtf8Bytes -Text $JsonText
+    if ($bytes -is [System.Array] -and $bytes -isnot [byte[]]) {
+        $flat = New-Object System.Collections.Generic.List[byte]
+        foreach ($chunk in $bytes) {
+            if ($null -eq $chunk) { continue }
+            if ($chunk -is [byte[]]) {
+                foreach ($b in $chunk) { $flat.Add($b) | Out-Null }
+            } elseif ($chunk -is [byte]) {
+                $flat.Add([byte]$chunk) | Out-Null
+            }
+        }
+        $bytes = $flat.ToArray()
+    }
+    if ($bytes -isnot [byte[]]) {
+        Write-SacLog "WARN: SAC POST aborted: body is not byte[] (type=$($bytes.GetType().FullName))"
+        return $null
+    }
+    if ($bytes.Length -ge 4 -and $bytes[0] -eq 0x6E -and $bytes[1] -eq 0x75 -and $bytes[2] -eq 0x6C -and $bytes[3] -eq 0x6C) {
+        Write-SacLog 'WARN: SAC POST aborted: body starts with ASCII null (0x6E756C6C)'
+        return $null
+    }
+    if ($bytes.Length -lt 2 -or $bytes[0] -ne 0x7B) {
+        $take = [Math]::Min(16, $bytes.Length)
+        $hex = if ($take -gt 0) {
+            (($bytes[0..($take - 1)] | ForEach-Object { '{0:X2}' -f $_ }) -join ' ')
+        } else { '(empty)' }
+        Write-SacLog "WARN: SAC POST aborted: body must start with 0x7B '{{' (hex: $hex)"
+        return $null
+    }
+    try {
+        $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+        $null = $text | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        Write-SacLog "WARN: SAC POST aborted: local JSON parse failed ($($_.Exception.Message))"
+        return $null
+    }
+    return $bytes
+}
+
+function Invoke-SacHttpPost {
+    param(
+        [string]$Uri,
+        [byte[]]$BodyBytes,
+        [string]$EventId,
+        [int]$TimeoutSec
+    )
+    Invoke-SacTlsPrep
+    $req = [System.Net.HttpWebRequest]::Create($Uri)
+    $req.Method = 'POST'
+    $req.Timeout = $TimeoutSec * 1000
+    $req.ReadWriteTimeout = $TimeoutSec * 1000
+    $req.ContentType = 'application/json'
+    $req.ContentLength = $BodyBytes.Length
+    $req.Headers[[System.Net.HttpRequestHeader]::Authorization] = "Bearer $SacApiKey"
+    $req.Headers.Add('Idempotency-Key', $EventId)
+
+    $stream = $req.GetRequestStream()
+    try {
+        $stream.Write($BodyBytes, 0, $BodyBytes.Length)
+    } finally {
+        $stream.Close()
+    }
+
+    try {
+        $resp = $req.GetResponse()
+        $code = [int]$resp.StatusCode
+        $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
+        $content = $reader.ReadToEnd()
+        $reader.Close()
+        $resp.Close()
+        return @{ StatusCode = $code; Content = $content }
+    } catch [System.Net.WebException] {
+        $code = 0
+        $content = ''
+        $exResp = $_.Exception.Response
+        if ($null -ne $exResp) {
+            $code = [int]$exResp.StatusCode
+            try {
+                $reader = New-Object System.IO.StreamReader($exResp.GetResponseStream())
+                $content = $reader.ReadToEnd()
+                $reader.Close()
+            } catch { }
+            $exResp.Close()
+        }
+        return @{ StatusCode = $code; Content = $content; Error = $_.Exception.Message }
+    }
+}
+
+function Write-SacPostBodyDiagnostic {
+    param(
+        [byte[]]$BodyBytes,
+        [string]$EventId
+    )
+    if ($null -eq $BodyBytes -or $BodyBytes.Length -eq 0) { return }
+    $take = [Math]::Min(32, $BodyBytes.Length)
+    $hex = (($BodyBytes[0..($take - 1)] | ForEach-Object { '{0:X2}' -f $_ }) -join ' ')
+    Write-SacLog "WARN: SAC POST body prefix ($take bytes hex): $hex"
+    if ([string]::IsNullOrWhiteSpace($script:InstallRoot)) { return }
+    try {
+        $logDir = Join-Path $script:InstallRoot 'Logs'
+        if (-not (Test-Path -LiteralPath $logDir)) {
+            New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+        }
+        $path = Join-Path $logDir 'sac-last-post.json'
+        [System.IO.File]::WriteAllBytes($path, $BodyBytes)
+        Write-SacLog "WARN: SAC saved last POST body to $path (event_id=$EventId)"
+    } catch {
+        Write-SacLog "WARN: SAC could not save sac-last-post.json: $($_.Exception.Message)"
+    }
+}
+
+function Invoke-SacPostPayload {
+    param(
+        [string]$JsonBody,
+        [string]$SpoolFilePath = ''
+    )
+
+    if (-not (Test-SacConfigured)) { return $false }
+    if (-not (Test-SacShouldAttemptSend)) { return $false }
+
+    $ingest = Get-SacIngestUrl
+    if ([string]::IsNullOrWhiteSpace($ingest)) { return $false }
+
+    $jsonText = Repair-SacJsonText -Text (Get-SacSingleString -Value $JsonBody -Label 'spool payload')
+    $eventId = Get-SacEventIdFromJsonText -JsonText $jsonText
+    if (-not $eventId) {
+        if (-not [string]::IsNullOrWhiteSpace($SpoolFilePath)) {
+            Move-SacSpoolFileToRejected -SpoolFilePath $SpoolFilePath -Reason 'no event_id in JSON body'
+        } else {
+            Write-SacLog 'WARN: SAC JSON has no event_id (uuid); skip POST'
+        }
+        return $false
+    }
+    $eventType = 'unknown'
+    if ($jsonText -match '"type"\s*:\s*"([^"]+)"') {
+        $eventType = $Matches[1]
+    }
+    $timeout = if ($SacTimeoutSec) { [int]$SacTimeoutSec } else { 12 }
+    $spoolOnFailure = $true
+    $bodyBytes = $null
+
+    $bodyBytes = Get-SacPostBodyBytes -JsonText $jsonText
+    if ($null -eq $bodyBytes) {
+        Move-SacSpoolToRejected -EventId $eventId
+        return $false
+    }
+
+    $post = Invoke-SacHttpPost -Uri $ingest -BodyBytes $bodyBytes -EventId $eventId -TimeoutSec $timeout
+    $code = [int]$post.StatusCode
+    $body = if ($post.Content) { [string]$post.Content } else { '' }
+
+    if (Test-SacIngestAcceptedStatus -StatusCode $code) {
+        Complete-SacIngestSuccess -EventId $eventId -EventType $eventType -StatusCode $code
+        return $true
+    }
+
+    if ($code -eq 422) {
+        $spoolOnFailure = $false
+        Write-SacLog "WARN: SAC POST HTTP 422 validation (not spooled) type=$eventType event_id=$eventId len=$($bodyBytes.Length)"
+        Write-SacPostBodyDiagnostic -BodyBytes $bodyBytes -EventId $eventId
+    } elseif ($code -gt 0) {
+        Write-SacLog "WARN: SAC POST HTTP $code type=$eventType event_id=$eventId len=$($bodyBytes.Length)"
+    } elseif (-not [string]::IsNullOrWhiteSpace($post.Error)) {
+        Write-SacLog "WARN: SAC POST failed type=$eventType event_id=${eventId}: $($post.Error)"
+    }
+
+    if ($body.Length -gt 0) {
+        $snippet = $body.Substring(0, [Math]::Min(800, $body.Length))
+        Write-SacLog "WARN: SAC POST response: $snippet"
+    }
+
+    if (-not $spoolOnFailure) {
+        Move-SacSpoolToRejected -EventId $eventId
+        return $false
+    }
+
+    Write-SacSpoolFile -EventId $eventId -JsonBody $jsonText
+    $max = if ($SacFallbackFailures) { [int]$SacFallbackFailures } else { 5 }
+    $n = Get-SacFailCount + 1
+    Set-SacFailCount -Count $n
+    if ($n -ge $max) {
+        Write-SacLog "WARN: SAC fallback: SAC_FALLBACK_FAILURES threshold ($max)"
+    }
+    return $false
+}
+
+function Send-SacEvent {
+    param(
+        [Parameter(Mandatory = $true)][string]$EventType,
+        [Parameter(Mandatory = $true)][string]$Severity,
+        [Parameter(Mandatory = $true)][string]$Title,
+        [Parameter(Mandatory = $true)][string]$Summary,
+        [hashtable]$Details = $null,
+        $OccurredAt = $null
+    )
+
+    if (-not (Test-SacConfigured)) {
+        Write-SacLog 'WARN: SAC not configured (SacUrl / SacApiKey)'
+        return $false
+    }
+
+    $mergedDetails = Merge-SacNotifyDetails -Details $Details -TelegramVia ''
+    if ($mergedDetails.Count -eq 0) {
+        $mergedDetails = $null
+    }
+
+    $payloadArgs = @{
+        EventType = $EventType
+        Severity  = $Severity
+        Title     = $Title
+        Summary   = $Summary
+        Details   = $mergedDetails
+    }
+    if ($null -ne $OccurredAt) {
+        $payloadArgs['OccurredAt'] = $OccurredAt
+    }
+    $payload = $(New-SacEventPayload @payloadArgs)
+    if ($payload -is [System.Array]) {
+        $payload = $payload[-1]
+    }
+    $json = $(ConvertTo-SacJsonText -Payload $payload)
+    $json = Repair-SacJsonText -Text (Get-SacSingleString -Value $json -Label 'event json')
+    if ([string]::IsNullOrWhiteSpace($json) -or $json[0] -ne '{') {
+        Write-SacLog "WARN: SAC invalid JSON for type=$EventType (empty or does not start with '{' )"
+        return $false
+    }
+    return (Invoke-SacPostPayload -JsonBody $json)
+}
+
+function Send-SacLocalChannels {
+    param(
+        [string]$TelegramMessage,
+        [string]$EmailSubject
+    )
+
+    if ([string]::IsNullOrWhiteSpace($TelegramMessage)) { return $false }
+
+    $channels = @(Get-NotifyOrderChannels)
+    if ($channels.Count -eq 0) { return $false }
+
+    $anyOk = $false
+    foreach ($ch in $channels) {
+        $ok = switch ($ch) {
+            'telegram' { Send-TelegramMessage -Message $TelegramMessage }
+            'email'    { Send-EmailNotification -Message $TelegramMessage -Subject $EmailSubject }
+            default    { $false }
+        }
+        if ($ok) { $anyOk = $true }
+    }
+    return $anyOk
+}
+
+function Test-SacHeartbeatOnlyEventType {
+    param([string]$EventType)
+    return ($EventType -eq 'agent.heartbeat')
+}
+
+function Merge-SacNotifyDetails {
+    param(
+        [hashtable]$Details = $null,
+        [string]$TelegramVia = ''
+    )
+
+    $merged = @{}
+    if ($null -ne $Details) {
+        foreach ($k in $Details.Keys) {
+            $merged[$k] = $Details[$k]
+        }
+    }
+    if (-not $merged.ContainsKey('generated_by')) {
+        $merged['generated_by'] = 'agent'
+    }
+    if (-not [string]::IsNullOrWhiteSpace($TelegramVia) -and -not $merged.ContainsKey('telegram_via')) {
+        $merged['telegram_via'] = $TelegramVia.Trim().ToLowerInvariant()
+    }
+    return $merged
+}
+
+function Get-SacEventInvokeArgs {
+    param(
+        [Parameter(Mandatory = $true)][string]$EventType,
+        [Parameter(Mandatory = $true)][string]$Severity,
+        [Parameter(Mandatory = $true)][string]$Title,
+        [Parameter(Mandatory = $true)][string]$Summary,
+        [hashtable]$Details = $null,
+        $OccurredAt = $null
+    )
+
+    $args = @{
+        EventType = $EventType
+        Severity  = $Severity
+        Title     = $Title
+        Summary   = $Summary
+        Details   = $Details
+    }
+    if ($null -ne $OccurredAt) {
+        $args['OccurredAt'] = $OccurredAt
+    }
+    return $args
+}
+
+function Send-NotifyOrSac {
+    param(
+        [Parameter(Mandatory = $true)][string]$EventType,
+        [Parameter(Mandatory = $true)][string]$Severity,
+        [Parameter(Mandatory = $true)][string]$Title,
+        [Parameter(Mandatory = $true)][string]$Summary,
+        [string]$TelegramMessage = '',
+        [string]$EmailSubject = 'RDP Login Monitor',
+        [hashtable]$Details = $null,
+        $OccurredAt = $null
+    )
+
+    if ([string]::IsNullOrWhiteSpace($TelegramMessage)) {
+        $TelegramMessage = $Summary
+    }
+
+    $mode = Get-SacNormalizedMode
+
+    # Периодический heartbeat — только SAC (UI), без Telegram/email в любом режиме.
+    if (Test-SacHeartbeatOnlyEventType -EventType $EventType) {
+        if ($mode -eq 'off') {
+            return $false
+        }
+        $hbDetails = Merge-SacNotifyDetails -Details $Details -TelegramVia 'sac'
+        $sacEventArgs = Get-SacEventInvokeArgs -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $hbDetails -OccurredAt $OccurredAt
+        return (Send-SacEvent @sacEventArgs)
+    }
+
+    switch ($mode) {
+        'off' {
+            return (Send-SacLocalChannels -TelegramMessage $TelegramMessage -EmailSubject $EmailSubject)
+        }
+        'exclusive' {
+            $merged = Merge-SacNotifyDetails -Details $Details -TelegramVia 'sac'
+            $sacEventArgs = Get-SacEventInvokeArgs -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $merged -OccurredAt $OccurredAt
+            return (Send-SacEvent @sacEventArgs)
+        }
+        'dual' {
+            $merged = Merge-SacNotifyDetails -Details $Details -TelegramVia 'agent'
+            $sacEventArgs = Get-SacEventInvokeArgs -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $merged -OccurredAt $OccurredAt
+            Send-SacEvent @sacEventArgs | Out-Null
+            return (Send-SacLocalChannels -TelegramMessage $TelegramMessage -EmailSubject $EmailSubject)
+        }
+        'fallback' {
+            $merged = Merge-SacNotifyDetails -Details $Details -TelegramVia 'sac'
+            $sacEventArgs = Get-SacEventInvokeArgs -EventType $EventType -Severity $Severity -Title $Title -Summary $Summary -Details $merged -OccurredAt $OccurredAt
+            if (Send-SacEvent @sacEventArgs) {
+                return $true
+            }
+            return (Send-SacLocalChannels -TelegramMessage $TelegramMessage -EmailSubject $EmailSubject)
+        }
+        default {
+            Write-SacLog "WARN: unknown UseSAC=$mode, local channels only"
+            return (Send-SacLocalChannels -TelegramMessage $TelegramMessage -EmailSubject $EmailSubject)
+        }
+    }
+}
+
+function Invoke-SacFlushSpool {
+    param([int]$MaxFiles = 20)
+
+    $mode = Get-SacNormalizedMode
+    if ($mode -eq 'off') { return }
+    if (-not (Test-SacConfigured)) { return }
+
+    $dir = Get-SacSpoolDirResolved
+    if (-not (Test-Path -LiteralPath $dir)) { return }
+
+    # Сначала свежие события (daily report); битые записи уходят в rejected и не блокируют очередь.
+    $files = @(Get-ChildItem -LiteralPath $dir -Filter '*.json' -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending)
+    $count = 0
+    foreach ($f in $files) {
+        $count++
+        if ($count -gt $MaxFiles) { break }
+        try {
+            $bytes = Read-SacSpoolFileBytes -Path $f.FullName
+            if (Test-SacSpoolBytesCorrupt -Bytes $bytes) {
+                Move-SacSpoolFileToRejected -SpoolFilePath $f.FullName -Reason 'null or empty payload'
+                continue
+            }
+            $json = Read-SacSpoolFileText -Path $f.FullName
+            if ([string]::IsNullOrWhiteSpace($json)) {
+                Move-SacSpoolFileToRejected -SpoolFilePath $f.FullName -Reason 'unreadable payload'
+                continue
+            }
+            Invoke-SacPostPayload -JsonBody $json -SpoolFilePath $f.FullName | Out-Null
+        } catch {
+            Write-SacLog "WARN: SAC spool flush failed for $($f.Name): $($_.Exception.Message)"
+        }
+    }
+}
+
+function Get-SacAgentCommandsUrl {
+    $base = Get-SacBaseUrl
+    if ([string]::IsNullOrWhiteSpace($base)) { return $null }
+    return "$base/api/v1/agent/commands"
+}
+
+function Get-SacAgentCommandResultUrl {
+    param([Parameter(Mandatory = $true)][string]$CommandId)
+    $base = Get-SacBaseUrl
+    if ([string]::IsNullOrWhiteSpace($base)) { return $null }
+    return "$base/api/v1/agent/commands/$CommandId/result"
+}
+
+function Invoke-SacHttpGet {
+    param(
+        [Parameter(Mandatory = $true)][string]$Uri,
+        [int]$TimeoutSec = 12
+    )
+    Invoke-SacTlsPrep
+    try {
+        $resp = Invoke-WebRequest -Uri $Uri -Method Get -UseBasicParsing -TimeoutSec $TimeoutSec `
+            -Headers @{ Authorization = "Bearer $SacApiKey" }
+        return @{ StatusCode = [int]$resp.StatusCode; Content = [string]$resp.Content }
+    } catch {
+        $code = 0
+        $content = ''
+        if ($_.Exception.Response) {
+            $code = [int]$_.Exception.Response.StatusCode
+            try {
+                $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+                $content = $reader.ReadToEnd()
+                $reader.Close()
+            } catch { }
+        }
+        return @{ StatusCode = $code; Content = $content; Error = $_.Exception.Message }
+    }
+}
+
+function Invoke-SacHttpPostJson {
+    param(
+        [Parameter(Mandatory = $true)][string]$Uri,
+        [Parameter(Mandatory = $true)][string]$JsonBody,
+        [int]$TimeoutSec = 12
+    )
+    Invoke-SacTlsPrep
+    $bytes = Get-SacUtf8Bytes -Text $JsonBody
+    try {
+        $resp = Invoke-WebRequest -Uri $Uri -Method Post -UseBasicParsing -TimeoutSec $TimeoutSec `
+            -Headers @{ Authorization = "Bearer $SacApiKey" } `
+            -ContentType 'application/json; charset=utf-8' `
+            -Body $bytes
+        return @{ StatusCode = [int]$resp.StatusCode; Content = [string]$resp.Content }
+    } catch {
+        $code = 0
+        $content = ''
+        if ($_.Exception.Response) {
+            $code = [int]$_.Exception.Response.StatusCode
+            try {
+                $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+                $content = $reader.ReadToEnd()
+                $reader.Close()
+            } catch { }
+        }
+        return @{ StatusCode = $code; Content = $content; Error = $_.Exception.Message }
+    }
+}
+
+function Invoke-SacCaptureProcess {
+    param(
+        [Parameter(Mandatory = $true)][string]$CommandLine
+    )
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'cmd.exe'
+    $psi.Arguments = "/c $CommandLine"
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    $p = New-Object System.Diagnostics.Process
+    $p.StartInfo = $psi
+    [void]$p.Start()
+    $stdout = $p.StandardOutput.ReadToEnd()
+    $stderr = $p.StandardError.ReadToEnd()
+    if (-not $p.WaitForExit(60000)) {
+        try { $p.Kill() } catch { }
+        return @{ ExitCode = -1; Stdout = $stdout; Stderr = 'timeout' }
+    }
+    return @{ ExitCode = $p.ExitCode; Stdout = $stdout; Stderr = $stderr }
+}
+
+function Invoke-SacRunWithRunAs {
+    param(
+        [Parameter(Mandatory = $true)][string]$CommandLine,
+        $RunAs = $null
+    )
+    if ($null -eq $RunAs -or [string]::IsNullOrWhiteSpace($RunAs.user)) {
+        return (Invoke-SacCaptureProcess -CommandLine $CommandLine)
+    }
+    $user = [string]$RunAs.user
+    $password = [string]$RunAs.password
+    if ([string]::IsNullOrWhiteSpace($password)) {
+        return (Invoke-SacCaptureProcess -CommandLine $CommandLine)
+    }
+    $taskName = "SacCmd_$([guid]::NewGuid().ToString('N').Substring(0, 12))"
+    $outFile = Join-Path $env:TEMP "$taskName.out.txt"
+    $errFile = Join-Path $env:TEMP "$taskName.err.txt"
+    if (Test-Path -LiteralPath $outFile) { Remove-Item -LiteralPath $outFile -Force -ErrorAction SilentlyContinue }
+    if (Test-Path -LiteralPath $errFile) { Remove-Item -LiteralPath $errFile -Force -ErrorAction SilentlyContinue }
+    $wrapped = "/c `"$CommandLine > `"$outFile`" 2> `"$errFile`"`""
+    try {
+        $action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument $wrapped
+        Register-ScheduledTask -TaskName $taskName -Action $action -User $user -Password $password `
+            -RunLevel Highest -Force | Out-Null
+        Start-ScheduledTask -TaskName $taskName
+        $deadline = (Get-Date).AddSeconds(45)
+        do {
+            Start-Sleep -Milliseconds 300
+            $state = (Get-ScheduledTask -TaskName $taskName).State
+        } while ($state -eq 'Running' -and (Get-Date) -lt $deadline)
+        $stdout = if (Test-Path -LiteralPath $outFile) { Get-Content -LiteralPath $outFile -Raw -ErrorAction SilentlyContinue } else { '' }
+        $stderr = if (Test-Path -LiteralPath $errFile) { Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue } else { '' }
+        return @{ ExitCode = 0; Stdout = [string]$stdout; Stderr = [string]$stderr }
+    } catch {
+        return @{ ExitCode = 1; Stdout = ''; Stderr = $_.Exception.Message }
+    } finally {
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Invoke-SacAgentCommand {
+    param(
+        [Parameter(Mandatory = $true)]$Command,
+        $RunAs = $null
+    )
+    $type = [string]$Command.type
+    switch ($type) {
+        'qwinsta' {
+            return (Invoke-SacRunWithRunAs -CommandLine 'qwinsta.exe' -RunAs $RunAs)
+        }
+        'logoff' {
+            $sid = $null
+            if ($Command.params -and $Command.params.session_id) {
+                $sid = [int]$Command.params.session_id
+            }
+            if (-not $sid) {
+                return @{ ExitCode = 1; Stdout = ''; Stderr = 'missing session_id' }
+            }
+            $line = "logoff.exe $sid /v"
+            return (Invoke-SacRunWithRunAs -CommandLine $line -RunAs $RunAs)
+        }
+        default {
+            return @{ ExitCode = 1; Stdout = ''; Stderr = "unknown command type: $type" }
+        }
+    }
+}
+
+function Submit-SacAgentCommandResult {
+    param(
+        [Parameter(Mandatory = $true)][string]$CommandId,
+        [Parameter(Mandatory = $true)][string]$Status,
+        [string]$Stdout = '',
+        [string]$Stderr = ''
+    )
+    $url = Get-SacAgentCommandResultUrl -CommandId $CommandId
+    if ([string]::IsNullOrWhiteSpace($url)) { return $false }
+    $body = @{
+        status = $Status
+        stdout = $Stdout
+        stderr = $Stderr
+    } | ConvertTo-Json -Compress
+    $timeout = if ($SacTimeoutSec) { [int]$SacTimeoutSec } else { 12 }
+    $resp = Invoke-SacHttpPostJson -Uri $url -JsonBody $body -TimeoutSec $timeout
+    return ($resp.StatusCode -in 200, 201)
+}
+
+function Invoke-SacProcessPendingCommands {
+    if ((Get-SacNormalizedMode) -eq 'off') { return 0 }
+    if (-not (Test-SacConfigured)) { return 0 }
+
+    $pollUrl = Get-SacAgentCommandsUrl
+    if ([string]::IsNullOrWhiteSpace($pollUrl)) { return 0 }
+
+    $agentId = Get-SacAgentInstanceId
+    $timeout = if ($SacTimeoutSec) { [int]$SacTimeoutSec } else { 12 }
+    $uri = "${pollUrl}?agent_instance_id=$([uri]::EscapeDataString($agentId))"
+    $get = Invoke-SacHttpGet -Uri $uri -TimeoutSec $timeout
+    if ($get.StatusCode -ne 200) {
+        if ($get.StatusCode -gt 0) {
+            Write-SacLog "WARN: SAC agent commands poll HTTP $($get.StatusCode)"
+        }
+        return 0
+    }
+    $parsed = $null
+    try {
+        $parsed = $get.Content | ConvertFrom-Json
+    } catch {
+        Write-SacLog "WARN: SAC agent commands poll: invalid JSON"
+        return 0
+    }
+    $commands = @($parsed.commands)
+    if ($commands.Count -eq 0) { return 0 }
+
+    $done = 0
+    foreach ($cmd in $commands) {
+        $cmdId = [string]$cmd.id
+        if ([string]::IsNullOrWhiteSpace($cmdId)) { continue }
+        Write-SacLog "SAC agent command: $cmdId type=$($cmd.type)"
+        $runAs = $cmd.run_as
+        $result = Invoke-SacAgentCommand -Command $cmd -RunAs $runAs
+        $status = if ([int]$result.ExitCode -eq 0) { 'completed' } else { 'failed' }
+        $stderr = [string]$result.Stderr
+        if ([int]$result.ExitCode -ne 0 -and [string]::IsNullOrWhiteSpace($stderr)) {
+            $stderr = "exit code $($result.ExitCode)"
+        }
+        if (Submit-SacAgentCommandResult -CommandId $cmdId -Status $status `
+                -Stdout ([string]$result.Stdout) -Stderr $stderr) {
+            $done++
+            Write-SacLog "SAC agent command result submitted: $cmdId status=$status"
+        } else {
+            Write-SacLog "WARN: SAC agent command result failed: $cmdId"
+        }
+    }
+    return $done
+}
+
+function Test-SacConnection {
+    Write-Host 'SAC check (rdp-login-monitor)'
+    Write-Host "UseSAC=$(Get-SacNormalizedMode)"
+    switch (Get-SacNormalizedMode) {
+        'exclusive' { Write-Host 'Mode exclusive: SAC only' }
+        'dual'      { Write-Host 'Mode dual: SAC + local channels' }
+        'fallback'  { Write-Host 'Mode fallback: SAC, then local on failure' }
+    }
+    Write-Host "SacUrl=$SacUrl"
+    if (Test-SacConfigured) {
+        Write-Host "SAC ingest URL=$(Get-SacIngestUrl)"
+    }
+    if (-not (Test-SacConfigured)) {
+        Write-Error 'SAC: SacUrl or SacApiKey missing'
+        return 1
+    }
+    if (Test-SacHealth) {
+        Write-Host 'SAC health: OK'
+    } else {
+        Write-Error 'SAC health: FAIL'
+        return 1
+    }
+    if (Send-SacEvent -EventType 'agent.test' -Severity 'info' -Title 'SAC test' -Summary 'rdp-login-monitor CheckSac') {
+        Write-Host 'SAC ingest agent.test: OK (expected HTTP 201)'
+        return 0
+    }
+    Write-Error 'SAC ingest agent.test: FAIL'
+    return 1
+}
